@@ -59,6 +59,7 @@ class ComputeOrder(AngeeDataModel):
     line_count = models.IntegerField(default=0, editable=False)
     grand_total = models.IntegerField(default=0, editable=False)
     tag_names = models.CharField(max_length=200, blank=True, default="", editable=False)
+    tag_count = models.IntegerField(default=0, editable=False)
 
     class Meta:
         """Concrete demo order."""
@@ -81,6 +82,10 @@ class ComputeOrder(AngeeDataModel):
     @compute("tag_names", depends=("tags.name",))
     def _compute_tag_names(self) -> str:
         return ", ".join(self.tags.order_by("name").values_list("name", flat=True))
+
+    @compute("tag_count", depends=("tags",))
+    def _compute_tag_count(self) -> int:
+        return self.tags.count()
 
 
 class ComputeLine(AngeeDataModel):

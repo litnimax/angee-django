@@ -16,13 +16,17 @@ from typing import Any
 
 import pytest
 from django.core.management import CommandError, call_command
-from django.db import models
+from django.db import connection, models
 from django.db.models.signals import post_save
+from django.test.utils import CaptureQueriesContext
 from rebac import system_context
 
-from angee.base.computes import compute, compute_check_messages, compute_specs
+from angee.base.computes import compute, compute_check_messages, compute_specs, related
 from angee.base.models import AngeeModel
 from tests.computedemo.models import ComputeLine, ComputeOrder, ComputeProduct, ComputeTag
+
+ORDER_LINE_AMOUNTS = tuple(range(10))
+"""Enough lines that a per-row delete recompute is distinguishable from one pass."""
 
 
 def _order_with_lines(amounts: tuple[int, ...] = (3, 7), discount: int = 0) -> ComputeOrder:
@@ -206,6 +210,46 @@ def test_m2m_membership_and_far_column_propagate() -> None:
 
 
 @pytest.mark.django_db
+def test_m2m_far_side_delete_recomputes_membership_only_column() -> None:
+    """Deleting the far row drops through rows without ``m2m_changed``; the edge covers it."""
+
+    with system_context(reason="test computes m2m delete"):
+        order = ComputeOrder.objects.create()
+        urgent = ComputeTag.objects.create(name="urgent")
+        vip = ComputeTag.objects.create(name="vip")
+        order.tags.add(urgent, vip)
+        order.refresh_from_db()
+        assert order.tag_count == 2
+
+        urgent.delete()
+        order.refresh_from_db()
+    assert order.tag_count == 1
+    assert order.tag_names == "vip"
+
+
+@pytest.mark.django_db
+def test_batch_child_delete_recomputes_each_parent_once() -> None:
+    """A delete batch is drained once, not once per deleted row."""
+
+    with system_context(reason="test computes delete batch"):
+        order = _order_with_lines(ORDER_LINE_AMOUNTS)
+        with CaptureQueriesContext(connection) as queries:
+            ComputeLine.objects.filter(order=order).delete()
+        rereads = [
+            query["sql"]
+            for query in queries.captured_queries
+            if f'FROM "{ComputeOrder._meta.db_table}"' in query["sql"] and "JOIN" not in query["sql"]
+        ]
+        order.refresh_from_db()
+    # Resolving the affected parents stays per-row (only the doomed row knows its
+    # own relations), but the recompute itself drains once: the order row is
+    # re-read a single time instead of once per deleted line.
+    assert len(rereads) == 1
+    assert order.total == 0
+    assert order.line_count == 0
+
+
+@pytest.mark.django_db
 def test_deferred_dependency_load_stays_safe() -> None:
     """A value edge resolves through the join, so a deferred FK stays lazy."""
 
@@ -314,6 +358,24 @@ def test_check_rejects_unresolvable_depends_path() -> None:
 
     ids = [error.id for error in compute_check_messages(BadPath)]
     assert ids == ["angee.E017"]
+
+
+def test_check_rejects_related_path_through_a_to_many_hop() -> None:
+    """angee.E017 — a ``related()`` copy has one source row, so every hop is to-one."""
+
+    class ToManyRelated(AngeeModel):
+        tags = models.ManyToManyField(ComputeTag, related_name="+")
+        copied = models.CharField(max_length=50, blank=True, default="", editable=False)
+
+        class Meta:
+            abstract = True
+            app_label = "computedemo"
+
+        _related_copied = related("copied", "tags.name")
+
+    errors = compute_check_messages(ToManyRelated)
+    assert [error.id for error in errors] == ["angee.E017"]
+    assert "must walk to-one relations" in errors[0].msg
 
 
 def test_check_rejects_local_dependency_cycle() -> None:

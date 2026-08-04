@@ -355,9 +355,15 @@ def _resolve_path_set(model: type[models.Model], spec: ComputeSpec) -> _Resolved
     m2m_triggers: list[M2MComputeTrigger] = []
     for path in spec.depends:
         _resolve_path(model, spec, path, collect=(local, triggers, m2m_triggers))
+    # A delete-only far-side edge (``column=None``) resolves its dependents with
+    # the same pre-delete query a value edge on that model and lookup already
+    # runs, so keep only the one that also covers writes.
+    covered = {(edge.source, edge.lookup) for edge in triggers if edge.column is not None}
     return _ResolvedPath(
         local_names=frozenset(local),
-        triggers=tuple(triggers),
+        triggers=tuple(
+            edge for edge in triggers if edge.column is not None or (edge.source, edge.lookup) not in covered
+        ),
         m2m_triggers=tuple(m2m_triggers),
     )
 
@@ -410,9 +416,15 @@ def _resolve_path(
                     )
             return True
 
+        if spec.related_path is not None and (isinstance(field, ForeignObjectRel) or field.many_to_many):
+            raise ComputePathError(
+                f"{model._meta.label}.{spec.method_name} related path {path!r} must walk to-one relations, "
+                f"but {current._meta.label}.{hop} is to-many; a copy has one source row."
+            )
+
         if isinstance(field, ForeignObjectRel):
             if field.many_to_many:
-                _collect_m2m(collect, spec, model, current, field.through, lookup_parts)
+                _collect_m2m(collect, spec, model, current, field, lookup_parts, hop)
             else:
                 remote_fk = cast(models.Field, field.field)
                 if collect is not None:
@@ -431,7 +443,7 @@ def _resolve_path(
         else:
             forward = cast(models.Field, field)
             if forward.many_to_many:
-                _collect_m2m(collect, spec, model, current, forward.remote_field.through, lookup_parts)
+                _collect_m2m(collect, spec, model, current, forward, lookup_parts, hop)
             else:
                 if collect is not None:
                     local, triggers, _ = collect
@@ -479,14 +491,25 @@ def _collect_m2m(
     spec: ComputeSpec,
     dependent: type[models.Model],
     anchor: type[models.Model],
-    through: type[models.Model],
+    field: Any,
     lookup_parts: list[str],
+    hop: str,
 ) -> None:
-    """Collect the membership edges for one many-to-many hop."""
+    """Collect the membership edges for one many-to-many hop.
+
+    Two edges, because ``m2m_changed`` does not cover every membership change:
+    the through edge fires on add/remove/clear, and the far-side edge fires on
+    delete — deleting the far row drops its through rows by cascade *without*
+    firing ``m2m_changed``, so membership would otherwise change with no signal
+    the engine hears. The far-side edge carries no ``column``: only a delete can
+    fire it, and :func:`_resolve_path_set` drops it when a value edge on the same
+    far model already resolves the same dependents.
+    """
 
     if collect is None:
         return
     _, triggers, m2m_triggers = collect
+    through = field.through if isinstance(field, ForeignObjectRel) else field.remote_field.through
     m2m_triggers.append(
         M2MComputeTrigger(
             dependent=dependent,
@@ -494,6 +517,17 @@ def _collect_m2m(
             through=cast(type[models.Model], through._meta.concrete_model),
             anchor_model=cast(type[models.Model], anchor._meta.concrete_model),
             lookup="__".join(lookup_parts),
+        )
+    )
+    triggers.append(
+        ComputeTrigger(
+            dependent=dependent,
+            field_name=spec.field_name,
+            source=cast(type[models.Model], field.related_model._meta.concrete_model),
+            column=None,
+            written_names=frozenset(),
+            lookup="__".join([*lookup_parts, hop]),
+            membership=True,
         )
     )
 
@@ -890,6 +924,35 @@ def _on_post_save(
     snapshot_watched(instance, watched - instance.get_deferred_fields())
 
 
+@dataclass(slots=True)
+class _DeleteBatch:
+    """Dependents resolved for one sender's rows during a single delete pass."""
+
+    pending: dict[type[models.Model], dict[Any, set[str]]]
+    deleted: set[Any]
+
+
+_DELETE_BATCHES: contextvars.ContextVar[dict[type[models.Model], _DeleteBatch] | None] = contextvars.ContextVar(
+    "angee_compute_delete_batches", default=None
+)
+"""Per-sender delete batches accumulated between ``pre_delete`` and ``post_delete``.
+
+Django's collector sends every ``pre_delete``, then deletes a model's rows as one
+batch and only then sends that model's ``post_delete`` signals — so the first
+``post_delete`` for a sender already sees the whole batch gone and can recompute
+each affected dependent once, instead of once per deleted row."""
+
+
+def _delete_batch(sender: type[models.Model]) -> _DeleteBatch:
+    """Return this execution context's accumulating batch for ``sender``."""
+
+    batches = _DELETE_BATCHES.get()
+    if batches is None:
+        batches = {}
+        _DELETE_BATCHES.set(batches)
+    return batches.setdefault(sender, _DeleteBatch(pending={}, deleted=set()))
+
+
 def _on_pre_delete(sender: type[models.Model], instance: models.Model, **kwargs: Any) -> None:
     """Resolve the dependents a row's disappearance will invalidate, while it exists."""
 
@@ -897,7 +960,9 @@ def _on_pre_delete(sender: type[models.Model], instance: models.Model, **kwargs:
     triggers = compute_registry.triggers_for(sender)
     if not triggers:
         return
-    pending: dict[type[models.Model], dict[Any, set[str]]] = {}
+    batch = _delete_batch(sender)
+    batch.deleted.add(instance.pk)
+    pending = batch.pending
     with system_context(reason=RECOMPUTE_REASON):
         for trigger in triggers:
             if trigger.membership and trigger.column is not None:
@@ -911,26 +976,29 @@ def _on_pre_delete(sender: type[models.Model], instance: models.Model, **kwargs:
                 else:
                     pks = {instance.pk}
                 _collect(pending, trigger, pks)
-    instance.__dict__["_angee_compute_affected"] = pending
 
 
 def _on_post_delete(sender: type[models.Model], instance: models.Model, **kwargs: Any) -> None:
-    """Recompute the dependents resolved before this row was deleted."""
+    """Recompute the dependents resolved before this sender's rows were deleted.
 
-    del sender, kwargs
-    pending = cast(
-        "dict[type[models.Model], dict[Any, set[str]]] | None",
-        instance.__dict__.pop("_angee_compute_affected", None),
-    )
-    if not pending:
+    The whole batch is already gone by the first ``post_delete``, so this drains
+    the accumulated batch once; the remaining signals of the same delete find it
+    empty and do no work.
+    """
+
+    del kwargs
+    batches = _DELETE_BATCHES.get()
+    batch = batches.pop(sender, None) if batches is not None else None
+    if batch is None or not batch.pending:
         return
-    # The deleted row can no longer be a dependent of itself (self-referential
+    # A deleted row can no longer be a dependent of itself (self-referential
     # paths); other dependents keep their pks — they only coincide numerically.
-    for dependent, rows in pending.items():
+    for dependent, rows in batch.pending.items():
         if isinstance(instance, dependent):
-            rows.pop(instance.pk, None)
+            for pk in batch.deleted:
+                rows.pop(pk, None)
     with system_context(reason=RECOMPUTE_REASON):
-        _fire(pending)
+        _fire(batch.pending)
 
 
 def _on_m2m_changed(
