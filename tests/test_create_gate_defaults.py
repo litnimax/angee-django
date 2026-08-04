@@ -12,6 +12,10 @@ persist with. These drive the real gate over a built schema:
 2. multi-membership actor, no scope -> field-named ``ValidationError``;
 3. caller-supplied scope the actor is not a member of -> denied by the gate;
 4. caller-supplied scope the actor is a member of -> allowed.
+
+The form-facing ``get_create_defaults`` shares the same membership rule and is
+pinned here too: a sole membership is offered, an unresolvable default is
+omitted (never raised), and a caller seed wins over the derived value.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from django.core.management import call_command
 from django.test import override_settings
 from rebac import (
     RelationshipTuple,
+    actor_context,
     system_context,
     to_object_ref,
     to_subject_ref,
@@ -182,3 +187,53 @@ def test_supplied_member_scope_create_is_allowed() -> None:
     with system_context(reason="test scope gate read"):
         doc = ScopedDoc.objects.get()
     assert doc.scope_id == scope_a.pk
+
+
+@pytest.mark.django_db
+def test_get_create_defaults_offers_the_sole_membership_scope() -> None:
+    """The form-facing defaults owner resolves the same rule the gate applies."""
+
+    call_command("rebac", "sync", verbosity=0)
+    member = create_user("scope-defaults-sole")
+    with system_context(reason="test scope defaults setup"):
+        scope = Scope.objects.create(name="Default Scope")
+    _grant(scope, "direct_member", member)
+
+    with actor_context(member):
+        values = ScopedDoc.get_create_defaults()
+    assert values["scope"].pk == scope.pk
+
+
+@pytest.mark.django_db
+def test_get_create_defaults_omits_an_unresolvable_scope() -> None:
+    """An ambiguous or absent membership omits the key instead of raising."""
+
+    call_command("rebac", "sync", verbosity=0)
+    loner = create_user("scope-defaults-none")
+    joiner = create_user("scope-defaults-multi")
+    with system_context(reason="test scope defaults setup"):
+        scope_a = Scope.objects.create(name="Scope A")
+        scope_b = Scope.objects.create(name="Scope B")
+    _grant(scope_a, "direct_member", joiner)
+    _grant(scope_b, "direct_member", joiner)
+
+    with actor_context(loner):
+        assert "scope" not in ScopedDoc.get_create_defaults()
+    with actor_context(joiner):
+        assert "scope" not in ScopedDoc.get_create_defaults()
+
+
+@pytest.mark.django_db
+def test_get_create_defaults_keeps_a_caller_seeded_scope() -> None:
+    """A client-supplied seed wins over the membership-derived default."""
+
+    call_command("rebac", "sync", verbosity=0)
+    member = create_user("scope-defaults-seeded")
+    with system_context(reason="test scope defaults setup"):
+        home = Scope.objects.create(name="Home")
+        picked = Scope.objects.create(name="Picked")
+    _grant(home, "direct_member", member)
+
+    with actor_context(member):
+        values = ScopedDoc.get_create_defaults(defaults={"scope": picked})
+    assert values["scope"].pk == picked.pk

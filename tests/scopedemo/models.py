@@ -20,6 +20,7 @@ from rebac.models import active_relationship_model
 from rebac.resources import model_resource_type
 
 from angee.base.models import AngeeDataModel, AngeeManager, AngeeQuerySet
+from angee.base.onchange import OnchangeWarning, onchange
 
 SCOPE_MEMBER_RELATION = "direct_member"
 """Direct membership relation on the local ``scopedemo/scope`` test resource."""
@@ -103,6 +104,18 @@ class ScopeScopedMixin(models.Model):
             self.scope = self._default_scope_from_membership()
         super().save(*args, **kwargs)
 
+    @classmethod
+    def get_create_defaults(cls, *, defaults: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Offer the membership-derived scope to a create form when resolvable."""
+
+        values = super().get_create_defaults(defaults=defaults)
+        if values.get("scope") is None:
+            try:
+                values["scope"] = cls._default_scope_from_membership()
+            except ValidationError:
+                values.pop("scope", None)
+        return values
+
     def apply_create_defaults(self) -> Mapping[str, Sequence[Any]]:
         """Default blank ``scope`` before the create gate evaluates the row."""
 
@@ -112,13 +125,14 @@ class ScopeScopedMixin(models.Model):
             contributions["scope"] = (self.scope,)
         return contributions
 
-    def _default_scope_from_membership(self) -> Scope:
+    @classmethod
+    def _default_scope_from_membership(cls) -> Scope:
         """Return the acting user's sole direct scope, or raise naming ``scope``."""
 
         actor = current_actor()
         if actor is None or is_anonymous_actor(actor):
             raise ValidationError({"scope": "Select a scope: it cannot be defaulted for an unauthenticated actor."})
-        scope_model = type(self)._meta.get_field("scope").related_model
+        scope_model = cls._meta.get_field("scope").related_model
         memberships = list(scope_model._default_manager.direct_memberships_of(actor)[:2])
         if len(memberships) == 1:
             return memberships[0]
@@ -132,11 +146,17 @@ class ScopeScopedMixin(models.Model):
 
 
 class ScopedDoc(ScopeScopedMixin, AngeeDataModel):
-    """A locally scoped document whose ``create`` rides ``scope->member``."""
+    """A locally scoped document whose ``create`` rides ``scope->member``.
+
+    Beyond the create gate, this is also the regression handle for the generic
+    draft machinery: ``title_length`` is a server-derived column its ``@onchange``
+    handler recomputes live while a form edits ``title``.
+    """
 
     sqid_prefix = "scd_"
 
     title = models.CharField(max_length=200, blank=True, default="")
+    title_length = models.PositiveIntegerField(default=0)
 
     class Meta(AngeeDataModel.Meta):
         """Concrete locally scoped, create-gated document for the gate tests."""
@@ -146,3 +166,21 @@ class ScopedDoc(ScopeScopedMixin, AngeeDataModel):
         db_table = "test_scopedemo_doc"
         rebac_resource_type = "scopedemo/doc"
         rebac_id_attr = "sqid"
+
+    @onchange("title")
+    def recompute_title_length(self) -> OnchangeWarning | None:
+        """Derive the draft title length; warn when the title runs long."""
+
+        self.title_length = len(self.title)
+        if len(self.title) > 50:
+            return OnchangeWarning(message="That title is getting long.", title="Long title")
+        return None
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        """Keep the persisted ``title_length`` authoritative on every save."""
+
+        self.recompute_title_length()
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None and "title" in update_fields:
+            kwargs["update_fields"] = {*update_fields, "title_length"}
+        super().save(*args, **kwargs)

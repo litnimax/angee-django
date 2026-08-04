@@ -259,16 +259,24 @@ function buildOperationDocuments(name, runtimeDir) {
   const actions = actionFields(sdlPath);
   const names = actions.map((action) => action.name);
   const aggregateResources = aggregateFields(metadataPath);
+  const defaultsResources = defaultsFields(metadataPath);
   const deletePreviewResources = deletePreviewFields(metadataPath);
   const groupResources = groupFields(metadataPath);
+  const onchangeResources = onchangeFields(metadataPath);
   const revisionResources = revisionFields(metadataPath);
   const saveResources = saveFields(metadataPath);
   const union = names.length > 0 ? names.map((n) => JSON.stringify(n)).join(" | ") : "never";
   const aggregateUnion = aggregateResources.length > 0
     ? aggregateResources.map((resource) => JSON.stringify(resource.modelLabel)).join(" | ")
     : "never";
+  const defaultsUnion = defaultsResources.length > 0
+    ? defaultsResources.map((resource) => JSON.stringify(resource.modelLabel)).join(" | ")
+    : "never";
   const deletePreviewUnion = deletePreviewResources.length > 0
     ? deletePreviewResources.map((resource) => JSON.stringify(resource.modelLabel)).join(" | ")
+    : "never";
+  const onchangeUnion = onchangeResources.length > 0
+    ? onchangeResources.map((resource) => JSON.stringify(resource.modelLabel)).join(" | ")
     : "never";
   const groupUnion = groupResources.length > 0
     ? groupResources.map((resource) => JSON.stringify(resource.modelLabel)).join(" | ")
@@ -291,9 +299,17 @@ function buildOperationDocuments(name, runtimeDir) {
     );
     return `  ${JSON.stringify(resource.modelLabel)}: ${ast} as AggregateDocument,`;
   });
+  const defaultsDocuments = defaultsResources.map((resource) => {
+    const ast = JSON.stringify(defaultsDocument(resource.defaultsRoot), null, 2);
+    return `  ${JSON.stringify(resource.modelLabel)}: ${ast} as DefaultsDocument,`;
+  });
   const deletePreviewDocuments = deletePreviewResources.map((resource) => {
     const ast = JSON.stringify(deletePreviewDocument(resource.deletePreviewRoot), null, 2);
     return `  ${JSON.stringify(resource.modelLabel)}: ${ast} as DeletePreviewDocument,`;
+  });
+  const onchangeDocuments = onchangeResources.map((resource) => {
+    const ast = JSON.stringify(onchangeDocument(resource.onchangeRoot), null, 2);
+    return `  ${JSON.stringify(resource.modelLabel)}: ${ast} as OnchangeDocument,`;
   });
   const groupDocuments = groupResources.map((resource) => {
     const ast = JSON.stringify(groupDocument(resource), null, 2);
@@ -440,6 +456,53 @@ function buildOperationDocuments(name, runtimeDir) {
     ...revisionDocuments,
     "};",
     "",
+    `export type DefaultsResource = ${defaultsUnion};`,
+    "",
+    "export interface DefaultsVariables {",
+    "  defaults?: Record<string, unknown>;",
+    "}",
+    "",
+    "export type DefaultsDocument = TypedDocumentNode<",
+    "  Record<string, Record<string, unknown>>,",
+    "  DefaultsVariables",
+    ">;",
+    "",
+    "export const defaultsDocuments: {",
+    "  readonly [Resource in DefaultsResource]: DefaultsDocument;",
+    "} = {",
+    ...defaultsDocuments,
+    "};",
+    "",
+    `export type OnchangeResource = ${onchangeUnion};`,
+    "",
+    "export interface OnchangeVariables {",
+    "  values: Record<string, unknown>;",
+    "  changed: readonly string[];",
+    "  id?: string | null;",
+    "}",
+    "",
+    "export interface OnchangeWarning {",
+    "  title: string;",
+    "  message: string;",
+    "}",
+    "",
+    "export interface OnchangePayload {",
+    "  values: Record<string, unknown>;",
+    "  warning: OnchangeWarning | null;",
+    "  validation_errors: Record<string, string[]> | null;",
+    "}",
+    "",
+    "export type OnchangeDocument = TypedDocumentNode<",
+    "  Record<string, OnchangePayload>,",
+    "  OnchangeVariables",
+    ">;",
+    "",
+    "export const onchangeDocuments: {",
+    "  readonly [Resource in OnchangeResource]: OnchangeDocument;",
+    "} = {",
+    ...onchangeDocuments,
+    "};",
+    "",
     `export type SaveResource = ${saveUnion};`,
     "",
     "export interface SaveVariables {",
@@ -464,8 +527,10 @@ function buildOperationDocuments(name, runtimeDir) {
     "export const operationDocuments = {",
     "  actions: actionDocuments,",
     "  aggregates: aggregateDocuments,",
+    "  defaults: defaultsDocuments,",
     "  deletePreviews: deletePreviewDocuments,",
     "  groups: groupDocuments,",
+    "  onchanges: onchangeDocuments,",
     "  revisions: revisionDocuments,",
     "  saves: saveDocuments,",
     "};",
@@ -477,8 +542,10 @@ function buildOperationDocuments(name, runtimeDir) {
     `operation documents [${name}]: ` +
       `${names.length} action(s), ` +
       `${aggregateResources.length} aggregate query(ies), ` +
+      `${defaultsResources.length} defaults query(ies), ` +
       `${deletePreviewResources.length} delete-preview mutation(s), ` +
       `${groupResources.length} group query(ies), ` +
+      `${onchangeResources.length} onchange query(ies), ` +
       `${revisionResources.length} revision query(ies), ` +
       `${saveResources.length} save mutation(s)`,
   );
@@ -646,6 +713,46 @@ function revisionFields(metadataPath) {
     .sort((left, right) => left.modelLabel.localeCompare(right.modelLabel));
 }
 
+function defaultsFields(metadataPath) {
+  const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+  const resources = metadata?.angee?.resources;
+  if (!Array.isArray(resources)) return [];
+  return resources
+    .flatMap((resource) => {
+      const modelLabel = resource?.modelLabel;
+      const defaultsRoot = resource?.roots?.defaults;
+      if (
+        typeof modelLabel !== "string" ||
+        typeof defaultsRoot !== "string" ||
+        defaultsRoot === ""
+      ) {
+        return [];
+      }
+      return [{ modelLabel, defaultsRoot }];
+    })
+    .sort((left, right) => left.modelLabel.localeCompare(right.modelLabel));
+}
+
+function onchangeFields(metadataPath) {
+  const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+  const resources = metadata?.angee?.resources;
+  if (!Array.isArray(resources)) return [];
+  return resources
+    .flatMap((resource) => {
+      const modelLabel = resource?.modelLabel;
+      const onchangeRoot = resource?.roots?.onchange;
+      if (
+        typeof modelLabel !== "string" ||
+        typeof onchangeRoot !== "string" ||
+        onchangeRoot === ""
+      ) {
+        return [];
+      }
+      return [{ modelLabel, onchangeRoot }];
+    })
+    .sort((left, right) => left.modelLabel.localeCompare(right.modelLabel));
+}
+
 function saveFields(metadataPath) {
   const metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
   const resources = metadata?.angee?.resources;
@@ -786,6 +893,23 @@ function groupDocument(resource) {
       `aggregate { ${aggregateSelection(resource.measures)} } } ` +
       `totalCount: ${assertGraphQLName(resource.groupsCountRoot)}(` +
       "group_by: $group_by, where: $where, having: $having) }",
+    { noLocation: true },
+  );
+}
+
+function defaultsDocument(root) {
+  return parse(
+    `query ${actionOperationName(root)}($defaults: JSON) { ` +
+      `${assertGraphQLName(root)}(defaults: $defaults) }`,
+    { noLocation: true },
+  );
+}
+
+function onchangeDocument(root) {
+  return parse(
+    `query ${actionOperationName(root)}($values: JSON!, $changed: [String!]!, $id: ID) { ` +
+      `${assertGraphQLName(root)}(values: $values, changed: $changed, id: $id) { ` +
+      "values warning { title message } validation_errors } }",
     { noLocation: true },
   );
 }

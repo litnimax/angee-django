@@ -70,6 +70,8 @@ _RESOURCE_CAPABILITY_ORDER = (
     "groups",
     "filterEcho",
     "revisions",
+    "defaults",
+    "onchange",
     "create",
     "update",
     "save",
@@ -179,6 +181,8 @@ class DataResourceRoots:
     aggregate_name: str | None = dataclasses.field(default=None, metadata={"wire": "aggregate"})
     group_name: str | None = dataclasses.field(default=None, metadata={"wire": "groups"})
     group_count_name: str | None = dataclasses.field(default=None, metadata={"wire": "groupsCount"})
+    defaults_name: str | None = dataclasses.field(default=None, metadata={"wire": "defaults"})
+    onchange_name: str | None = dataclasses.field(default=None, metadata={"wire": "onchange"})
     create_name: str | None = dataclasses.field(default=None, metadata={"wire": "create"})
     update_name: str | None = dataclasses.field(default=None, metadata={"wire": "update"})
     save_name: str | None = dataclasses.field(default=None, metadata={"wire": "save"})
@@ -269,6 +273,7 @@ class DataResourceMetadata:
     create_fields: tuple[str, ...] = ()
     update_fields: tuple[str, ...] = ()
     required_create_fields: tuple[str, ...] = ()
+    onchange_fields: tuple[str, ...] = ()
     revision_fields: tuple[str, ...] = ()
     relation_axes: tuple[DataRelationAxisMetadata, ...] = ()
     group_aliases: tuple[DataGroupAliasMetadata, ...] = ()
@@ -334,6 +339,7 @@ class DataResourceMetadata:
             create_fields=self.create_fields or other.create_fields,
             update_fields=self.update_fields or other.update_fields,
             required_create_fields=self.required_create_fields or other.required_create_fields,
+            onchange_fields=self.onchange_fields or other.onchange_fields,
             revision_fields=self.revision_fields or other.revision_fields,
             relation_axes=self.relation_axes or other.relation_axes,
             group_aliases=self.group_aliases or other.group_aliases,
@@ -384,6 +390,7 @@ def make_data_resource_metadata(
     create_fields: tuple[str, ...] = (),
     update_fields: tuple[str, ...] = (),
     required_create_fields: tuple[str, ...] = (),
+    onchange_fields: tuple[str, ...] = (),
     revision_fields: tuple[str, ...] = (),
     relation_axes: tuple[DataRelationAxisMetadata, ...] = (),
     group_aliases: tuple[DataGroupAliasMetadata, ...] = (),
@@ -436,6 +443,7 @@ def make_data_resource_metadata(
         "required create field",
         required_create_fields or required_input_wire_fields(create_input_type),
     )
+    onchange_fields = _require_unique(exposed_model_label, "onchange trigger field", onchange_fields)
     revision_fields = _require_unique(exposed_model_label, "revision field", revision_fields)
     declared_fields = require_unique_resource_fields(exposed_model_label, fields)
     generated_fields = (
@@ -487,6 +495,7 @@ def make_data_resource_metadata(
         create_fields=active_create_fields,
         update_fields=active_update_fields,
         required_create_fields=active_required_create_fields,
+        onchange_fields=onchange_fields,
         revision_fields=revision_fields,
         relation_axes=relation_axes,
         group_aliases=group_aliases,

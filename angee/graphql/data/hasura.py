@@ -6,12 +6,13 @@ import dataclasses
 import types as _types
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import strawberry
 from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured, ValidationError
 from django.db import models, transaction
-from rebac import PermissionDenied, system_context
+from rebac import PermissionDenied, RebacMixin, system_context
+from strawberry.scalars import JSON
 from strawberry_django.mutations import resolvers as mutation_resolvers
 from strawberry_django_aggregates import (
     AggregateOp,
@@ -41,7 +42,22 @@ from angee.base.models import (
     public_id_for,
     requires_angee_rebac_contract,
 )
+from angee.base.onchange import onchange_specs
+from angee.graphql.actions import (
+    BASELINE_ACTION_ERRORS,
+    authorized_action_target,
+    require_authenticated,
+)
 from angee.graphql.constants import PUBLIC_ID_FIELD_NAME
+from angee.graphql.data.draft import (
+    OnchangePayload,
+    choices_stored_value,
+    decode_draft_values,
+    draft_field_names,
+    encode_draft_values,
+    onchange_error_payload,
+    run_onchange,
+)
 from angee.graphql.data.field_classification import model_field_scalar
 from angee.graphql.data.metadata import (
     DataAggregateMeasureMetadata,
@@ -434,7 +450,7 @@ class AngeeHasuraWriteBackend:
         for key, value in data.items():
             related_model = field_models.get(key)
             if related_model is None:
-                out[key] = _choices_wire_value(owner_model, key, value)
+                out[key] = choices_stored_value(owner_model, key, value)
                 continue
             try:
                 field = owner_model._meta.get_field(key)
@@ -455,33 +471,6 @@ class AngeeHasuraWriteBackend:
             if instance is not None:
                 relationships[key] = (instance,)
         return out, relationships
-
-
-def _choices_wire_value(owner_model: type[models.Model], name: str, value: Any) -> Any:
-    """Translate a read-side enum member name onto the choices value it stores.
-
-    Hasura insert/patch inputs carry choices columns as ``String`` while the
-    read surface projects the ``TextChoices`` enum serialized by member name,
-    so a console read→write round-trip posts the NAME (``"PYDANTIC"``) where
-    the column stores the value (``"pydantic"``). Accept the member name
-    alongside the stored value; a string that is neither passes through for
-    ``full_clean`` to reject. A value that is itself a valid stored value is
-    never remapped, even when it collides with another member's name.
-    """
-
-    if not isinstance(value, str):
-        return value
-    try:
-        field = owner_model._meta.get_field(name)
-    except FieldDoesNotExist:
-        return value
-    enum = getattr(field, "choices_enum", None)
-    if enum is None:
-        return value
-    member = enum.__members__.get(value)
-    if member is None or value in enum._value2member_map_:
-        return value
-    return member.value
 
 
 def public_pk_decoder(model: type[models.Model]) -> Callable[[Any], Any]:
@@ -983,6 +972,7 @@ def hasura_model_resource(  # noqa: PLR0913 - mirrors the upstream declarative b
             aggregate_builder_globals["AggregateBuilder"] = original_aggregate_builder
     if lines is not None:
         resource = _attach_lines_save(resource, node=node, lines=lines, write_backend=active_write_backend)
+    resource = _attach_draft_roots(resource, node=node, model=model, insert=insert, lines=lines)
     return attach_hasura_resource_metadata(
         resource,
         node=node,
@@ -1145,6 +1135,101 @@ def _attach_lines_save(
     return dataclasses.replace(resource, mutation=combined_mutation)
 
 
+def _attach_draft_roots(
+    resource: HasuraResource,
+    *,
+    node: type,
+    model: type[models.Model],
+    insert: bool,
+    lines: HasuraLines | None,
+) -> HasuraResource:
+    """Merge the ``<res>_defaults`` / ``<res>_onchange`` query roots into a built resource.
+
+    Both are read-only draft surfaces (queries): ``<res>_defaults(defaults)``
+    returns the values a new row starts from — the model's
+    ``get_create_defaults`` evaluated under the acting session, caller seeds
+    folded on top, intersected with the resource's creatable set — so a create
+    form opens with the values the model would persist. ``<res>_onchange(values,
+    changed, id)`` runs the model's ``@onchange`` handlers over the draft and
+    returns the recomputed values (see :mod:`angee.graphql.data.draft`). The
+    defaults root attaches when the resource inserts and the model carries the
+    Angee defaults hook; the onchange root attaches only when the model declares
+    handlers. Both require an authenticated session and read under the ambient
+    actor — nothing is elevated, nothing persists. Edit-mode onchange (``id``)
+    resolves the row through the actor's write scope and requires the per-row
+    ``write`` permission, so it needs the Angee REBAC contract.
+    """
+
+    res = resource.name or node.__name__.lower()
+    namespace: dict[str, Any] = {}
+
+    get_create_defaults = getattr(model, "get_create_defaults", None)
+    if insert and callable(get_create_defaults):
+        defaults_root = f"{res}_defaults"
+        create_wire = resource_wire_field_names(
+            resource.insert_input_type,
+            exclude=_parent_write_exclude(lines),
+        )
+        create_names = draft_field_names(model, create_wire)
+
+        def resolve_defaults(self: Any, info: strawberry.Info, defaults: JSON | None = None) -> JSON:
+            del self
+            require_authenticated(info)
+            seed_values = cast("Mapping[str, Any]", defaults) if defaults else {}
+            seeds = decode_draft_values(
+                model,
+                seed_values,
+                allowed=create_names,
+                skip_unresolved_relations=True,
+            )
+            values = get_create_defaults(defaults=seeds)
+            return encode_draft_values(model, node, values, allowed_wire=create_wire)
+
+        namespace[defaults_root] = strawberry.field(resolver=resolve_defaults, name=defaults_root)
+
+    if onchange_specs(model):
+        onchange_root = f"{res}_onchange"
+
+        def resolve_onchange(
+            self: Any,
+            info: strawberry.Info,
+            values: JSON,
+            changed: list[str],
+            id: PublicID | None = None,
+        ) -> OnchangePayload:
+            del self
+            require_authenticated(info)
+            try:
+                instance = None
+                if id is not None:
+                    instance = authorized_action_target(
+                        info,
+                        cast("type[RebacMixin]", model),
+                        id,
+                        "write",
+                    )
+                return run_onchange(
+                    model,
+                    node=node,
+                    values=cast("Mapping[str, Any]", values) if values else {},
+                    changed=changed,
+                    instance=cast("models.Model | None", instance),
+                )
+            except BASELINE_ACTION_ERRORS as error:
+                return onchange_error_payload(error)
+
+        namespace[onchange_root] = strawberry.field(resolver=resolve_onchange, name=onchange_root)
+
+    if not namespace:
+        return resource
+    holder = strawberry.type(type(f"{res}__draft_query", (), namespace))
+    # Keep the original query surface's type name: metadata reads it off the
+    # combined class (`type_names.query`), and the merged schema only ever uses
+    # the fields, never the surface class name.
+    combined_query = strawberry.type(type(resource.query.__name__, (resource.query, holder), {}))
+    return dataclasses.replace(resource, query=combined_query)
+
+
 def attach_hasura_resource_metadata(
     resource: HasuraResource,
     *,
@@ -1245,6 +1330,22 @@ def attach_hasura_resource_metadata(
     )
     if detail_root is None:
         raise ImproperlyConfigured(f"{model._meta.label} Hasura resource did not expose a detail root.")
+    query_field_names = set(resource_wire_field_names(resource.query))
+    defaults_root_name = f"{name}_defaults" if f"{name}_defaults" in query_field_names else None
+    onchange_root_name = f"{name}_onchange" if f"{name}_onchange" in query_field_names else None
+    onchange_wire_fields = (
+        tuple(
+            sorted(
+                {
+                    resource_wire_field_name(node, trigger) or trigger
+                    for spec in onchange_specs(model)
+                    for trigger in spec.fields
+                }
+            )
+        )
+        if onchange_root_name is not None
+        else ()
+    )
     attach_data_resource_metadata(
         resource.query,
         make_data_resource_metadata(
@@ -1271,6 +1372,8 @@ def attach_hasura_resource_metadata(
                     if groupable and groups_count_root is not None
                     else None
                 ),
+                defaults_name=defaults_root_name,
+                onchange_name=onchange_root_name,
             ),
             type_names=DataResourceTypeNames(
                 query=resource_type_name(resource.query),
@@ -1284,7 +1387,14 @@ def attach_hasura_resource_metadata(
                 group_order=resource_type_name(group_order_type),
                 having=resource_type_name(having_type),
             ),
-            capabilities=("list", "detail", "aggregate", *(("groups",) if groupable else ())),
+            capabilities=(
+                "list",
+                "detail",
+                "aggregate",
+                *(("groups",) if groupable else ()),
+                *(("defaults",) if defaults_root_name is not None else ()),
+                *(("onchange",) if onchange_root_name is not None else ()),
+            ),
             filter_fields=filterable,
             order_fields=sortable,
             aggregate_fields=aggregatable,
@@ -1292,6 +1402,7 @@ def attach_hasura_resource_metadata(
             group_dimensions=_hasura_group_dimensions(model, groupable, filterable, json_paths=active_json_paths),
             aggregate_measures=_hasura_aggregate_measures(model, aggregatable),
             default_measures=(DataAggregateMeasureMetadata(op="count"),),
+            onchange_fields=onchange_wire_fields,
             fields=fields,
             row_model=row_model,
         ),

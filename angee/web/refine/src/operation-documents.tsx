@@ -6,16 +6,22 @@ import {
 } from "react";
 export type ActionDocumentMap = Readonly<Record<string, unknown>>;
 export type AggregateDocumentMap = Readonly<Record<string, unknown>>;
+export type DefaultsDocumentMap = Readonly<Record<string, unknown>>;
 export type DeletePreviewDocumentMap = Readonly<Record<string, unknown>>;
 export type GroupDocumentMap = Readonly<Record<string, unknown>>;
+export type OnchangeDocumentMap = Readonly<Record<string, unknown>>;
 export type RevisionDocumentMap = Readonly<Record<string, unknown>>;
 export type SaveDocumentMap = Readonly<Record<string, unknown>>;
 
 export interface SchemaOperationDocuments {
   actions?: ActionDocumentMap;
   aggregates?: AggregateDocumentMap;
+  /** Generated `<resource>_defaults(defaults)` create-draft seed documents. */
+  defaults?: DefaultsDocumentMap;
   deletePreviews?: DeletePreviewDocumentMap;
   groups?: GroupDocumentMap;
+  /** Generated `<resource>_onchange(values, changed, id)` recompute documents. */
+  onchanges?: OnchangeDocumentMap;
   revisions?: RevisionDocumentMap;
   /** Authored `<resource>_save(pk, patch, lines)` diff-apply documents (F6). */
   saves?: SaveDocumentMap;
@@ -28,8 +34,10 @@ export type OperationDocumentKind = keyof SchemaOperationDocuments;
 const OPERATION_DOCUMENT_LABELS = {
   actions: "action",
   aggregates: "aggregate",
+  defaults: "defaults",
   deletePreviews: "delete-preview",
   groups: "group",
+  onchanges: "onchange",
   revisions: "revision",
   saves: "save",
 } as const satisfies Record<OperationDocumentKind, string>;

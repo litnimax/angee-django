@@ -193,7 +193,17 @@ def test_console_resource_metadata_declares_integration_surface() -> None:
     }
     assert metadata.default_measures[0].op == "count"
     assert metadata.aggregate_measures == ()
-    assert metadata.capabilities == ("list", "detail", "aggregate", "groups", "create", "update", "delete", "changes")
+    assert metadata.capabilities == (
+        "list",
+        "detail",
+        "aggregate",
+        "groups",
+        "defaults",
+        "create",
+        "update",
+        "delete",
+        "changes",
+    )
     assert metadata.relation_axes[0].field == "vendor"
     assert metadata.relation_axes[0].model_label == "integrate.Vendor"
     assert metadata.relation_axes[0].public_id_field == "sqid"
@@ -219,6 +229,7 @@ def test_console_resource_metadata_declares_integration_surface() -> None:
         "detail",
         "aggregate",
         "groups",
+        "defaults",
         "create",
         "update",
         "delete",

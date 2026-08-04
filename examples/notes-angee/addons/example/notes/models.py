@@ -14,6 +14,7 @@ from angee.base.mixins import (
     SqidMixin,
 )
 from angee.base.models import AngeeModel
+from angee.base.onchange import onchange
 from angee.messaging.models import ThreadedModelMixin
 
 
@@ -65,10 +66,16 @@ class Note(SqidMixin, AuditMixin, ThreadedModelMixin, AngeeModel, HistoryMixin, 
 
         return len((body or "").split())
 
+    @onchange("body")
+    def recount_words(self) -> None:
+        """Derive the word count from the body — live on a form draft, and on save."""
+
+        self.word_count = self.count_words(self.body)
+
     def save(self, *args: Any, **kwargs: Any) -> None:
         """Persist the current number of whitespace-delimited body words."""
 
-        self.word_count = self.count_words(self.body)
+        self.recount_words()
         update_fields = kwargs.get("update_fields")
         if update_fields is not None:
             field_names = set(update_fields)

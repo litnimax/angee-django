@@ -116,6 +116,12 @@ export interface DataResourceMetadata {
   createFields?: readonly string[];
   updateFields?: readonly string[];
   requiredCreateFields?: readonly string[];
+  /**
+   * Wire names of the fields whose edits trigger the `<resource>_onchange`
+   * recompute — the form round-trips only when one of these changes. Present
+   * only when the model declares recompute handlers (`roots.onchange` set).
+   */
+  onchangeFields?: readonly string[];
   revisionFields?: readonly string[];
   relationAxes: readonly DataResourceRelationAxisMetadata[];
   groupAliases?: readonly DataResourceGroupAliasMetadata[];
@@ -147,6 +153,10 @@ export interface DataResourceRootMetadata {
   aggregate?: string | null;
   groups?: string | null;
   groupsCount?: string | null;
+  /** Generated `<resource>_defaults(defaults)` create-draft seed query. */
+  defaults?: string | null;
+  /** Generated `<resource>_onchange(values, changed, id)` recompute query. */
+  onchange?: string | null;
   create?: string | null;
   update?: string | null;
   /** Authored `<resource>_save(pk, patch, lines)` diff-apply mutation (F6). */

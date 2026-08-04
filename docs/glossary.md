@@ -129,6 +129,16 @@ of an agent or automation. Non-login (unusable password, excluded from OIDC
 linking and user pickers); its lifecycle is owned by the thing it represents
 (the agents manager creates, renames, and deactivates it with its `Agent`).
 
+**Create defaults** — the server-computed values a new row starts from, owned by
+`Model.get_create_defaults`. The generated `<resource>_defaults` query serves
+them to create forms; the gate-facing `apply_create_defaults` derives its
+blank-on-input values from the same rule.
+
+**Recompute handler** — a model method declared with `@onchange("field", …)`
+that recomputes dependent fields on an unsaved draft while a form edits a
+trigger field. Served by the generated `<resource>_onchange` query; never
+persists — `save()` stays authoritative.
+
 **Resource file** — tabular data owned by an addon and imported idempotently by
 tier (`master`, `install`, `demo`). Addons list resource files in their
 `addon.toml` `[resources]` manifest.

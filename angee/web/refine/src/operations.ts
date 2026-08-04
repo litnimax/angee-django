@@ -266,6 +266,109 @@ export function extractSaveResult(
   return fieldRecord(data, root);
 }
 
+/** Variables for the generated `<resource>_defaults(defaults)` create-seed query. */
+export interface ResourceDefaultsVariables extends Record<string, unknown> {
+  /** Client seeds folded on top of the server defaults (page seeds, field seeds). */
+  defaults?: Record<string, unknown>;
+}
+
+/**
+ * Build the request for the generated `<resource>_defaults(defaults)` query —
+ * the values a new row starts from, computed by the model under the acting
+ * session with the caller's seeds folded on top. Like every dialect builder
+ * here it stays metadata-free: the metadata edge resolves the `defaults` root
+ * as `target` and passes the generated document.
+ */
+export function defaultsRequest(
+  target: CustomGraphQLOperationTarget,
+  variables: ResourceDefaultsVariables,
+  options: { document: unknown },
+): CustomGraphQLRequest {
+  const operation = operationTarget(target);
+  return {
+    dataProviderName: operation.dataProviderName,
+    root: operation.root,
+    meta: queryMeta(
+      options.document,
+      variables.defaults !== undefined ? { defaults: variables.defaults } : {},
+    ),
+  };
+}
+
+/** Pull the seeded draft values from a `<resource>_defaults` response. */
+export function extractDefaults(
+  data: unknown,
+  root: string,
+): Record<string, unknown> | null {
+  const values = recordValue(data)?.[root];
+  return isRecord(values) ? values : null;
+}
+
+/** Variables for the generated `<resource>_onchange(values, changed, id)` recompute query. */
+export interface ResourceOnchangeVariables extends Record<string, unknown> {
+  /** The current draft, write-shaped, keyed by wire field name. */
+  values: Record<string, unknown>;
+  /** Wire names of the fields the edit changed (the recompute triggers). */
+  changed: readonly string[];
+  /** Public id of the stored row an edit draft overlays; absent on create. */
+  id?: string | null;
+}
+
+/** Non-blocking recompute message a handler returned for the form to surface. */
+export interface OnchangeWarning {
+  title: string;
+  message: string;
+}
+
+/** The recomputed values plus in-band handler outcomes of one onchange round-trip. */
+export interface OnchangeResult {
+  values: Record<string, unknown>;
+  warning: OnchangeWarning | null;
+  validationErrors: Record<string, readonly string[]> | null;
+}
+
+/**
+ * Build the request for the generated `<resource>_onchange(values, changed, id)`
+ * query — the server recompute of dependent draft fields. Read-only: nothing
+ * persists, so it rides `queryMeta` like the other dialect reads.
+ */
+export function onchangeRequest(
+  target: CustomGraphQLOperationTarget,
+  variables: ResourceOnchangeVariables,
+  options: { document: unknown },
+): CustomGraphQLRequest {
+  const operation = operationTarget(target);
+  return {
+    dataProviderName: operation.dataProviderName,
+    root: operation.root,
+    meta: queryMeta(options.document, {
+      values: variables.values,
+      changed: variables.changed,
+      ...(variables.id != null && variables.id !== "" ? { id: variables.id } : {}),
+    }),
+  };
+}
+
+/** Pull the recompute outcome from a `<resource>_onchange` response. */
+export function extractOnchange(data: unknown, root: string): OnchangeResult | null {
+  const payload = fieldRecord(data, root);
+  if (!payload) return null;
+  const warning = isRecord(payload.warning) ? payload.warning : null;
+  return {
+    values: isRecord(payload.values) ? payload.values : {},
+    warning:
+      warning && typeof warning.message === "string"
+        ? {
+            title: typeof warning.title === "string" ? warning.title : "",
+            message: warning.message,
+          }
+        : null,
+    // The wire field is snake_case (the schema's Hasura naming); expose the
+    // idiomatic camelCase domain key, like the other extractors here.
+    validationErrors: stringListMap(payload.validation_errors),
+  };
+}
+
 export function actionRequest(
   field: string,
   variables: ByIdVariables,

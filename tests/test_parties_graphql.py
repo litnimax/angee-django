@@ -91,6 +91,7 @@ def test_public_resource_metadata_declares_people_surface() -> None:
         "detail",
         "aggregate",
         "groups",
+        "defaults",
         "create",
         "update",
     )

@@ -61,6 +61,13 @@ import {
 
 const sdkMocks = vi.hoisted(() => ({
   record: null as Row | null,
+  // The `<resource>_defaults` values the mocked hook resolves; `null` keeps the
+  // create gate waiting. A stable object — the arrival effect keys on identity.
+  defaultsValues: null as Record<string, unknown> | null,
+  // Records the client seeds each defaults read carried.
+  defaultsSeeds: vi.fn(),
+  // The `<resource>_onchange` runner (resolves an OnchangeResult or null).
+  onchange: vi.fn(),
   listRows: [] as Row[],
   // Whether the most recent relation-options `useList` ran with its query
   // enabled — the deferred 200-row fetch fires only once the picker is opened,
@@ -89,6 +96,24 @@ vi.mock("@angee/refine", async (importOriginal) => {
       fetching: false,
       error: null,
       reset: vi.fn(),
+    }),
+    useAngeeDefaults: (
+      target: unknown,
+      options: { defaults?: Record<string, unknown>; enabled?: boolean },
+    ) => {
+      const active = target !== null && options.enabled !== false;
+      if (active) sdkMocks.defaultsSeeds(options.defaults);
+      return {
+        values: active ? sdkMocks.defaultsValues : null,
+        fetching: false,
+        error: null,
+        refetch: vi.fn(),
+      };
+    },
+    useAngeeOnchange: (target: unknown) => ({
+      run: target !== null ? sdkMocks.onchange : async () => null,
+      fetching: false,
+      error: null,
     }),
   };
 });
@@ -357,6 +382,9 @@ describe("FormView", () => {
     sdkMocks.projectToSelection = false;
     sdkMocks.mutationAction = undefined;
     sdkMocks.mutationOptions = undefined;
+    sdkMocks.defaultsValues = null;
+    sdkMocks.defaultsSeeds.mockReset();
+    sdkMocks.onchange.mockReset();
     sdkMocks.mutate.mockImplementation(async ({ data }: { data: Row }) => ({
       ...sdkMocks.record,
       ...data,
@@ -2456,6 +2484,81 @@ describe("FormView", () => {
     // The row-1 cell surfaces its server message from the projected rowErrors.
     expect(await screen.findByText("This field is required.")).toBeTruthy();
   });
+
+  test("gates a create form on the server defaults", async () => {
+    sdkMocks.defaultsValues = null;
+    renderDraftCreate();
+
+    // The defaults capability is present but unresolved: the form's first paint
+    // waits on the loading surface so react-hook-form never captures
+    // client-empty values.
+    expect(screen.queryByLabelText("Title")).toBeNull();
+    expect(await screen.findByRole("status")).toBeTruthy();
+  });
+
+  test("seeds a create form from the arrived server defaults", async () => {
+    sdkMocks.defaultsValues = { title: "Server title", word_count: 0 };
+    renderDraftCreate();
+
+    await waitFor(() =>
+      expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe(
+        "Server title",
+      ),
+    );
+    // The client tiers (`Field.defaultValue`, page seeds) ride into the read as
+    // seeds the server folds at top precedence.
+    expect(sdkMocks.defaultsSeeds).toHaveBeenCalledWith(
+      expect.objectContaining({ title: "Client title" }),
+    );
+  });
+
+  test("round-trips a trigger edit and applies the recomputed values", async () => {
+    sdkMocks.defaultsValues = {};
+    sdkMocks.onchange.mockResolvedValue({
+      values: { word_count: 11 },
+      warning: null,
+      validationErrors: null,
+    });
+    renderDraftCreate();
+
+    fireEvent.change(await screen.findByLabelText("Title"), {
+      target: { value: "Hello world" },
+    });
+
+    await waitFor(
+      () => expect(sdkMocks.onchange).toHaveBeenCalledTimes(1),
+      { timeout: 2000 },
+    );
+    expect(sdkMocks.onchange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        changed: ["title"],
+        values: expect.objectContaining({ title: "Hello world" }),
+      }),
+    );
+    await waitFor(() =>
+      expect((screen.getByLabelText("Words") as HTMLInputElement).value).toBe(
+        "11",
+      ),
+    );
+  });
+
+  test("surfaces an onchange warning as a toast", async () => {
+    sdkMocks.defaultsValues = {};
+    sdkMocks.onchange.mockResolvedValue({
+      values: {},
+      warning: { title: "Long title", message: "That title is getting long." },
+      validationErrors: null,
+    });
+    renderDraftCreate();
+
+    fireEvent.change(await screen.findByLabelText("Title"), {
+      target: { value: "x" },
+    });
+
+    expect(
+      await screen.findByText("Long title", undefined, { timeout: 2000 }),
+    ).toBeTruthy();
+  });
 });
 
 function saleDocRecord(): Row {
@@ -2555,6 +2658,74 @@ const SALES_METADATA: SchemaFieldMetadata = {
 const SALES_DOCUMENTS = {
   console: { saves: { "demo.SaleDoc": { kind: "Document", definitions: [] } } },
 };
+
+const DRAFT_METADATA: SchemaFieldMetadata = {
+  types: {
+    DraftType: {
+      typeName: "DraftType",
+      recordRepresentation: "title",
+      fields: {
+        title: { name: "title", kind: "scalar", scalar: "String" },
+        word_count: { name: "word_count", kind: "scalar", scalar: "Int" },
+      },
+      rootFields: {
+        list: "drafts",
+        detail: "drafts_by_pk",
+        create: "insert_drafts_one",
+      },
+      resource: {
+        schemaName: "console",
+        modelLabel: "demo.Draft",
+        appLabel: "demo",
+        modelName: "Draft",
+        publicIdField: "id",
+        roots: {
+          list: "drafts",
+          detail: "drafts_by_pk",
+          create: "insert_drafts_one",
+          defaults: "drafts_defaults",
+          onchange: "drafts_onchange",
+        },
+        typeNames: { node: "DraftType", createInput: "drafts_insert_input" },
+        capabilities: ["list", "detail", "defaults", "onchange", "create"],
+        fields: [
+          saleLineField("title", "String"),
+          saleLineField("word_count", "Int"),
+        ],
+        filterFields: [],
+        orderFields: [],
+        aggregateFields: [],
+        groupByFields: [],
+        onchangeFields: ["title"],
+        relationAxes: [],
+      },
+    },
+  },
+};
+
+const DRAFT_DOCUMENTS = {
+  console: {
+    defaults: { "demo.Draft": { kind: "Document", definitions: [] } },
+    onchanges: { "demo.Draft": { kind: "Document", definitions: [] } },
+  },
+};
+
+function renderDraftCreate(): void {
+  renderWithProviders(
+    <FormView
+      resource="demo.Draft"
+      id={null}
+      fields={[
+        { name: "title", label: "Title", defaultValue: "Client title" },
+        { name: "word_count", label: "Words" },
+      ]}
+    />,
+    DRAFT_METADATA,
+    undefined,
+    undefined,
+    DRAFT_DOCUMENTS,
+  );
+}
 
 function renderForm(id: string | null): void {
   renderWithProviders(<FormView resource="notes.Note" id={id} fields={fields} />);

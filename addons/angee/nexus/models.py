@@ -218,23 +218,40 @@ class Cadence(SqidMixin, AngeeModel):
         self.touch_due_at = touch_due_at
         super().save(update_fields=["touch_due_at", "updated_at"])
 
+    @classmethod
+    def get_create_defaults(cls, *, defaults: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Offer the acting user to a create form when one is authenticated."""
+
+        values = super().get_create_defaults(defaults=defaults)
+        if values.get("user") is None:
+            try:
+                values["user"] = cls._actor_user()
+            except ValidationError:
+                values.pop("user", None)
+        return values
+
     def apply_create_defaults(self) -> Mapping[str, Sequence[Any]]:
         """Bind a blank user relation to the authenticated REBAC actor."""
 
         contributions = dict(super().apply_create_defaults())
         if self.user_id is not None:
             return contributions
+        self.user = self._actor_user()
+        contributions["user"] = (self.user,)
+        return contributions
+
+    @classmethod
+    def _actor_user(cls) -> Any:
+        """Return the acting user row, or raise a ``user``-keyed validation error."""
+
         actor = current_actor()
         if not is_user_actor(actor):
             raise ValidationError({"user": "An authenticated user is required."})
-        user_id = actor_user_id(actor)
-        user_model = type(self)._meta.get_field("user").related_model
-        user = user_model._base_manager.filter(pk=user_id).first()
+        user_model = cls._meta.get_field("user").related_model
+        user = user_model._base_manager.filter(pk=actor_user_id(actor)).first()
         if user is None:
             raise ValidationError({"user": "The authenticated user no longer exists."})
-        self.user = user
-        contributions["user"] = (user,)
-        return contributions
+        return user
 
     def save(self, *args: Any, **kwargs: Any) -> None:
         """Refresh the server-owned due date whenever cadence intent changes."""

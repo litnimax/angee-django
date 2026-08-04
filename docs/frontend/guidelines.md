@@ -316,6 +316,17 @@ TanStack apply the URL-owned filter object to in-memory rows.
   card) instead of wrapping it in a `grid place-content-center` div; `LoadingPanel`
   already self-centers. A renderer owns its own loading/error so callers describe
   only the happy path (cf. `preview/builtins.tsx` `FileText`).
+- **Create forms open on server defaults; trigger edits recompute server-side.**
+  A resource with the `defaults` capability gates `FormView`'s first create
+  paint on the `<resource>_defaults` query — the client seeds (page
+  `createDefaults` and each `Field.defaultValue`) ride into it and the server
+  folds them at top precedence, so the model is the one defaults owner. A field
+  named in the resource's `onchangeFields` round-trips the visible draft
+  (debounced, latest-wins) through `useAngeeOnchange` and the recomputed values
+  apply through the same `setValue` path a prefill uses; warnings toast and
+  field-keyed errors ride `serverFieldErrors`. Do not hand-roll dependent-field
+  derivation in a page when the rule belongs to the model — declare it there
+  with `@onchange` and let the form inherit it.
 - Forms are declarative even when they branch: a `<Field showWhen={(values) => …}>`
   predicate (mirroring `Action.visibleWhen`) drives a discriminated form — a `kind`
   select that swaps the body — and a hidden field is never submitted. Reach for a

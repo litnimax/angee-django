@@ -1,5 +1,5 @@
-import { useCallback, useMemo } from "react";
-import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useCustom,
   useCustomMutation,
@@ -19,15 +19,19 @@ import {
 import {
   aggregateRequest,
   actionRequest,
+  defaultsRequest,
   deletePreviewRequest,
   extractActionOutcome,
   extractAggregate,
+  extractDefaults,
   extractDeletePreview,
   extractFacet,
   extractGroupBy,
+  extractOnchange,
   extractRevisions,
   extractSaveResult,
   groupByRequest,
+  onchangeRequest,
   revisionsRequest,
   saveRequest,
   type ActionOutcome,
@@ -40,6 +44,8 @@ import {
   type FacetRequestSpec,
   type GroupByRequestOptions,
   type GroupByResult,
+  type OnchangeResult,
+  type ResourceOnchangeVariables,
   type ResourceRevision,
   type ResourceFacetResult,
   type ResourceSaveVariables,
@@ -538,6 +544,140 @@ export function useAngeeResourceSave(
     error: run.mutation.error,
     reset: run.mutation.reset,
   };
+}
+
+export interface UseAngeeDefaultsResult {
+  values: Record<string, unknown> | null;
+  fetching: boolean;
+  error: HttpError | null;
+  refetch: () => void;
+}
+
+/**
+ * Read the generated `<resource>_defaults(defaults)` query — the values a new
+ * row starts from, computed by the model under the acting session with the
+ * caller's seeds folded on top. The metadata edge resolves the `defaults` root
+ * as `target`; a `null` target (capability absent) resolves `values: null`
+ * with nothing fetched, so a create form falls back to its client-only seeds.
+ * Rides react-query over the provider's custom request (the
+ * `useGroupByRequestBatch` shape) so a provider without `custom` support is
+ * only ever touched when a fetch actually runs, never at render.
+ */
+export function useAngeeDefaults(
+  target: CustomGraphQLOperationTarget | null,
+  options: DialectDocumentOptions & {
+    defaults?: Record<string, unknown>;
+    enabled?: boolean;
+  },
+): UseAngeeDefaultsResult {
+  const { document, defaults, enabled = true } = options;
+  const dataProvider = useDataProvider();
+  const canQuery = enabled && target !== null;
+  const defaultsKey = stableKey(defaults ?? {});
+  const request = useMemo(
+    () => (target ? defaultsRequest(target, { defaults }, { document }) : null),
+    [document, target, defaultsKey],
+  );
+  const query = useQuery({
+    queryKey: [
+      "angee",
+      "defaults",
+      request?.dataProviderName,
+      request?.root,
+      defaultsKey,
+    ],
+    queryFn: async () => {
+      if (!request) return null;
+      const custom = dataProvider(request.dataProviderName).custom;
+      if (!custom) {
+        throw new Error(
+          `Data provider "${request.dataProviderName}" does not support ` +
+            "custom GraphQL requests.",
+        );
+      }
+      const response = await custom<BaseRecord>({
+        url: "",
+        method: "post",
+        meta: request.meta,
+      });
+      return response.data;
+    },
+    enabled: canQuery,
+  });
+  return {
+    values:
+      request && canQuery && query.data != null
+        ? extractDefaults(query.data, request.root)
+        : null,
+    fetching: query.isFetching,
+    error: (query.error ?? null) as HttpError | null,
+    refetch: () => {
+      void query.refetch();
+    },
+  };
+}
+
+export interface UseAngeeOnchangeResult {
+  run: (variables: ResourceOnchangeVariables) => Promise<OnchangeResult | null>;
+  fetching: boolean;
+  error: Error | null;
+}
+
+/**
+ * Run the generated `<resource>_onchange(values, changed, id)` recompute query
+ * imperatively — one round-trip per (debounced) trigger-field edit, resolving
+ * the recomputed values plus in-band handler outcomes. Latest wins: a run
+ * superseded by a newer edit resolves `null` instead of racing stale values
+ * into the form. Read-only, so it rides the provider's custom request directly
+ * with no cache entry to invalidate.
+ */
+export function useAngeeOnchange(
+  target: CustomGraphQLOperationTarget | null,
+  options: DialectDocumentOptions,
+): UseAngeeOnchangeResult {
+  const { document } = options;
+  const dataProvider = useDataProvider();
+  const [fetching, setFetching] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const sequenceRef = useRef(0);
+  const run = useCallback(
+    async (
+      variables: ResourceOnchangeVariables,
+    ): Promise<OnchangeResult | null> => {
+      if (!target) return null;
+      const request = onchangeRequest(target, variables, { document });
+      const custom = dataProvider(request.dataProviderName).custom;
+      if (!custom) {
+        throw new Error(
+          `Data provider "${request.dataProviderName}" does not support ` +
+            "custom GraphQL requests.",
+        );
+      }
+      const sequence = ++sequenceRef.current;
+      setFetching(true);
+      setError(null);
+      try {
+        const response = await custom<BaseRecord>({
+          url: "",
+          method: "post",
+          meta: request.meta,
+        });
+        if (sequence !== sequenceRef.current) return null;
+        return extractOnchange(response.data, request.root);
+      } catch (caught) {
+        if (sequence === sequenceRef.current) {
+          setError(errorFromHttp(caught));
+        }
+        return null;
+      } finally {
+        if (sequence === sequenceRef.current) {
+          setFetching(false);
+        }
+      }
+    },
+    [dataProvider, document, target],
+  );
+  return { run, fetching, error };
 }
 
 export function useAngeeRevisions(

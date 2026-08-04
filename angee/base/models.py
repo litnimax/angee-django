@@ -31,6 +31,7 @@ from rebac.types import RelationshipFilter
 from angee.base.fields import SqidField
 from angee.base.impl import ImplClassField
 from angee.base.mixins import SqidMixin, TimestampMixin
+from angee.base.onchange import onchange_check_messages
 
 _ModelT = TypeVar("_ModelT", bound=models.Model)
 
@@ -311,6 +312,7 @@ class AngeeModel(TimestampMixin, RebacMixin):
 
         errors = super().check(**kwargs)
         errors.extend(cls._check_catalogue_tier())
+        errors.extend(onchange_check_messages(cls))
         return errors
 
     @classmethod
@@ -376,6 +378,35 @@ class AngeeModel(TimestampMixin, RebacMixin):
             return field.resolve_class(default)
         return field.resolve_for(self)
 
+    @classmethod
+    def get_create_defaults(cls, *, defaults: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Return the field values a new row starts from, seeds folded on top.
+
+        The pre-instantiation defaults owner. The generated ``<resource>_defaults``
+        query calls it so a create form opens with the values the model would
+        persist, and gate-facing :meth:`apply_create_defaults` overrides derive
+        their blank-on-input values from the same rule — each default is stated
+        once, on the method that owns it.
+
+        The base evaluates every editable concrete field's declared default at
+        call time (so callable defaults are current) and folds caller
+        ``defaults`` on top: client-supplied seeds win over model rules, keyed by
+        field name with already-coerced Python values (wire decoding is the
+        GraphQL layer's job). Overrides add computed, actor-aware defaults and
+        must omit a key they cannot resolve rather than raise, so a form still
+        opens when a default is unavailable; the gate-facing hook is where an
+        unresolvable required default raises.
+        """
+
+        values: dict[str, Any] = {}
+        for field in cls._meta.concrete_fields:
+            if field.primary_key or not field.editable or not field.has_default():
+                continue
+            values[field.name] = field.get_default()
+        if defaults:
+            values.update(defaults)
+        return values
+
     def apply_create_defaults(self) -> Mapping[str, Sequence[Any]]:
         """Apply this row's blank-on-input create defaults before the create gate.
 
@@ -391,8 +422,11 @@ class AngeeModel(TimestampMixin, RebacMixin):
         this hook to apply that default here too (idempotent with ``save()``, so
         the row still persists with it) and return the relation contributions the
         default adds, keyed by relation name with subject values — so the gate is
-        evaluated against the row as it will persist. The base default applies no
-        defaults and contributes nothing.
+        evaluated against the row as it will persist. The default's *rule* lives
+        once, shared with :meth:`get_create_defaults` (the form-facing owner);
+        this hook keeps only the blank check, the gate contribution, and the
+        field-keyed ``ValidationError`` for a required default that cannot be
+        resolved. The base default applies no defaults and contributes nothing.
         """
 
         return {}

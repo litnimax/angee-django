@@ -21,8 +21,11 @@ import { Controller,
 import { useBlocker } from "@tanstack/react-router";
 import {
   refineFieldsFromPaths,
+  useAngeeDefaults,
+  useAngeeOnchange,
   useAngeeResourceSave,
   } from "@angee/refine";
+import { useDebouncedCallback } from "use-debounce";
 import {
   publicIdLabel,
 } from "@angee/metadata";
@@ -41,7 +44,8 @@ import {
 
 import { Button } from "../ui/button";
 import { ErrorBanner } from "../fragments/ErrorBanner";
-import { useConfirm } from "../feedback";
+import { LoadingPanel } from "../fragments/LoadingPanel";
+import { useConfirm, useToast } from "../feedback";
 import {
   FieldDescription,
   FieldLabel,
@@ -68,7 +72,11 @@ import {
   recordLinesToRows,
   type LineDiff,
 } from "./editable-lines";
-import { useSaveOperation } from "./resource-operations";
+import {
+  useDefaultsOperation,
+  useOnchangeOperation,
+  useSaveOperation,
+} from "./resource-operations";
 import {
   validationErrorsFromError,
   type ValidationErrors,
@@ -150,6 +158,9 @@ export interface RecordTabDescriptor {
 
 /** Value of the form body's leading tab, shown when `recordTabs` is set. */
 const OVERVIEW_TAB_ID = "overview";
+
+/** Trailing debounce for the server recompute round-trip on trigger-field edits. */
+const ONCHANGE_DEBOUNCE_MS = 400;
 
 export interface FormViewProps {
   /** Model label rendered by this form, e.g. `"notes.Note"`. */
@@ -587,16 +598,42 @@ export function FormView({
     [selection],
   );
   const refineResource = dataResource ? refineResourceName(dataResource) : "";
+  // Server-computed create defaults: the generated `<resource>_defaults` query
+  // evaluates the model's rule under the acting session, folding the client
+  // seeds (page `createDefaults` plus each field's own `defaultValue`) at top
+  // precedence and intersecting with the creatable set. The response feeds
+  // `emptyDraft` above the client-only tiers; a resource without the capability
+  // (null target) skips the round-trip and the client ladder stands alone.
+  const defaultsOperation = useDefaultsOperation(isCreate ? dataResource : null);
+  const clientSeeds = React.useMemo(() => {
+    const seeds: Record<string, unknown> = {};
+    for (const field of formFields) {
+      if (field.defaultValue !== undefined) seeds[field.name] = field.defaultValue;
+    }
+    Object.assign(seeds, defaultValues ?? {});
+    return seeds;
+  }, [defaultValues, formFields]);
+  const serverDefaults = useAngeeDefaults(defaultsOperation.target, {
+    document: defaultsOperation.document,
+    defaults: clientSeeds,
+    enabled: isCreate,
+  });
   const emptyValues = React.useMemo(
-    () => emptyDraft(formFields, defaultValues),
-    [defaultValues, formFields],
+    () => emptyDraft(formFields, defaultValues, serverDefaults.values),
+    [defaultValues, formFields, serverDefaults.values],
   );
-  // Field names the page-level create seed (`defaultValues`) pins. On create these
-  // submit even when read-only — the same exception a field's own `defaultValue`
-  // gets — so a `createDefaults` seed is never silently dropped from the payload.
+  // Field names a create seed pins — the page-level `defaultValues` plus every
+  // server-defaulted field. On create these submit even when read-only — the
+  // same exception a field's own `defaultValue` gets — so neither a
+  // `createDefaults` seed nor a server default is silently dropped from the
+  // payload.
   const createSeedNames = React.useMemo<ReadonlySet<string>>(
-    () => new Set(Object.keys(defaultValues ?? {})),
-    [defaultValues],
+    () =>
+      new Set([
+        ...Object.keys(defaultValues ?? {}),
+        ...Object.keys(serverDefaults.values ?? {}),
+      ]),
+    [defaultValues, serverDefaults.values],
   );
   const [patchedRecord, setPatchedRecord] = React.useState<Row | null>(null);
   // `useForm` re-seeds an untouched form whenever `defaultValues` deep-changes.
@@ -728,6 +765,20 @@ export function FormView({
     [linesResource],
   );
   const linesField = linesResource?.field ?? null;
+  // Server recompute (`<resource>_onchange`): an edit to a trigger field
+  // round-trips the visible draft (debounced, latest-wins) and the handlers'
+  // recomputed values land back through the same `setValue` path a prefill
+  // uses. Only a model declaring handlers carries the capability, so every
+  // other form pays nothing here.
+  const onchangeOperation = useOnchangeOperation(dataResource);
+  const onchangeRun = useAngeeOnchange(onchangeOperation.target, {
+    document: onchangeOperation.document,
+  });
+  const onchangeTriggers = React.useMemo(
+    () => new Set(dataResource?.onchangeFields ?? []),
+    [dataResource],
+  );
+  const pendingOnchangeRef = React.useRef<Set<string>>(new Set());
   const saveOperation = useSaveOperation(dataResource);
   const resourceSave = useAngeeResourceSave(saveOperation.target, {
     document: saveOperation.document,
@@ -1040,6 +1091,24 @@ export function FormView({
     seedLineRows,
   ]);
 
+  // Re-seed the create form when the server defaults land. The first paint is
+  // gated on them (`awaitingDefaults` below), so the reset normally runs on a
+  // never-shown clean form; the dirty guard covers the degraded path (a failed
+  // gate) where the user already typed.
+  const appliedDefaultsRef = React.useRef<Record<string, unknown> | null>(null);
+  React.useEffect(() => {
+    if (!isCreate) {
+      appliedDefaultsRef.current = null;
+      return;
+    }
+    const seeded = serverDefaults.values;
+    if (seeded == null || appliedDefaultsRef.current === seeded) return;
+    appliedDefaultsRef.current = seeded;
+    if (formIsDirtyRef.current) return;
+    baselineValuesRef.current = emptyValues;
+    resetForm(emptyValues);
+  }, [emptyValues, isCreate, resetForm, serverDefaults.values]);
+
   const titleField = titleFieldFor(formFields, modelMetadata);
   const titleFieldMessages = titleField
     ? [
@@ -1104,6 +1173,55 @@ export function FormView({
         : undefined,
     [linesActive, linesField, serverFieldErrors],
   );
+  const toast = useToast();
+  // Apply server-recomputed values into the live form. `shouldDirty` is honest —
+  // they are unsaved edits — and `canonicalOptionValue` reconciles an authored
+  // option's casing exactly as a record seed does.
+  const applyRecomputedValues = React.useCallback(
+    (values: Record<string, unknown>): void => {
+      for (const [name, value] of Object.entries(values)) {
+        const field = fieldByName.get(name);
+        if (!field) continue;
+        const optionValue = canonicalOptionValue(field.options, value);
+        form.setValue(name, optionValue !== undefined ? optionValue : value, {
+          shouldDirty: true,
+          shouldTouch: true,
+        });
+      }
+    },
+    [fieldByName, form],
+  );
+  const fireOnchange = useDebouncedCallback(() => {
+    const changed = [...pendingOnchangeRef.current];
+    pendingOnchangeRef.current = new Set();
+    if (changed.length === 0) return;
+    const values = draftValues(form.getValues(), formFields);
+    void onchangeRun
+      .run({
+        values,
+        changed,
+        ...(isCreate || id == null ? {} : { id: String(id) }),
+      })
+      .then((result) => {
+        if (!result) return;
+        applyRecomputedValues(result.values);
+        if (result.warning) {
+          toast.warning({
+            title: result.warning.title || result.warning.message,
+            description: result.warning.title ? result.warning.message : undefined,
+          });
+        }
+        const { __all__: formMessages, ...fieldMessages } =
+          result.validationErrors ?? {};
+        if (Object.keys(fieldMessages).length > 0) {
+          setServerFieldErrors((prev) => ({ ...prev, ...fieldMessages }));
+        }
+        if (formMessages && formMessages.length > 0) {
+          setSaveError(formMessages.join(" "));
+        }
+      });
+  }, ONCHANGE_DEBOUNCE_MS);
+
   const renderField = (field: FieldDescriptor): React.ReactNode => {
     const relation = relationByField.get(field.name);
     // The selected record's label comes from the parent read (folded above), so
@@ -1172,13 +1290,25 @@ export function FormView({
     }
   }
 
+  // Queue a server recompute for a trigger-field edit. Changed names accumulate
+  // across the debounce window so a burst of edits fires one round-trip carrying
+  // every trigger.
+  function queueOnchange(field: FieldDescriptor): void {
+    if (onchangeOperation.target === null || !onchangeTriggers.has(field.name)) {
+      return;
+    }
+    pendingOnchangeRef.current.add(field.name);
+    fireOnchange();
+  }
+
   // The onChange pipeline shared by every editable field — grid (`renderField`) and
   // the header title/body/status fields. Routing them all here keeps onChange-driven
-  // behavior (impl prefill, slug derivation) from silently skipping the header fields
-  // — which is how the title-source slug derive was lost.
+  // behavior (impl prefill, slug derivation, server recompute) from silently skipping
+  // the header fields — which is how the title-source slug derive was lost.
   function afterFieldChange(field: FieldDescriptor, value: unknown): void {
     applyFieldPrefill(field, value);
     applySlugDerivation(field, value);
+    queueOnchange(field);
   }
 
   function fieldReadOnly(field: FieldDescriptor): boolean {
@@ -1477,6 +1607,19 @@ export function FormView({
       </div>
     </form>
   );
+
+  // Gate the create form's first paint on the defaults round-trip so the values
+  // react-hook-form captures are already server-true — no flash of client-empty
+  // values and no reset race. A failed defaults read degrades to the client
+  // seed ladder instead of blocking the form.
+  const awaitingDefaults =
+    isCreate &&
+    defaultsOperation.target !== null &&
+    serverDefaults.values === null &&
+    serverDefaults.error === null;
+  if (awaitingDefaults) {
+    return <LoadingPanel />;
+  }
 
   if (!tabbed) {
     return (
@@ -1947,18 +2090,26 @@ function addFormField(
 function emptyDraft(
   fields: readonly FieldDescriptor[],
   defaultValues?: Record<string, unknown>,
+  serverDefaults?: Record<string, unknown> | null,
 ): Values {
   const draft: Values = {};
   for (const field of fields) {
-    // Seed precedence (a live user edit later overrides all of these): a
-    // page-level `defaultValues` entry (the list-scope create seed a
-    // `ResourceList` passes to match its active filter) wins, then the field's
-    // own `defaultValue`, then the widget's empty value.
-    draft[field.name] = Object.hasOwn(defaultValues ?? {}, field.name)
-      ? defaultValues?.[field.name]
-      : field.defaultValue !== undefined
-        ? field.defaultValue
-        : emptyValue(field);
+    // Seed precedence (a live user edit later overrides all of these): the
+    // server-computed defaults win — they already folded the client seeds
+    // (page `defaultValues` and `Field.defaultValue`) at top precedence, so a
+    // kept seed comes back through them — then the client tiers stand in for a
+    // field the server dropped (not creatable) or a resource with no defaults
+    // root: a page-level `defaultValues` entry (the list-scope create seed a
+    // `ResourceList` passes to match its active filter), the field's own
+    // `defaultValue`, and finally the widget's empty value.
+    draft[field.name] =
+      serverDefaults != null && Object.hasOwn(serverDefaults, field.name)
+        ? serverDefaults[field.name]
+        : Object.hasOwn(defaultValues ?? {}, field.name)
+          ? defaultValues?.[field.name]
+          : field.defaultValue !== undefined
+            ? field.defaultValue
+            : emptyValue(field);
   }
   return draft;
 }
@@ -2122,6 +2273,32 @@ function mutationData(
 function mutationFieldValue(field: FieldDescriptor, value: unknown): unknown {
   if (isRelationIdField(field)) return relationValueId(value);
   return value;
+}
+
+/**
+ * The visible draft a server recompute round-trip sends: every visible field's
+ * value in write shape, sharing `mutationData`'s field-level coercions
+ * (relation values to flat ids via `mutationFieldValue`, unselected options and
+ * blank numerics never sent as `""`). Unlike a submit it carries clean and
+ * read-only fields too — the server overlays the whole draft — and never the
+ * child-lines rows (line recompute is not part of this round-trip). Enum casing
+ * is deliberately not normalized here: the server's draft decoder owns
+ * accepting the read-side member name alongside the stored value.
+ */
+function draftValues(
+  values: Values,
+  fields: readonly FieldDescriptor[],
+): Record<string, unknown> {
+  const draft: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (!isFieldVisible(field, values)) continue;
+    const next = mutationFieldValue(field, values[field.name]);
+    if (next === undefined) continue;
+    if (isUnselectedOption(field, next)) continue;
+    if (isEmptyNumericValue(field, next)) continue;
+    draft[field.name] = next;
+  }
+  return draft;
 }
 
 function emptyValue(field: FieldDescriptor): unknown {

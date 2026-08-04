@@ -28,15 +28,20 @@ class NotesSchemaMetadataTests(SimpleTestCase):
                 "aggregate": "notes_aggregate",
                 "changes": None,
                 "create": "insert_notes_one",
+                "defaults": "notes_defaults",
                 "delete": "delete_notes_by_pk",
                 "deletePreview": "delete_note",
                 "detail": "notes_by_pk",
                 "groups": "notes_groups",
+                "groupsCount": "notes_groups_count",
                 "list": "notes",
+                "onchange": "notes_onchange",
                 "revisions": "note_revisions",
+                "save": None,
                 "update": "update_notes_by_pk",
             },
         )
+        self.assertEqual(note["onchangeFields"], ["body"])
         self.assertEqual(note["typeNames"]["filter"], "notes_bool_exp")
         self.assertEqual(note["typeNames"]["order"], "notes_order_by")
         self.assertEqual(note["typeNames"]["aggregate"], "notes_aggregate")

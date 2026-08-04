@@ -36,7 +36,7 @@ class NoteWordCountModelTests(TransactionTestCase):
 
 
 class NoteWordCountGraphQLTests(TransactionTestCase):
-    """Expose ``word_count`` through aggregates and ordering."""
+    """Expose ``word_count`` through aggregates, ordering, and the draft roots."""
 
     def setUp(self) -> None:
         call_command("rebac", "sync", verbosity=0)
@@ -74,6 +74,39 @@ class NoteWordCountGraphQLTests(TransactionTestCase):
             },
             expected,
         )
+
+    def test_note_onchange_recomputes_word_count_live(self) -> None:
+        data = self.graphql(
+            """
+            query {
+              notes_onchange(values: {body: "one two three"}, changed: ["body"]) {
+                values
+                warning { message }
+              }
+            }
+            """
+        )["data"]["notes_onchange"]
+
+        self.assertEqual(data["values"], {"word_count": 3})
+        self.assertIsNone(data["warning"])
+
+    def test_note_defaults_seed_a_create_draft(self) -> None:
+        values = self.graphql(
+            """
+            query {
+              notes_defaults(defaults: {title: "Seeded"})
+            }
+            """
+        )["data"]["notes_defaults"]
+
+        self.assertEqual(values["title"], "Seeded")
+        self.assertEqual(values["status"], "draft")
+        self.assertEqual(values["body"], "")
+        self.assertEqual(values["tags"], [])
+        self.assertFalse(values["is_starred"])
+        # ``word_count`` is server-derived (not writable), so the creatable-set
+        # intersection keeps it out of the seed.
+        self.assertNotIn("word_count", values)
 
     def test_notes_order_by_word_count(self) -> None:
         data = self.graphql(

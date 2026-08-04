@@ -278,6 +278,24 @@ Rules that follow from the layering:
   - *Only behaviour differs, closed framework-known set* → a `StateField` + an
     eager **handler registry** (`integrate.credentials.register_handler`/`handler_for`).
     The row stores the enum value; the kind projects as a GraphQL enum.
+- **Server-computed form drafts have two model-owned hooks.**
+  `Model.get_create_defaults(defaults=…)` is the pre-instantiation defaults
+  owner: the generated `<res>_defaults` query serves it so a create form opens
+  with the values the model would persist (caller seeds folded at top
+  precedence, the resolver intersecting with the resource's creatable set), and
+  the gate-facing `apply_create_defaults` derives its blank-on-input values from
+  the same rule — each default is stated once. An override omits a key it cannot
+  resolve rather than raise; the gate hook is where a required, unresolvable
+  default raises field-keyed. `@onchange("field", …)`
+  (`angee.base.onchange`) declares a live recompute handler: when a form edit
+  changes a trigger field, the generated `<res>_onchange` query runs the handler
+  on an unsaved draft instance (edit drafts overlay the actor-authorized row),
+  diffs the concrete fields, and returns what changed; a handler may return an
+  `OnchangeWarning`. Nothing persists — `save()` stays authoritative, so a
+  persisted derivation calls the same handler from `save()` (the notes
+  `word_count` shape). Unknown trigger fields and shadowed handlers fail model
+  checks (`angee.E015`/`angee.E016`); draft wire codecs live in
+  `angee.graphql.data.draft`, and reads inside handlers stay actor-scoped.
 - **Enum-backed fields use `StateField`, never `CharField(choices=…)`.**
   `StateField` wraps django-choices-field's `TextChoicesField`, so strawberry-django
   renders a native GraphQL enum straight from the `choices_enum`. A plain

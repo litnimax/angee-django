@@ -26,6 +26,7 @@ import {
 import type {
   Row,
 } from "@angee/metadata";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { type ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -318,18 +319,24 @@ function wrap(children: ReactElement): ReactElement {
     routeTree: rootRoute.addChildren([indexRoute]),
     history: createMemoryHistory({ initialEntries: ["/"] }),
   });
+  // The refine hooks are mocked above, but FormView's defaults query rides raw
+  // react-query (disabled here — the fixture resource has no defaults root), so
+  // the tree still needs a QueryClient like every real app has.
+  const queryClient = new QueryClient();
   return (
-    <RouterContextProvider router={router}>
-      <ModalsHost>
-        <ToastProvider>
-          <ModelMetadataProvider metadata={metadata}>
-            <AppRuntimeProvider runtime={{ widgets: defaultWidgets }}>
-              {children}
-            </AppRuntimeProvider>
-          </ModelMetadataProvider>
-        </ToastProvider>
-      </ModalsHost>
-    </RouterContextProvider>
+    <QueryClientProvider client={queryClient}>
+      <RouterContextProvider router={router}>
+        <ModalsHost>
+          <ToastProvider>
+            <ModelMetadataProvider metadata={metadata}>
+              <AppRuntimeProvider runtime={{ widgets: defaultWidgets }}>
+                {children}
+              </AppRuntimeProvider>
+            </ModelMetadataProvider>
+          </ToastProvider>
+        </ModalsHost>
+      </RouterContextProvider>
+    </QueryClientProvider>
   );
 }
 

@@ -131,6 +131,19 @@ def action_guard(
     return decorate
 
 
+def require_authenticated(info: strawberry.Info) -> None:
+    """Raise ``rebac.PermissionDenied`` unless the request session is authenticated.
+
+    The session gate every actor-authorized operation shares: an unauthenticated
+    session raises a GraphQL error (the same contract as ``angee.iam``'s
+    ``session_user`` gate) so the client re-authenticates instead of toasting.
+    """
+
+    user = getattr(info.context.request, "user", None)
+    if user is None or not getattr(user, "is_authenticated", False):
+        raise PermissionDenied("Authentication required.")
+
+
 def authorized_action_target(
     info: strawberry.Info,
     model: type[_RebacActionTarget],
@@ -161,9 +174,7 @@ def authorized_action_target(
     and leaves authorization to the caller.
     """
 
-    user = getattr(info.context.request, "user", None)
-    if user is None or not getattr(user, "is_authenticated", False):
-        raise PermissionDenied("Authentication required.")
+    require_authenticated(info)
     instance = instance_for_write(model, id)
     if instance is None:
         raise ValidationError(

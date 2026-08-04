@@ -55,6 +55,18 @@ export function useGroupOperation(
   return useResourceOperation(resource, "groups", "groups");
 }
 
+export function useDefaultsOperation(
+  resource: DataResourceMetadata | null,
+): ResourceOperation {
+  return useResourceOperation(resource, "defaults", "defaults");
+}
+
+export function useOnchangeOperation(
+  resource: DataResourceMetadata | null,
+): ResourceOperation {
+  return useResourceOperation(resource, "onchange", "onchanges");
+}
+
 export function useDeletePreviewOperation(
   resource: DataResourceMetadata | null,
 ): ResourceOperation {
