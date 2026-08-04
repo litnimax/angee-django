@@ -379,6 +379,159 @@ export const APPEARANCE_TEMPLATES: readonly AppearanceTemplate[] = [
 /** Carbon is the product default. */
 export const DEFAULT_TEMPLATE_ID = "carbon";
 
+export const CUSTOM_TEMPLATE_ID = "custom";
+
 export function findTemplate(id: string): AppearanceTemplate | undefined {
   return APPEARANCE_TEMPLATES.find((t) => t.id === id);
+}
+
+// ------------------------------------------------------- generated templates
+
+function toRgb(hex: string): [number, number, number] {
+  return hexToRgb(hex);
+}
+
+function toHex([r, g, b]: [number, number, number]): string {
+  return `#${[r, g, b].map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** Blend two colours in sRGB. Used only for the readability walk, where the exact
+ *  perceptual path matters less than landing on a ratio that passes. */
+function mix(a: string, b: string, t: number): string {
+  const [ar, ag, ab] = toRgb(a);
+  const [br, bg, bb] = toRgb(b);
+  return toHex([ar + (br - ar) * t, ag + (bg - ag) * t, ab + (bb - ab) * t]);
+}
+
+export interface ReadableBrand {
+  brand: string;
+  onBrand: string;
+  /** True when the extracted colour had to be darkened to reach AA. */
+  adjusted: boolean;
+  ratio: number;
+}
+
+/**
+ * Return a brand fill that can legibly carry a label.
+ *
+ * A colour lifted from a website is chosen for a logo, not for a button, so it
+ * frequently fails AA against white. Dark text is tried first — that keeps a
+ * bright brand intact, the way tokens.css keeps amber. Only if neither label
+ * works is the colour walked darker, in small steps, so it stays recognisable.
+ */
+export function ensureReadable(brand: string): ReadableBrand {
+  const white = contrastRatio(brand, "#ffffff");
+  if (white >= 4.5) return { brand, onBrand: "#ffffff", adjusted: false, ratio: white };
+
+  const dark = contrastRatio(brand, "#14141a");
+  if (dark >= 4.5) return { brand, onBrand: "#14141a", adjusted: false, ratio: dark };
+
+  let candidate = brand;
+  for (let step = 1; step <= 12; step += 1) {
+    candidate = mix(brand, "#000000", step * 0.05);
+    const ratio = contrastRatio(candidate, "#ffffff");
+    if (ratio >= 4.5) return { brand: candidate, onBrand: "#ffffff", adjusted: true, ratio };
+  }
+  return { brand: candidate, onBrand: "#ffffff", adjusted: true, ratio: contrastRatio(candidate, "#ffffff") };
+}
+
+export interface CustomThemeInput {
+  brand: string;
+  /** Neutral temperature lifted from the site; null keeps the greys neutral. */
+  tint?: string | null;
+  /** Font family name; loaded from Google Fonts when it resolves there. */
+  font?: string | null;
+  label?: string;
+  description?: string;
+}
+
+/** Tint a base colour by `pct` toward the site's temperature, in oklab. */
+function tinted(base: string, tint: string | null | undefined, pct: number): string {
+  return tint ? `color-mix(in oklab, ${base} ${100 - pct}%, ${tint})` : base;
+}
+
+/**
+ * Build a full template — both schemes — from the handful of facts a site yields.
+ *
+ * The surfaces are derived rather than sampled: a page's own backgrounds are
+ * chosen for a marketing layout, not for a dense application shell, so copying
+ * them produces something unusable. What transfers is the brand hue, the
+ * temperature of the greys and the type — the rest is generated to the same
+ * shape the built-in templates use.
+ */
+export function buildCustomTemplate(input: CustomThemeInput): AppearanceTemplate {
+  const { brand, onBrand, adjusted, ratio } = ensureReadable(input.brand);
+  const tint = input.tint ?? null;
+  const font = input.font?.trim() || null;
+  const stack = font
+    ? `"${font}", system-ui, -apple-system, "Segoe UI", sans-serif`
+    : 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+  return {
+    id: CUSTOM_TEMPLATE_ID,
+    label: input.label?.trim() || "Custom",
+    brand,
+    onBrand,
+    // Try Google Fonts for the family the site declares. A miss 404s harmlessly
+    // and the CSS stack falls back to the system face.
+    ...(font ? { font: `${font.replace(/\s+/g, "+")}:wght@400;500;600;700` } : {}),
+    description:
+      input.description ??
+      `Generated from the site palette${adjusted ? " (brand darkened to reach AA)" : ""} · contrast ${ratio.toFixed(2)}:1`,
+    shared: {
+      ...ramp(brand),
+      "--text-on-brand": onBrand,
+      "--on-brand": onBrand,
+      ...radii(1.2),
+      ...density(1.04),
+      "--font-sans": stack,
+    },
+    light: {
+      ...scheme({
+        canvas: tinted("#f7f7f9", tint, 6),
+        sheet: "#ffffff",
+        sheet2: tinted("#fafafc", tint, 4),
+        inset: tinted("#eeeef2", tint, 8),
+        rail: tinted("#15161c", tint, 10),
+        railHi: tinted("#24262f", tint, 12),
+        onRail: tinted("#cdd1d8", tint, 6),
+        onRailMuted: tinted("#7d8593", tint, 6),
+        borderOnRail: tinted("#20232a", tint, 10),
+        textPrimary: tinted("#14151a", tint, 6),
+        textSecondary: tinted("#3a3d47", tint, 6),
+        textMuted: tinted("#6b7280", tint, 6),
+        textSubtle: tinted("#8a93a0", tint, 6),
+        borderSubtle: tinted("#eaeaef", tint, 6),
+        borderDefault: tinted("#dcdce4", tint, 6),
+        borderStrong: tinted("#c2c2ce", tint, 6),
+        brandSoft: `color-mix(in oklab, ${brand} 10%, #ffffff)`,
+        brandSoftText: `color-mix(in oklab, ${brand} 75%, #000000)`,
+      }),
+      ...SOFT_LIGHT,
+    },
+    dark: {
+      ...scheme({
+        canvas: tinted("#0d0e13", tint, 12),
+        sheet: tinted("#16181f", tint, 12),
+        sheet2: tinted("#1b1e26", tint, 12),
+        inset: tinted("#212430", tint, 12),
+        rail: tinted("#090a0f", tint, 12),
+        railHi: tinted("#1e212b", tint, 12),
+        onRail: tinted("#c8ccd6", tint, 8),
+        onRailMuted: tinted("#868d9c", tint, 8),
+        borderOnRail: tinted("#232630", tint, 12),
+        textPrimary: tinted("#e9eaf0", tint, 6),
+        textSecondary: tinted("#c0c4cf", tint, 6),
+        textMuted: tinted("#8e94a2", tint, 6),
+        textSubtle: tinted("#767c8a", tint, 6),
+        borderSubtle: tinted("#1f222c", tint, 12),
+        borderDefault: tinted("#292d39", tint, 12),
+        borderStrong: tinted("#393e4d", tint, 12),
+        brandSoft: `color-mix(in oklab, ${brand} 22%, #101218)`,
+        brandSoftText: `color-mix(in oklab, ${brand} 45%, #ffffff)`,
+      }),
+      ...SOFT_DARK,
+    },
+    css: `::selection { background: color-mix(in oklab, ${brand} 26%, transparent); }`,
+  };
 }

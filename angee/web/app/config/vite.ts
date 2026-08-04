@@ -222,6 +222,10 @@ export function defineAngeeWebViteConfig({
         // hard-reload to index.html (a file id is never "upload"/"download").
         "/storage/upload": { target: django, changeOrigin: false },
         "/storage/download": { target: django, changeOrigin: false },
+        // The appearance wizard's brand-extraction endpoint (integrate addon).
+        // Exact path for the same reason as the storage pair: /appearance is not
+        // an SPA route today, but scoping keeps that free.
+        "/appearance/extract": { target: django, changeOrigin: false },
         // Proxy ONLY the daemon GraphQL endpoint (Django sets
         // ANGEE_OPERATOR_GRAPHQL_ENDPOINT=/operator/graphql), stripping the
         // prefix so it lands on the daemon's own /graphql — no cross-origin.

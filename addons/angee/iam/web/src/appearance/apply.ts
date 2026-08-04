@@ -13,7 +13,13 @@
  * the id changes, not the mechanism below.
  */
 
-import { DEFAULT_TEMPLATE_ID, findTemplate } from "./templates";
+import { readCustomTemplate } from "./custom";
+import { CUSTOM_TEMPLATE_ID, DEFAULT_TEMPLATE_ID, findTemplate, type AppearanceTemplate } from "./templates";
+
+/** Resolve a template id, including the generated one held in storage. */
+function resolve(id: string): AppearanceTemplate | undefined {
+  return id === CUSTOM_TEMPLATE_ID ? readCustomTemplate() ?? undefined : findTemplate(id);
+}
 
 const STYLE_ID = "angee-appearance-style";
 const FONT_ID = "angee-appearance-font";
@@ -28,13 +34,13 @@ function serialise(vars: Record<string, string>): string {
 export function readStoredTemplateId(): string {
   if (typeof localStorage === "undefined") return DEFAULT_TEMPLATE_ID;
   const stored = localStorage.getItem(STORAGE_KEY);
-  return stored !== null && findTemplate(stored) ? stored : DEFAULT_TEMPLATE_ID;
+  return stored !== null && resolve(stored) ? stored : DEFAULT_TEMPLATE_ID;
 }
 
 export function applyTemplate(id: string, options: { persist?: boolean; switchScheme?: boolean } = {}): void {
   if (typeof document === "undefined") return;
   const { persist = true, switchScheme = true } = options;
-  const template = findTemplate(id) ?? findTemplate(DEFAULT_TEMPLATE_ID);
+  const template = resolve(id) ?? findTemplate(DEFAULT_TEMPLATE_ID);
   if (!template) return;
 
   document.getElementById(STYLE_ID)?.remove();
