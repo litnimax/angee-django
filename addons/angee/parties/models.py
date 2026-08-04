@@ -40,6 +40,7 @@ from phonenumbers import (
 from rebac import PermissionDenied, system_context
 from rebac.managers import RebacManager
 
+from angee.base.computes import compute
 from angee.base.fields import SqidField, StateField
 from angee.base.impl import ImplClassField
 from angee.base.mixins import AuditMixin, HierarchyMixin, SqidMixin
@@ -514,16 +515,11 @@ class Handle(SqidMixin, AuditMixin, AngeeModel):
 
         return " ".join((value or "").split()).casefold()
 
-    def save(self, *args: Any, **kwargs: Any) -> None:
-        """Persist the handle while keeping ``normalized_value`` in lockstep."""
+    @compute("normalized_value", depends=("platform", "value"))
+    def _compute_normalized_value(self) -> str:
+        """Return the stored comparison key kept in lockstep with the raw value."""
 
-        update_fields = kwargs.get("update_fields")
-        normalization_fields = {"platform", "value", "normalized_value"}
-        if self._state.adding or update_fields is None or normalization_fields.intersection(update_fields):
-            self.normalized_value = self.normalize_value(self.platform, self.value)
-            if update_fields is not None and "normalized_value" not in update_fields:
-                kwargs["update_fields"] = [*update_fields, "normalized_value"]
-        super().save(*args, **kwargs)
+        return self.normalize_value(self.platform, self.value)
 
     @property
     def resolved_confidence(self) -> float | None:

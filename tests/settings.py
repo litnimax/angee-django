@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     "angee.parties_integrate_carddav",
     "angee.platform_integrate_operator",
     "tests.linesdemo",
+    "tests.computedemo",
     "tests.chatterdemo",
     "tests.scopedemo",
     "tests.extcontrib.apps.ExtContribConfig",

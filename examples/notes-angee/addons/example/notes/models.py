@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from django.db import models
 
+from angee.base.computes import compute
 from angee.base.fields import StateField
 from angee.base.mixins import (
     AuditMixin,
@@ -40,7 +39,7 @@ class Note(SqidMixin, AuditMixin, ThreadedModelMixin, AngeeModel, HistoryMixin, 
 
     title = models.CharField(max_length=160)
     body = models.TextField(blank=True, default="")
-    word_count = models.PositiveIntegerField(default=0, db_index=True)
+    word_count = models.PositiveIntegerField(default=0, db_index=True, editable=False)
     status = StateField(choices_enum=Status, default=Status.DRAFT)
     tags = models.JSONField(blank=True, default=list)
     is_starred = models.BooleanField(default=False, db_index=True)
@@ -65,15 +64,8 @@ class Note(SqidMixin, AuditMixin, ThreadedModelMixin, AngeeModel, HistoryMixin, 
 
         return len((body or "").split())
 
-    def save(self, *args: Any, **kwargs: Any) -> None:
-        """Persist the current number of whitespace-delimited body words."""
+    @compute("word_count", depends=("body",))
+    def _compute_word_count(self) -> int:
+        """Return the stored word count derived from ``body``."""
 
-        self.word_count = self.count_words(self.body)
-        update_fields = kwargs.get("update_fields")
-        if update_fields is not None:
-            field_names = set(update_fields)
-            if "body" in field_names:
-                field_names.add("word_count")
-                field_names.add("updated_at")
-                kwargs["update_fields"] = field_names
-        super().save(*args, **kwargs)
+        return self.count_words(self.body)

@@ -54,7 +54,7 @@ export interface ChoiceFacetSupport {
  * The default widget family for a generated resource field. The backend owns the
  * widget vocabulary (`angee.graphql.data.field_classification`), so an explicit
  * `widget` — e.g. `"money"` over a Decimal scalar — wins; only a field with no
- * backend widget (a computed, model-less resource field) falls back to the
+ * backend widget (a synthetic, model-less resource field) falls back to the
  * kind/scalar-derived default. UI owns the actual component registry.
  */
 export function defaultWidgetForModelField(
@@ -96,6 +96,7 @@ export function fieldUpdatable(
   fieldName: string,
 ): boolean {
   if (!metadata?.rootFields?.update && !metadata?.resource?.roots.update) return false;
+  if (metadata.fields[fieldName]?.computed) return false;
   const updateFields =
     metadata.rootFields?.updateFields ?? metadata.resource?.updateFields;
   if (updateFields && !updateFields.includes(fieldName)) return false;

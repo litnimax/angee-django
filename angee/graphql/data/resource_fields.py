@@ -15,6 +15,7 @@ from strawberry.types.base import StrawberryList, StrawberryOptional
 from strawberry.types.enum import StrawberryEnumDefinition
 from strawberry_django_hasura import SnakeNameConverter
 
+from angee.base.computes import stored_compute_field_names
 from angee.base.impl import ImplClassField
 from angee.graphql.data.field_classification import (
     RESOURCE_FIELD_KINDS as _RESOURCE_FIELD_KINDS,
@@ -72,6 +73,14 @@ class DataResourceFieldMetadata:
     creatable: bool = False
     updatable: bool = False
     required_on_create: bool = False
+    computed: bool = False
+    """Whether a declared stored compute owns this column (``angee.base.computes``).
+
+    A computed column is server-owned by declaration: it never enters the write
+    surface (``hasura_model_resource`` rejects it from ``writable``), and the
+    frontend renders it read-only by this flag rather than by its omission from
+    the update fields."""
+
     archivable: bool = False
     currency_field: str | None = None
     relation_model_label: str | None = None
@@ -158,6 +167,7 @@ def model_resource_fields(
     updatable = set(update_fields)
     required_on_create = set(required_create_fields)
     relation_by_field = {axis.field: axis for axis in relation_axes}
+    computed_names = stored_compute_field_names(model)
     return tuple(
         _model_resource_field(
             model,
@@ -170,6 +180,7 @@ def model_resource_fields(
             creatable=name in creatable,
             updatable=name in updatable,
             required_on_create=name in required_on_create,
+            computed=name in computed_names,
         )
         for name in fields
     )
@@ -227,6 +238,7 @@ def resource_fields(
     updatable = set(update_fields)
     required_on_create = set(required_create_fields)
     relation_by_field = {axis.field: axis for axis in relation_axes}
+    computed_names = stored_compute_field_names(model) if model is not None else frozenset()
     fields: list[DataResourceFieldMetadata] = []
     for python_name in surface_field_names(node_type):
         name = resource_wire_field_name(node_type, python_name) or python_name
@@ -265,6 +277,7 @@ def resource_fields(
                 creatable=name in creatable,
                 updatable=name in updatable,
                 required_on_create=name in required_on_create,
+                computed=python_name in computed_names,
                 archivable=is_archive_field(model_field),
                 currency_field=money_currency_field(model_field),
                 relation_model_label=_relation_model_label(model_field, axis),
@@ -320,6 +333,7 @@ def merge_resource_fields(
             creatable=existing.creatable or field.creatable,
             updatable=existing.updatable or field.updatable,
             required_on_create=existing.required_on_create or field.required_on_create,
+            computed=existing.computed or field.computed,
             archivable=existing.archivable or field.archivable,
             currency_field=existing.currency_field or field.currency_field,
             relation_model_label=existing.relation_model_label or field.relation_model_label,
@@ -394,6 +408,7 @@ def _model_resource_field(
     creatable: bool,
     updatable: bool,
     required_on_create: bool,
+    computed: bool,
 ) -> DataResourceFieldMetadata:
     try:
         field = model._meta.get_field(name)
@@ -426,6 +441,7 @@ def _model_resource_field(
         creatable=creatable,
         updatable=updatable,
         required_on_create=required_on_create,
+        computed=computed,
         archivable=is_archive_field(field),
         currency_field=money_currency_field(field),
         relation_model_label=_relation_model_label(field, relation_axis),

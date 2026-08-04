@@ -6,7 +6,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Self, TypeVar, cast
+from typing import Any, ClassVar, Self, TypeVar, cast
 
 from django.core import checks
 from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
@@ -28,6 +28,14 @@ from rebac.managers import RebacManager, RebacQuerySet
 from rebac.resources import model_resource_type
 from rebac.types import RelationshipFilter
 
+from angee.base.computes import (
+    apply_local_computes,
+    compute_check_messages,
+    compute_registry,
+    finalize_created_computes,
+    recompute_queryset,
+    snapshot_watched,
+)
 from angee.base.fields import SqidField
 from angee.base.impl import ImplClassField
 from angee.base.mixins import SqidMixin, TimestampMixin
@@ -159,6 +167,18 @@ class AngeeQuerySet(RebacQuerySet[_ModelT]):
             return queryset
         return queryset.apply_ambient_scope()
 
+    def recompute(self, *field_names: str) -> int:
+        """Recompute stored computed columns for these rows; return rows written.
+
+        The idempotent repair pass the derived-column doctrine assigns to bulk
+        paths: ``bulk_create`` and ``QuerySet.update`` skip signals, so callers
+        that bulk-write a depended-on column follow with ``.recompute()``. Rows
+        are rewritten under ``system_context`` through the base manager and
+        saved with ``update_fields`` of only the changed columns.
+        """
+
+        return recompute_queryset(self, field_names or None)
+
 
 class AngeeUnscopedQuerySet(models.QuerySet[_ModelT]):
     """Angee queryset API for models that intentionally have no REBAC row policy."""
@@ -176,6 +196,14 @@ class AngeeUnscopedQuerySet(models.QuerySet[_ModelT]):
         """
 
         return self
+
+    def recompute(self, *field_names: str) -> int:
+        """Recompute stored computed columns for these rows; return rows written.
+
+        See :meth:`AngeeQuerySet.recompute`; the shared engine is the owner.
+        """
+
+        return recompute_queryset(self, field_names or None)
 
 
 class AngeeManager(RebacManager.from_queryset(AngeeQuerySet)):  # type: ignore[misc]
@@ -311,7 +339,75 @@ class AngeeModel(TimestampMixin, RebacMixin):
 
         errors = super().check(**kwargs)
         errors.extend(cls._check_catalogue_tier())
+        errors.extend(compute_check_messages(cls))
         return errors
+
+    _angee_computes_integrated: ClassVar[bool] = True
+    """Marks classes covered by the compute engine's save/load integration.
+
+    The registry build fails fast when a non-Angee model declares ``@compute``
+    methods (it would get propagation without the save-side half); the marker is
+    the structural fact it checks without importing this module.
+    """
+
+    @classmethod
+    def from_db(cls, db: Any, field_names: Sequence[str], values: Sequence[Any]) -> Self:
+        """Load the row, snapshotting old values of computed-dependency columns.
+
+        The snapshot lets a later ``save()`` fire cross-model recompute edges
+        for the *old* relation target too (the two parents a reparent affects)
+        and skip edges whose watched column did not actually change. Only
+        loaded columns are recorded, so a deferred load stays lazy.
+        """
+
+        instance = super().from_db(db, field_names, values)
+        snapshot_watched(instance, field_names)
+        return instance
+
+    def refresh_from_db(
+        self,
+        using: str | None = None,
+        fields: Sequence[str] | None = None,
+        from_queryset: models.QuerySet[Any] | None = None,
+    ) -> None:
+        """Reload the row, re-syncing the computed-dependency snapshot."""
+
+        super().refresh_from_db(using=using, fields=fields, from_queryset=from_queryset)
+        watched = compute_registry.watched_columns(type(self))
+        if not watched:
+            return
+        if fields is None:
+            refreshed = watched
+        else:
+            # ``fields`` entries may be names or attnames (Django accepts both);
+            # watched columns are attnames, so match either spelling per field.
+            spellings: set[str] = set()
+            for name in fields:
+                spellings.add(str(name))
+                try:
+                    spellings.add(self._meta.get_field(str(name)).attname)
+                except FieldDoesNotExist:
+                    continue
+            refreshed = watched.intersection(spellings)
+        snapshot_watched(self, refreshed)
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        """Persist the row after recomputing its declared stored computes.
+
+        A full save recomputes every declared compute; a partial save recomputes
+        only the computes whose local dependencies were written and folds the
+        recomputed columns (plus ``auto_now`` columns) into ``update_fields`` so
+        ``changes`` subscribers, history, and audit stamping observe them.
+        """
+
+        compute_registry.ensure()
+        adding = self._state.adding
+        folded = apply_local_computes(self, kwargs.get("update_fields"), adding=adding)
+        if folded is not None:
+            kwargs["update_fields"] = folded
+        super().save(*args, **kwargs)
+        if adding:
+            finalize_created_computes(self)
 
     @classmethod
     def _check_catalogue_tier(cls) -> list[checks.CheckMessage]:

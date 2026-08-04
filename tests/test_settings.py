@@ -72,7 +72,7 @@ def test_base_is_installed_exactly_once(tmp_path: Path) -> None:
 
     settings = _compose(tmp_path)
     installed = _installed_paths(settings["INSTALLED_APPS"])
-    base_app = "angee.base"
+    base_app = "angee.base.apps.BaseConfig"
     assert installed.count(base_app) == 1
 
 
@@ -87,7 +87,7 @@ def test_resources_root_expands_framework_dependencies(tmp_path: Path) -> None:
     installed = _installed_paths(settings["INSTALLED_APPS"])
 
     compose_at = installed.index("angee.compose.apps.ComposeConfig")
-    base_at = installed.index("angee.base")
+    base_at = installed.index("angee.base.apps.BaseConfig")
     resources_at = installed.index("angee.resources")
 
     assert compose_at < base_at < resources_at
@@ -102,7 +102,7 @@ def test_iam_user_is_the_default_auth_model(tmp_path: Path) -> None:
     installed = _installed_paths(settings["INSTALLED_APPS"])
 
     assert "angee.compose.apps.ComposeConfig" in installed
-    assert "angee.base" in installed
+    assert "angee.base.apps.BaseConfig" in installed
     assert GRAPHQL_APP in installed
     assert "angee.resources" in installed
     assert settings["AUTH_USER_MODEL"] == "iam.User"
@@ -158,7 +158,7 @@ def test_addons_are_sorted_by_declared_dependencies(tmp_path: Path) -> None:
     installed = _installed_paths(settings["INSTALLED_APPS"])
 
     compose_at = installed.index("angee.compose.apps.ComposeConfig")
-    base_at = installed.index("angee.base")
+    base_at = installed.index("angee.base.apps.BaseConfig")
     graphql_at = installed.index(GRAPHQL_APP)
     iam_at = installed.index("angee.iam.apps.IAMConfig")
     resources_at = installed.index("angee.resources")
@@ -182,7 +182,7 @@ def test_notes_app_order_is_stable(tmp_path: Path) -> None:
         "rebac.apps.RebacConfig",
         "reversion.apps.ReversionConfig",
         "simple_history",
-        "angee.base",
+        "angee.base.apps.BaseConfig",
         "channels.apps.ChannelsConfig",
         GRAPHQL_APP,
         "angee.resources",
@@ -223,11 +223,11 @@ def test_one_app_set_orders_compose_before_adopters(
     installed = _installed_paths(settings["INSTALLED_APPS"])
 
     assert installed.count("angee.compose.apps.ComposeConfig") == 1
-    assert installed.count("angee.base") == 1
+    assert installed.count("angee.base.apps.BaseConfig") == 1
     assert installed.count(GRAPHQL_APP) == 1
     assert installed.count("angee.resources") == 1
     compose_at = installed.index("angee.compose.apps.ComposeConfig")
-    base_at = installed.index("angee.base")
+    base_at = installed.index("angee.base.apps.BaseConfig")
     notes_at = installed.index("example.notes")
     assert compose_at < base_at < notes_at
     assert "ANGEE_BUILD" not in settings

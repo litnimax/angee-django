@@ -119,6 +119,9 @@ class Tag(ArchiveMixin, AngeeDataModel):
 
         return True
 
+    _loaded_is_shared_scope: object
+    """Loaded shared-scope snapshot, or the ``_NEVER_LOADED`` sentinel."""
+
     @classmethod
     def from_db(cls, db: Any, field_names: Any, values: Any) -> "Tag":
         """Load a row, snapshotting shared scope when its source fields are loaded.

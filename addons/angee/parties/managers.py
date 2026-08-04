@@ -146,7 +146,7 @@ class HandleManager(AngeeManager.from_queryset(HandleQuerySet)):  # type: ignore
         if "owner" in fields or "owner_id" in fields:
             raise TypeError("Handle control ownership must be written through claim_own().")
         if "normalized_value" in fields:
-            raise TypeError("Handle.normalized_value is maintained by Handle.save().")
+            raise TypeError("Handle.normalized_value is maintained by its declared compute.")
         normalized_value = self.model.normalize_value(platform, value)
         external_id = str(fields.get("external_id") or "")
         if external_id:

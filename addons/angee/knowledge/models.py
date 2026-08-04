@@ -21,6 +21,7 @@ from django.db import IntegrityError, models, transaction
 from markdown_it import MarkdownIt
 from rebac import PermissionDenied, system_context, to_subject_ref
 
+from angee.base.computes import compute
 from angee.base.impl import ImplClassField
 from angee.base.mixins import AuditMixin, HistoryMixin, RevisionMixin, SqidMixin
 from angee.base.models import AngeeManager, AngeeModel
@@ -401,7 +402,7 @@ class MarkdownPage(SqidMixin, AuditMixin, AngeeModel, RevisionMixin):
     )
     body = models.TextField(blank=True, default="")
     body_hash = models.CharField(max_length=64, blank=True, default="", editable=False)
-    word_count = models.PositiveIntegerField(default=0, db_index=True)
+    word_count = models.PositiveIntegerField(default=0, db_index=True, editable=False)
 
     objects = MarkdownPageManager()
 
@@ -619,18 +620,17 @@ class MarkdownPage(SqidMixin, AuditMixin, AngeeModel, RevisionMixin):
             joined.extend(block)
         return joined
 
-    def save(self, *args: Any, **kwargs: Any) -> None:
-        """Persist the body together with its derived hash and word count."""
+    @compute("body_hash", depends=("body",))
+    def _compute_body_hash(self) -> str:
+        """Return the stored content hash derived from ``body``."""
 
-        self.body_hash = self.hash_body(self.body)
-        self.word_count = len(self.body.split())
-        update_fields = kwargs.get("update_fields")
-        if update_fields is not None:
-            field_names = set(update_fields)
-            if "body" in field_names:
-                field_names |= {"body_hash", "word_count", "updated_at"}
-                kwargs["update_fields"] = field_names
-        super().save(*args, **kwargs)
+        return self.hash_body(self.body)
+
+    @compute("word_count", depends=("body",))
+    def _compute_word_count(self) -> int:
+        """Return the stored whitespace-delimited word count of ``body``."""
+
+        return len(self.body.split())
 
 
 # ---------------------------------------------------------------------------

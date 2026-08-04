@@ -33,6 +33,7 @@ from strawberry_django_hasura import (
     hasura_resource as build_hasura_resource,
 )
 
+from angee.base.computes import stored_compute_field_names
 from angee.base.models import (
     aggregate_scoped_queryset,
     bind_actor,
@@ -900,6 +901,9 @@ def hasura_model_resource(  # noqa: PLR0913 - mirrors the upstream declarative b
         id_decode = public_pk_decoder(model)
     active_write_backend = write_backend or AngeeHasuraWriteBackend(model, lines=lines)
     declared_writable = [seq for seq in (writable, insertable, updatable) if seq is not None]
+    _check_writable_computed(model, declared_writable, surface=f"resource {resource_name!r}")
+    if lines is not None:
+        _check_writable_computed(lines.model, [lines.writable], surface=f"resource {resource_name!r} lines")
     _check_writable_relations_decoded(
         model,
         writable=[name for seq in declared_writable for name in seq] if declared_writable else None,
@@ -1002,6 +1006,32 @@ def hasura_model_resource(  # noqa: PLR0913 - mirrors the upstream declarative b
         public_id_field=public_id_field,
         row_model=row_model,
     )
+
+
+def _check_writable_computed(
+    model: type[models.Model],
+    declared_writable: Sequence[Sequence[str] | None],
+    *,
+    surface: str,
+) -> None:
+    """Reject a stored computed column declared on a write surface.
+
+    A computed column (``angee.base.computes``) is server-owned by declaration —
+    the compute engine is its only writer — so listing it in ``writable`` /
+    ``insertable`` / ``updatable`` would let a client write a column the server
+    immediately re-derives. Fail at resource build, not at the first write.
+    """
+
+    computed = stored_compute_field_names(model)
+    if not computed:
+        return
+    declared = {name for seq in declared_writable if seq is not None for name in seq}
+    offending = sorted(computed & declared)
+    if offending:
+        raise ImproperlyConfigured(
+            f"{surface} declares computed column(s) {', '.join(offending)} on {model._meta.label} "
+            "as writable; stored computes are server-owned and cannot enter the write surface."
+        )
 
 
 def _is_writable_relation(field: Any) -> bool:

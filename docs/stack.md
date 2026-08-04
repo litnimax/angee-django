@@ -90,6 +90,16 @@ because the indexed path-prefix subtree test composes into the Hasura
 `_bool_exp` filter dialect and REBAC subtree scoping as a plain column predicate;
 recursive CTE ownership does not.
 
+Computed-field library choice: `angee.base.computes` — stored computed columns
+declared with `@compute`/`related` and dependency paths — is deliberately owned
+in-repo. `django-computedfields` was evaluated and rejected because the
+recompute write path must compose seams the library cannot see: fail-closed
+REBAC (`system_context` system writes through the base manager), the
+`update_fields` fan-out that feeds `ChangePayload.changed_fields`, and the
+composer's abstract-source → emitted-concrete-model pipeline. Django's native
+`GeneratedField` remains the first resort when a derived value is row-local and
+SQL-expressible.
+
 Implementation-registry choice: the settings-keyed `ImplClassField` registry is
 Angee's declared composition contract. Python entry points were evaluated and
 rejected because composition facts belong to project settings, not package

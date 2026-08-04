@@ -12,6 +12,7 @@ from django.db import models, transaction
 from django.db.models import F, Value
 from django.db.models.functions import Replace
 from rebac import current_actor
+from rebac.managers import RebacQuerySet
 
 from angee.base.actors import actor_user_id
 from angee.base.emission import ModelClassAttribute, ModelDecorator
@@ -54,6 +55,25 @@ def update_fields_with_auto_now(instance: models.Model, update_fields: Any) -> s
     if not fields:
         return fields
     return fields | {field.name for field in instance._meta.fields if getattr(field, "auto_now", False)}
+
+
+def system_writer(model: type[models.Model]) -> models.QuerySet[Any]:
+    """Return the unscoped, elevated queryset framework maintenance writes through.
+
+    Derived-value maintenance — hierarchy path cascades, stored computed columns —
+    is a system fact, not an actor read: the write must reach every affected row
+    even where the acting user's REBAC scope hides some, so it elevates when the
+    base queryset supports it. This assumes ``_base_manager`` is unscoped-or-sudo
+    (the framework default); a consumer must not repoint ``Meta.base_manager_name``
+    at an actor-scoped manager, or maintenance writes would silently REBAC-scope.
+    """
+
+    queryset = model._base_manager.all()
+    if isinstance(queryset, RebacQuerySet):
+        # Reached only when a model repoints its base manager at a REBAC-scoped
+        # one; the framework default base manager is already unfiltered.
+        return cast("models.QuerySet[Any]", queryset.sudo(reason="angee.base.system_writer"))
+    return queryset
 
 
 class SqidMixin(models.Model):
@@ -620,16 +640,6 @@ class HierarchyMixin(models.Model):
                 raise ValidationError({"parent": f"Parent must belong to the same {name}."})
 
     def _hierarchy_writer(self) -> models.QuerySet[Self]:
-        """Return an unscoped queryset for the mixin's own path maintenance.
+        """Return the unscoped queryset for path maintenance (see :func:`system_writer`)."""
 
-        Path maintenance is a system fact, not an actor read: a reparent must
-        rewrite every descendant even where the acting user's REBAC scope hides
-        some, so the write elevates when the manager supports it. This assumes
-        ``_base_manager`` is unscoped-or-sudo (the framework default); a
-        consumer must not repoint ``Meta.base_manager_name`` at an actor-scoped
-        manager, or descendant rewrites would silently REBAC-scope.
-        """
-
-        queryset = type(self)._base_manager.all()
-        sudo = getattr(queryset, "sudo", None)
-        return cast("models.QuerySet[Self]", sudo() if callable(sudo) else queryset)
+        return cast("models.QuerySet[Self]", system_writer(type(self)))

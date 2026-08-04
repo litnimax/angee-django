@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import Any, Self, cast
 
@@ -1082,7 +1082,7 @@ class WorkflowRun(AuditMixin, RecordRefMixin, AngeeDataModel):
         super().save(*args, **kwargs)
 
     @classmethod
-    def from_db(cls, db: str | None, field_names: list[str], values: list[Any]) -> Self:
+    def from_db(cls, db: str | None, field_names: Sequence[str], values: Sequence[Any]) -> Self:
         """Capture immutable loaded facts without a save-time SELECT."""
 
         instance = cast(Self, super().from_db(db, field_names, values))

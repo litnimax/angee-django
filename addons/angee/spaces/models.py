@@ -209,6 +209,9 @@ class Membership(ScoredLinkMixin, SqidMixin, AuditMixin, AngeeModel):
 
         return f"{self.party_id}∈{self.group_id} ({self.role})"
 
+    _loaded_reconcile_state: object
+    """Loaded grant-source snapshot, or the ``_NEVER_LOADED`` sentinel."""
+
     @classmethod
     def from_db(cls, db: Any, field_names: Any, values: Any) -> Membership:
         """Load a row and snapshot only fields that can change its role grant."""

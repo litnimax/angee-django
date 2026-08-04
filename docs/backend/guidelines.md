@@ -143,6 +143,20 @@ Rules that follow from the layering:
 ## Rules
 
 - Domain behavior lives on models, managers, and querysets.
+- **A stored derived column is a declared compute, never a hand-rolled `save()`
+  override.** Declare it with `angee.base.computes` — `@compute("col",
+  depends=("dep", "relation.dep"))` on the deriving model method, or
+  `related("col", "relation.column")` for a stored copy — against a concrete
+  `editable=False` column. The engine owns recompute on save (with the
+  `update_fields` fan-out that keeps `changes`/history/audit honest),
+  cross-model propagation through reverse-FK/forward-FK/M2M depends paths under
+  `system_context`, and delete paths. Bulk paths keep the repair-pass doctrine:
+  callers follow `bulk_create`/`update()` with `AngeeQuerySet.recompute()`, and
+  `manage.py recompute` backfills new computes. Computed columns never enter a
+  resource's `writable` set (`hasura_model_resource` fails fast) and project as
+  `computed` in resource metadata. Prefer Django's `GeneratedField` when the
+  value is row-local and SQL-expressible; declaration defects surface as system
+  checks `angee.E015`–`angee.E019`.
 - Manager/QuerySet canon: chainable read scopes live on a `*QuerySet` exposed
   through `Manager.from_queryset(...)`. Factories and mutations stay on the
   manager that owns the write.
@@ -535,6 +549,9 @@ Hard-won traps — the wise learn from others' mistakes (`docs/guidelines.md`).
 - **Derived columns have two drift classes and two owners.** Signals own instance
   saves/deletes, cascades, and queryset deletes; idempotent repair passes own
   `bulk_create` and queryset `update` paths, where signals do not run.
+  `angee.base.computes` is the framework owner of both for declared computes:
+  instance paths recompute automatically, and `.recompute()` /
+  `manage.py recompute` are the repair passes.
 - **`ScoredLinkMixin` is the scored-suggestion shape, not a permission owner.**
   A subclass that needs REBAC side effects overrides the transition; never add
   REBAC writes to the shared mixin.

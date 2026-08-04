@@ -1,10 +1,11 @@
-"""A Hasura data resource over a pydantic row model — the computed-source seam.
+"""A Hasura data resource over a pydantic row model — the model-less-source seam.
 
-The non-model sibling of :func:`hasura_model_resource`. ``strawberry-django-
+The non-model sibling of :func:`hasura_model_resource` (distinct from a stored
+*computed column*, which ``angee.base.computes`` owns). ``strawberry-django-
 hasura`` owns the dialect mechanics (``hasura_run_query_resource`` + the
 in-memory evaluator); this wrapper owns the Angee seam: deriving the GraphQL
 node from the pydantic row model (the row-shape SSOT) and attaching the
-``angee.resources`` metadata so the frontend drives the computed resource
+``angee.resources`` metadata so the frontend drives the synthetic resource
 through the same ``useList`` path as a model resource — no bespoke client path.
 """
 

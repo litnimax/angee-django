@@ -49,6 +49,8 @@ export interface ModelFieldMetadata {
   creatable?: boolean;
   updatable?: boolean;
   requiredOnCreate?: boolean;
+  /** Whether a declared stored compute owns this column — server-owned, rendered read-only. */
+  computed?: boolean;
 }
 
 export interface ModelRootFieldMetadata {
@@ -219,6 +221,8 @@ export interface DataResourceFieldMetadata {
   creatable: boolean;
   updatable: boolean;
   requiredOnCreate: boolean;
+  /** Optional on the wire only for artifacts emitted before the flag existed. */
+  computed?: boolean;
   nullable?: boolean;
   relationModelLabel?: string | null;
   relationLabelAxis?: string | null;
@@ -471,6 +475,7 @@ function baseModelFieldMetadata(
     creatable: field.creatable,
     updatable: field.updatable,
     requiredOnCreate: field.requiredOnCreate,
+    computed: field.computed ?? false,
   };
 }
 
