@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.core.exceptions import ValidationError
 from django.db import models
 
 from angee.base.fields import StateField
@@ -21,7 +22,10 @@ class Note(SqidMixin, AuditMixin, ThreadedModelMixin, AngeeModel, HistoryMixin, 
     """A short note used to exercise backend composition.
 
     Metadata changes are audited through ``history``; the ``body`` field is
-    versioned through ``revisions`` so edits can be rolled back.
+    versioned through ``revisions`` so edits can be rolled back. ``parent``
+    makes notes a forest — a note may hang under another, and the graph view
+    renders those edges. Deleting a parent orphans its children rather than
+    taking them with it (``SET_NULL``): a note is content, not a container.
     """
 
     runtime = True
@@ -38,6 +42,13 @@ class Note(SqidMixin, AuditMixin, ThreadedModelMixin, AngeeModel, HistoryMixin, 
         ACTIVE = "active", "Active"
         ARCHIVED = "archived", "Archived"
 
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="children",
+    )
     title = models.CharField(max_length=160)
     body = models.TextField(blank=True, default="")
     word_count = models.PositiveIntegerField(default=0, db_index=True)
@@ -58,6 +69,20 @@ class Note(SqidMixin, AuditMixin, ThreadedModelMixin, AngeeModel, HistoryMixin, 
         """Return the note title for Django displays."""
 
         return self.title
+
+    def clean(self) -> None:
+        """Reject a ``parent`` chain that would make the note its own ancestor.
+
+        Nothing else guards this: the FK happily stores a cycle, and a cycle
+        would strand its notes outside every root the graph view walks from.
+        """
+
+        super().clean()
+        ancestor = self.parent
+        while ancestor is not None:
+            if ancestor.pk == self.pk:
+                raise ValidationError({"parent": "A note cannot be its own ancestor."})
+            ancestor = ancestor.parent
 
     @staticmethod
     def count_words(body: str) -> int:

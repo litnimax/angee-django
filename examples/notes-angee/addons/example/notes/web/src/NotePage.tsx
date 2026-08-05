@@ -1,6 +1,9 @@
 import * as React from "react";
-import { ResourceList, Form, List, Column, Field, Group, REFINE_CREATE_ID, RevisionsTab, Statusline, StatusSegment, StatuslineSpacer, useResourceRevisions, type ChatterTab, type ResourceViewDefaultGroups, type RecordSmartButtonDescriptor, useChatterContent } from "@angee/ui";
+import { ResourceList, Form, List, Column, Field, Group, REFINE_CREATE_ID, RevisionsTab, Statusline, StatusSegment, StatuslineSpacer, useAuthoredResourceMutation, useResourceRevisions, type ChatterTab, type Occurrence, type ResourceListCalendarSpec, type ResourceViewDefaultGroups, type RecordSmartButtonDescriptor, type TimelineViewSpec, useChatterContent } from "@angee/ui";
 import { useParams } from "@tanstack/react-router";
+
+import { NotesReschedule } from "./documents";
+import { noteCalendarSource } from "./note-calendar";
 
 const MODEL = "notes.Note";
 
@@ -17,10 +20,21 @@ const RECORD_SUBTITLE_FIELDS: readonly string[] = [
   "word_count",
 ];
 
+// The timeline kind buckets the list's own rows by `updated_at` — the one date
+// every note carries. `body` is not a column, so it is selected as an extra
+// field for the entry text.
+const NOTE_TIMELINE = {
+  dateField: "updated_at",
+  titleField: "title",
+  bodyField: "body",
+} satisfies TimelineViewSpec;
+
 const noteList = (
   <List
     resource={MODEL}
     defaultGroups={NOTE_DEFAULT_GROUPS}
+    timeline={NOTE_TIMELINE}
+    fields={["body"]}
     order={{ updated_at: "DESC" }}
     emptyContent={{
       icon: "agent",
@@ -48,6 +62,9 @@ const noteForm = (
     <Group label="Details" columns={2}>
       <Field name="created_by_label" label="Owner" widget="userRef" readOnly />
       <Field name="reminder_at" label="Reminder" widget="datetime" />
+      {/* No `widget`: the backend classifies `parent` as a scalar-id relation
+          onto notes.Note, so the metadata-declared picker renders it. */}
+      <Field name="parent" label="Parent note" />
       <Field name="tags" widget="tagInput" />
     </Group>
     <Field name="body" widget="markdown.editor" />
@@ -56,6 +73,20 @@ const noteForm = (
 
 /** The notes console page: a count-by-status panel above the data table. */
 export function NotePage(): React.ReactElement {
+  const [reschedule] = useAuthoredResourceMutation(NotesReschedule, {
+    invalidateModels: [MODEL],
+  });
+  // The calendar reads `reminder_at` per visible window and writes the same
+  // field back on drag; a range select seeds the routed create form with it.
+  const calendar = React.useMemo<ResourceListCalendarSpec>(
+    () => ({
+      sources: [noteCalendarSource],
+      onReschedule: (occurrence: Occurrence, start: Date) =>
+        reschedule({ id: occurrence.event_sqid, reminder_at: start.toISOString() }),
+      createDefaults: (start: Date) => ({ reminder_at: start.toISOString() }),
+    }),
+    [reschedule],
+  );
   // The nested record route (`notes.record`) carries no component; this parent
   // surface reads its `$id` param directly.
   const params = useParams({ strict: false });
@@ -100,6 +131,7 @@ export function NotePage(): React.ReactElement {
       {/* Open as a month-grouped list; board view switches to status lanes. */}
       <ResourceList
         resource={MODEL}
+        calendar={calendar}
         recordSmartButtons={recordSmartButtons}
         placement="inline"
         routed

@@ -8,6 +8,14 @@ definition notes/note {
     relation editor: auth/user | auth/group#member
     relation reader: auth/user | auth/group#member
 
+    // `parent` is deliberately absent here. A note may hang under another, but
+    // that link is structural — it is what the graph view draws — not an access
+    // path. Cascading `parent->read` down the chain would hand the owner of a
+    // parent every note filed under it, which is exactly the cross-owner reach
+    // this schema denies. Ownership stays per note; the tree carries no rights.
+    // (Contrast `knowledge/page`, where the parent IS a folder and the cascade
+    // is the point.)
+
     // Universal-admin reach without a per-note grant. Every note points at the
     // platform admin role via a const-backed relation (synthetic — no stored
     // tuple, no column), so `admin->member` resolves the actor's membership in

@@ -32,8 +32,11 @@ class NotesSchemaMetadataTests(SimpleTestCase):
                 "deletePreview": "delete_note",
                 "detail": "notes_by_pk",
                 "groups": "notes_groups",
+                "groupsCount": "notes_groups_count",
                 "list": "notes",
                 "revisions": "note_revisions",
+                # `save` is the lines-aware write root; notes declare no lines.
+                "save": None,
                 "update": "update_notes_by_pk",
             },
         )
@@ -162,12 +165,23 @@ class NotesSchemaMetadataTests(SimpleTestCase):
         )
         self.assertEqual(
             note["createFields"],
-            ["title", "body", "status", "tags", "is_starred", "reminder_at"],
+            ["title", "body", "status", "tags", "is_starred", "reminder_at", "parent"],
         )
         self.assertEqual(note["requiredCreateFields"], ["title"])
         self.assertEqual(
             note["updateFields"],
-            ["title", "body", "status", "tags", "is_starred", "reminder_at"],
+            ["title", "body", "status", "tags", "is_starred", "reminder_at", "parent"],
+        )
+        # `parent` is a to-one relation projected as a bare public id, so it
+        # classifies scalar/ID while still naming its target model.
+        self.assertEqual(
+            {key: fields["parent"][key] for key in ("kind", "scalar", "relationModelLabel", "widget")},
+            {
+                "kind": "scalar",
+                "scalar": "ID",
+                "relationModelLabel": "notes.Note",
+                "widget": "select",
+            },
         )
         self.assertEqual(note["revisionFields"], ["created_at", "comment", "body"])
         self.assertEqual(

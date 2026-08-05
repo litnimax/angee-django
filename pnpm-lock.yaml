@@ -1452,6 +1452,9 @@ importers:
       '@angee/app':
         specifier: workspace:*
         version: link:../../../../../../angee/web/app
+      '@angee/refine':
+        specifier: workspace:*
+        version: link:../../../../../../angee/web/refine
       '@angee/ui':
         specifier: workspace:*
         version: link:../../../../../../angee/web/ui

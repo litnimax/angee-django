@@ -31,6 +31,7 @@ rows:
 - _xref: reading_list
   fields:
     title: Reading list
+    parent: notes.quarterly_planning
     body: Papers and posts to revisit when the composition work settles.
     status: draft
     tags:
@@ -43,6 +44,7 @@ rows:
 - _xref: draft
   fields:
     title: Draft idea
+    parent: notes.quarterly_planning
     body: Keep the first slice small and explicit.
     status: draft
     tags:
@@ -93,6 +95,7 @@ rows:
 - _xref: release_checklist
   fields:
     title: Release checklist
+    parent: notes.team_handbook
     body: Steps to cut a release once the build and migrations are verified.
     status: active
     tags:
@@ -107,6 +110,7 @@ rows:
 - _xref: note_demo_01
   fields:
     title: Weekly product review
+    parent: notes.quarterly_planning
     status: draft
     tags:
     - product
@@ -139,6 +143,7 @@ rows:
 - _xref: note_demo_03
   fields:
     title: Launch checklist
+    parent: notes.release_checklist
     status: archived
     tags:
     - research
@@ -155,6 +160,7 @@ rows:
 - _xref: note_demo_04
   fields:
     title: Research synthesis
+    parent: notes.reading_list
     status: active
     tags:
     - customer
@@ -188,6 +194,7 @@ rows:
 - _xref: note_demo_06
   fields:
     title: Incident review notes
+    parent: notes.bug_triage
     status: in_review
     tags:
     - ops
@@ -220,6 +227,7 @@ rows:
 - _xref: note_demo_08
   fields:
     title: Release train status
+    parent: notes.release_checklist
     status: active
     tags:
     - engineering
@@ -236,6 +244,7 @@ rows:
 - _xref: note_demo_09
   fields:
     title: Roadmap risk register
+    parent: notes.quarterly_planning
     status: draft
     tags:
     - strategy
