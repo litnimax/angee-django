@@ -4,10 +4,15 @@ import { formViewSectionsSlot, type BaseMenuItem } from "@angee/ui";
 import { lazyRouteComponent } from "@tanstack/react-router";
 import { createElement } from "react";
 
+import { bootAppearance } from "./appearance/apply";
 import { enIamMessages } from "./i18n";
 import { OAuthLoginMethods } from "./OAuthLoginMethods";
 import { LOGIN_CALLBACK_PATH } from "./redirects";
 import { oidcLoginSection } from "./views/oidc-section";
+
+// Re-apply the stored appearance template on load, so a reload keeps the chosen
+// skin instead of falling back to the stock one.
+bootAppearance();
 
 export {
   IamLoginPage,
@@ -49,6 +54,12 @@ const identityMenu: readonly BaseMenuItem[] = [
           { id: "iam.schema", label: "Schema", route: "iam.schema", icon: "columns" },
         ],
       },
+      {
+        id: "iam.appearance",
+        label: "Appearance",
+        route: "iam.appearance",
+        icon: "settings",
+      },
     ],
   },
 ];
@@ -69,6 +80,7 @@ const iam = defineBaseAddon({
     { name: "iam.grants", path: "/iam/grants", resource: "iam.Grant", component: lazyRouteComponent(() => import("./views/GrantsPage"), "GrantsPage") },
     { name: "iam.relationships", path: "/iam/relationships", resource: "iam.Relationship", component: lazyRouteComponent(() => import("./views/RelationshipsPage"), "RelationshipsPage") },
     { name: "iam.schema", path: "/iam/schema", component: lazyRouteComponent(() => import("./views/SchemaPage"), "SchemaPage") },
+    { name: "iam.appearance", path: "/iam/appearance", component: lazyRouteComponent(() => import("./views/AppearancePage"), "AppearancePage") },
   ],
   menus: identityMenu,
   i18n: { iam: enIamMessages },
