@@ -171,6 +171,7 @@ const RESOURCE_VIEW_KIND_SWITCHER: Record<
   list: { labelKey: "resourceToolbar.listView", icon: "list" },
   board: { labelKey: "resourceToolbar.boardView", icon: "grid-2x2" },
   calendar: { labelKey: "resourceToolbar.calendarView", icon: "calendar" },
+  timeline: { labelKey: "resourceToolbar.timelineView", icon: "activity" },
 };
 
 const DEFAULT_SWITCHER_KINDS: readonly ResourceViewKind[] = ["list", "board"];

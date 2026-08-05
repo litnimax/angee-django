@@ -16,6 +16,7 @@ import type {
 import { useUiT } from "../i18n";
 import type { PagerState } from "../ui/pager";
 import { BoardView } from "./BoardView";
+import { TimelineView } from "./TimelineView";
 import {
   ResourceViewProvider,
   useResourceView,
@@ -94,6 +95,7 @@ export type {
   ListEmptyContent,
   ListEmptyState,
   ListViewProps,
+  TimelineViewSpec,
 } from "./resource-view-types";
 
 const EMPTY_GROUP_STACK = [] as const;
@@ -176,6 +178,7 @@ function ListViewBody<TRow extends Row = Row>({
   defaultGroup,
   defaultGroups,
   calendar,
+  timeline,
   laneSource,
   onCreate,
   createLabel,
@@ -195,12 +198,18 @@ function ListViewBody<TRow extends Row = Row>({
 }): React.ReactElement {
   const t = useUiT();
   const resolvedEmptyContent = emptyContent ?? t("list.empty");
-  // The Calendar kind is offered only where the page declares occurrence sources;
-  // the switcher's options derive from that (list + board always).
+  // The Calendar and Timeline kinds are offered only where the page declares
+  // what each needs — occurrence sources and a date axis; the switcher's options
+  // derive from that (list + board always).
   const calendarAvailable = (calendar?.sources.length ?? 0) > 0;
+  const timelineAvailable = Boolean(timeline?.dateField);
   const availableViews = React.useMemo(
-    () => availableResourceViewKinds({ calendar: calendarAvailable }),
-    [calendarAvailable],
+    () =>
+      availableResourceViewKinds({
+        calendar: calendarAvailable,
+        timeline: timelineAvailable,
+      }),
+    [calendarAvailable, timelineAvailable],
   );
   const modelMetadata = useModelMetadata(resource);
   const schemaMetadata = useSchemaFieldMetadata();
@@ -391,6 +400,7 @@ function ListViewBody<TRow extends Row = Row>({
       availableViews={availableViews}
       effectiveGroupStack={effectiveGroupStack}
       boardGroupingPinned={boardGroupingPinned}
+      timeline={timeline}
       clientRowModel={clientRowModel}
       groupedListMode={groupedListMode}
       declaredFacets={declaredFacets}
@@ -478,6 +488,7 @@ interface ListViewContentProps<TRow extends Row> {
   availableViews: readonly ResourceViewKind[];
   effectiveGroupStack: readonly ResourceViewGroup[];
   boardGroupingPinned: boolean;
+  timeline: ListViewProps<TRow>["timeline"];
   clientRowModel: boolean;
   groupedListMode: boolean;
   declaredFacets: ReturnType<typeof useRelationFacets>;
@@ -511,6 +522,7 @@ function ListViewContent<TRow extends Row = Row>({
   availableViews,
   effectiveGroupStack,
   boardGroupingPinned,
+  timeline,
   clientRowModel,
   groupedListMode,
   declaredFacets,
@@ -736,6 +748,17 @@ function ListViewContent<TRow extends Row = Row>({
           renderCard={renderCard}
           dragEnabled={surface.boardDragEnabled}
           onCardMove={surface.onBoardCardMove}
+        />
+      ) : timeline && resourceView.state.view === "timeline" ? (
+        // The timeline reads the very rows the table would have rendered — the
+        // kind buckets them by its declared date axis instead of laying them out
+        // in cells. Grouping is off for this kind, so the row models are flat.
+        <TimelineView<TRow>
+          rows={surface.rowModels.map((model) => model.original)}
+          dateField={timeline.dateField as keyof TRow & string}
+          titleField={timeline.titleField as (keyof TRow & string) | undefined}
+          bodyField={timeline.bodyField as (keyof TRow & string) | undefined}
+          emptyContent={emptyContent}
         />
       ) : flatMeasures.length > 0 && !clientRowModel ? (
         <FlatListBodyWithAggregate

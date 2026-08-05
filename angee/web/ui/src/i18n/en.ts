@@ -73,6 +73,7 @@ export const enUiMessages: Record<string, string> = {
   "resourceToolbar.gridView": "Grid view",
   "resourceToolbar.boardView": "Board view",
   "resourceToolbar.calendarView": "Calendar view",
+  "resourceToolbar.timelineView": "Timeline view",
   "resourceToolbar.today": "Today",
   "resourceToolbar.periodPrev": "Previous period",
   "resourceToolbar.periodNext": "Next period",

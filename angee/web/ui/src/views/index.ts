@@ -14,6 +14,7 @@ export {
   type ListViewNavigationScope,
   type ResourceListSnapshot,
   type ColumnAlign,
+  type TimelineViewSpec,
 } from "./ListView";
 export {
   useListRecordNavigation,

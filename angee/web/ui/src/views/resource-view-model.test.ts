@@ -368,7 +368,7 @@ describe("resource-view model", () => {
   });
 
   test("registers the calendar kind with its applicability", () => {
-    expect(RESOURCE_VIEW_KINDS).toEqual(["list", "board", "calendar"]);
+    expect(RESOURCE_VIEW_KINDS).toEqual(["list", "board", "calendar", "timeline"]);
     // The calendar takes only window args in v1: no group-by/pager/columns/filter.
     expect(RESOURCE_VIEW_KIND_CAPABILITIES.calendar).toEqual({
       grouping: false,
@@ -391,13 +391,38 @@ describe("resource-view model", () => {
     });
   });
 
-  test("offers the calendar kind only where sources are declared", () => {
+  test("registers the timeline kind with its applicability", () => {
+    // The timeline reads the same paged rows the list does, so filter + pager
+    // stay applicable; it owns its own date axis, so group-by is off, and it
+    // renders entries rather than cells, so the columns chooser is off.
+    expect(RESOURCE_VIEW_KIND_CAPABILITIES.timeline).toEqual({
+      grouping: false,
+      pagination: true,
+      columns: false,
+      filter: true,
+      requiresSources: true,
+    });
+  });
+
+  test("offers the source-declaring kinds only where declared", () => {
     expect(availableResourceViewKinds()).toEqual(["list", "board"]);
     expect(availableResourceViewKinds({ calendar: false })).toEqual(["list", "board"]);
     expect(availableResourceViewKinds({ calendar: true })).toEqual([
       "list",
       "board",
       "calendar",
+    ]);
+    expect(availableResourceViewKinds({ timeline: true })).toEqual([
+      "list",
+      "board",
+      "timeline",
+    ]);
+    // Declaration order follows RESOURCE_VIEW_KINDS, not the argument order.
+    expect(availableResourceViewKinds({ timeline: true, calendar: true })).toEqual([
+      "list",
+      "board",
+      "calendar",
+      "timeline",
     ]);
   });
 

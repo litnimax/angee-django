@@ -47,6 +47,21 @@ export interface CalendarViewSpec {
   onSelectRange?: (start: Date, end: Date) => void;
 }
 
+/**
+ * The timeline kind's declaration: which row fields are the entry's date, title
+ * and body. The date axis has no safe default — a resource may carry several
+ * datetimes, and picking one by probing metadata would be a guess — so the page
+ * names it, the way a board names its lane source.
+ */
+export interface TimelineViewSpec {
+  /** Row field holding the ISO datetime the entries bucket by (newest first). */
+  dateField: string;
+  /** Row field holding the entry title; defaults to the resource representation. */
+  titleField?: string;
+  /** Row field holding the entry body. */
+  bodyField?: string;
+}
+
 export interface BoardLaneSource {
   /** Resource field that owns the board lane id and receives drag writes. */
   field: string;
@@ -103,6 +118,9 @@ export interface ListViewProps<TRow extends Row = Row> {
   /** Calendar data + interaction seams. When declared, the Calendar kind is offered
    * in the switcher and rendered as a windowed-collection surface (no `useList`). */
   calendar?: CalendarViewSpec;
+  /** Timeline date axis + entry fields. When declared, the Timeline kind is
+   * offered in the switcher and renders the same paged rows the list reads. */
+  timeline?: TimelineViewSpec;
   /** Declared board lanes for a relation group field; empty lanes render too. */
   laneSource?: BoardLaneSource;
   /** Group seeded by the resource list. */

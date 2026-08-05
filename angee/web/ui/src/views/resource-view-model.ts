@@ -7,7 +7,7 @@ import {
 import { dedupeBy } from "../lib/dedupe";
 import { DEFAULT_PAGE_SIZE } from "./page-size";
 
-export const RESOURCE_VIEW_KINDS = ["list", "board", "calendar"] as const;
+export const RESOURCE_VIEW_KINDS = ["list", "board", "calendar", "timeline"] as const;
 
 /** The calendar kind's window modes; `month` is the default period. */
 export const CALENDAR_VIEW_MODES = ["month", "week", "day"] as const;
@@ -31,7 +31,8 @@ export type ResourceViewKind = (typeof RESOURCE_VIEW_KINDS)[number];
  * reads the active kind's applicability to gate the filter/search box, the pager,
  * the group-by picker, and the columns chooser rather than each page hiding them.
  * `requiresSources` marks a kind offered only where the composing page declares
- * the data it needs (the calendar's windowed occurrence sources).
+ * the data it needs (the calendar's windowed occurrence sources, the timeline's
+ * date axis).
  */
 export interface ResourceViewKindCapabilities {
   /** The group-by picker + group/board lane renderers apply. */
@@ -65,6 +66,18 @@ export const RESOURCE_VIEW_KIND_CAPABILITIES: Record<
     filter: false,
     requiresSources: true,
   },
+  // The timeline reads the same paged rows the list does, so filter and pager
+  // apply unchanged. It buckets them by its own date axis, so the group-by
+  // picker would fight that axis and stays hidden; it renders entries, not
+  // cells, so the columns chooser is inapplicable. The axis itself is a page
+  // declaration, hence `requiresSources`.
+  timeline: {
+    grouping: false,
+    pagination: true,
+    columns: false,
+    filter: true,
+    requiresSources: true,
+  },
 };
 
 /** All applicable, for a surface (e.g. an in-memory rows list) that names no kind. */
@@ -90,11 +103,12 @@ export function resourceViewKindCapabilities(
  * The switcher's options derive from this — never a hardcoded array.
  */
 export function availableResourceViewKinds(
-  declared: { calendar?: boolean } = {},
+  declared: { calendar?: boolean; timeline?: boolean } = {},
 ): readonly ResourceViewKind[] {
   return RESOURCE_VIEW_KINDS.filter((kind) => {
     if (!RESOURCE_VIEW_KIND_CAPABILITIES[kind].requiresSources) return true;
     if (kind === "calendar") return declared.calendar ?? false;
+    if (kind === "timeline") return declared.timeline ?? false;
     return false;
   });
 }
