@@ -38,7 +38,9 @@ dependencies = [
   "strawberry-graphql>=0.270",
   "strawberry-django-aggregates>=0.10.0",
   "strawberry-django-hasura>=0.6.0",
-  "strawberry-graphql-django>=0.86",
+  # 0.86.7 carries the DEFAULT_PK_FIELD_NAME mutation-lookup fix the Hasura
+  # resolvers depend on (upstream #928, was an Angee fork patch).
+  "strawberry-graphql-django>=0.86.7",
   "tablib>=3",
   "django-choices-field>=4.0.0",
   "django-yamlconf>=1.5.0",
@@ -105,21 +107,33 @@ dev = [
 cache-dir = ".angee/caches/uv"
 
 [tool.uv.extra-build-variables]
-# python-olm (mautrix[encryption]) vendors the EOL libolm C++ source, which
-# modern clang rejects on a const-increment inside a never-instantiated template
-# member (macOS has no wheels; manylinux wheels predate the stricter checks).
-# Deferring template semantic checks lets the sdist build unchanged. Remove when
-# mautrix moves off libolm (vodozemac) or a fixed release appears.
-python-olm = { CXXFLAGS = "-fdelayed-template-parsing" }
+# python-olm (mautrix[encryption]) vendors the EOL libolm C++/CMake source; no
+# wheel exists for the supported Python, so every platform builds this sdist.
+# The three variables are ONE decision — build it with clang:
+#   CXXFLAGS: modern compilers reject a const-increment inside a never-instantiated
+#     template member; `-fdelayed-template-parsing` defers the check. The flag is
+#     clang-only, so GCC dies on it with `unrecognized command-line option`.
+#   CC/CXX: pin the toolchain the flag belongs to instead of inheriting the
+#     platform default (clang on macOS, GCC on Linux). Declaring it here — not as
+#     ad-hoc env in a Dockerfile or a shell — also keeps the build variables part
+#     of uv's cache key identical everywhere, so a wheel built once (image build)
+#     is reused by every later `uv sync` instead of recompiling.
+#   CMAKE_POLICY_VERSION_MINIMUM: CMake 4 dropped compatibility with `< 3.5`,
+#     which the vendored libolm still declares.
+# Requires clang + cmake on any host that builds from source (see README
+# Requirements); the Docker `deps` stage installs both. Remove the whole entry
+# when mautrix moves off libolm (vodozemac) or a fixed release appears.
+python-olm = { CC = "clang", CXX = "clang++", CXXFLAGS = "-fdelayed-template-parsing", CMAKE_POLICY_VERSION_MINIMUM = "3.5" }
 
 [tool.uv.sources]
-# Developing against the Angee Strawberry forks. strawberry-django is on
-# `hotfix-angee-django` = `codex/input-object-extensions` + upstream/main + two
-# upstream bug fixes (DEFAULT_PK_FIELD_NAME mutation lookups, #927; __copy__
-# dropping key_attr/argument_name). strawberry core stays on codex — the fixes are
-# strawberry-django-only. Keep pins explicit so every environment resolves identically.
+# Developing against the Angee Strawberry core fork. `extend=True` merges
+# same-name object/input types at schema build, which is how an addon
+# contributes fields to a type another addon owns; upstream raises
+# DuplicatedTypeName instead. Tracking strawberry-graphql/strawberry#4464 —
+# drop the pin when it lands. Keep it explicit so every environment resolves
+# identically. strawberry-django needs no fork: its patches are upstream as of
+# 0.86.7.
 strawberry-graphql = { git = "https://github.com/ang-ee/strawberry.git", branch = "codex/input-object-extensions" }
-strawberry-graphql-django = { git = "https://github.com/ang-ee/strawberry-django.git", branch = "hotfix-angee-django" }
 
 [tool.hatch.build.targets.wheel]
 # Two source roots merge into the one `angee` PEP 420 namespace: the framework

@@ -73,6 +73,10 @@ export interface ResourceToolbarProps {
   onFilterToggle?: (id: string) => void;
   onClearGroup?: () => void;
   onGroupStackChange?: (groups: readonly ResourceViewGroup[]) => void;
+  /** The pivot's column axes; the group stack stays the row axes. */
+  columnStack?: readonly ResourceViewGroup[];
+  /** Declared by a kind that has a second axis (the pivot); adds its picker. */
+  onColumnStackChange?: (groups: readonly ResourceViewGroup[]) => void;
   onPageChange?: (page: number) => void;
   onPageSizeChange?: (pageSize: number) => void;
   onViewChange?: (view: ResourceViewKind) => void;
@@ -171,6 +175,7 @@ const RESOURCE_VIEW_KIND_SWITCHER: Record<
   list: { labelKey: "resourceToolbar.listView", icon: "list" },
   board: { labelKey: "resourceToolbar.boardView", icon: "grid-2x2" },
   calendar: { labelKey: "resourceToolbar.calendarView", icon: "calendar" },
+  pivot: { labelKey: "resourceToolbar.pivotView", icon: "table" },
   timeline: { labelKey: "resourceToolbar.timelineView", icon: "activity" },
 };
 
@@ -198,6 +203,8 @@ export function ResourceToolbar({
   onFilterTextChange,
   onClearGroup,
   onGroupStackChange,
+  columnStack,
+  onColumnStackChange,
   onPageChange,
   onPageSizeChange,
   onViewChange,
@@ -246,6 +253,8 @@ export function ResourceToolbar({
         <FilterPicker
           groups={groups}
           groupControls={groupControls}
+          columns={columnStack ?? EMPTY_AXIS}
+          onColumnStackChange={onColumnStackChange}
           groupOptions={toolbarGroupOptions}
           activeFilters={activeFilters}
           activeFilterIds={activeFilterIds}
@@ -337,9 +346,13 @@ function ResourceViewControls({
   );
 }
 
+const EMPTY_AXIS: readonly ResourceViewGroup[] = [];
+
 function FilterPicker({
   groups,
   groupControls,
+  columns,
+  onColumnStackChange,
   groupOptions,
   filterOptions,
   customFilterFields,
@@ -359,6 +372,8 @@ function FilterPicker({
 }: {
   groups: readonly ResourceViewGroup[];
   groupControls: boolean;
+  columns: readonly ResourceViewGroup[];
+  onColumnStackChange?: (groups: readonly ResourceViewGroup[]) => void;
   groupOptions: readonly ResourceToolbarGroupOption[];
   filterOptions: readonly ResourceToolbarFilterOption[];
   customFilterFields: readonly ResourceToolbarFilterField[];
@@ -464,6 +479,22 @@ function FilterPicker({
             }}
           />
         ))}
+        {columns.map((columnGroup, index) => (
+          <FacetChip
+            key={`column:${columnGroup.field}:${columnGroup.granularity ?? ""}`}
+            label={
+              index === 0
+                ? t("resourceToolbar.columnAxis")
+                : t("resourceToolbar.then")
+            }
+            value={resourceViewGroupLabel(columnGroup)}
+            removeLabel={resourceViewGroupLabel(columnGroup)}
+            onRemove={() =>
+              onColumnStackChange?.(
+                columns.filter((_, columnIndex) => columnIndex !== index),
+              )}
+          />
+        ))}
         {activeFilters.map((option) => (
           <FacetChip
             key={option.id}
@@ -520,7 +551,11 @@ function FilterPicker({
           <PopoverContent
             className={cn(
               "grid max-w-[calc(100vw-2rem)]",
-              groupControls ? "w-[45rem] grid-cols-3" : "w-[30rem] grid-cols-2",
+              onColumnStackChange
+                ? "w-[60rem] grid-cols-4"
+                : groupControls
+                  ? "w-[45rem] grid-cols-3"
+                  : "w-[30rem] grid-cols-2",
             )}
           >
             <PickerColumn
@@ -608,6 +643,23 @@ function FilterPicker({
                     onAdd={addCustomGroup}
                   />
                 ) : null}
+              </PickerColumn>
+            ) : null}
+            {onColumnStackChange ? (
+              // The pivot's second axis: the same axis vocabulary as group-by,
+              // edited into the column stack instead of the row stack.
+              <PickerColumn
+                icon={<Glyph name="columns" className="size-3.5" />}
+                title={t("resourceToolbar.columnAxis")}
+              >
+                {groupOptions.map((option) => (
+                  <GroupOptionButton
+                    key={option.id}
+                    option={option}
+                    groups={columns}
+                    onGroupStackChange={onColumnStackChange}
+                  />
+                ))}
               </PickerColumn>
             ) : null}
             <PickerColumn

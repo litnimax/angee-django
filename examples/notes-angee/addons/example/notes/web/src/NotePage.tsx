@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ResourceList, Form, List, Column, Field, Group, REFINE_CREATE_ID, RevisionsTab, Statusline, StatusSegment, StatuslineSpacer, useAuthoredResourceMutation, useResourceRevisions, type ChatterTab, type Occurrence, type ResourceListCalendarSpec, type ResourceViewDefaultGroups, type RecordSmartButtonDescriptor, type TimelineViewSpec, useChatterContent } from "@angee/ui";
+import { ResourceList, Form, List, Column, Field, Group, REFINE_CREATE_ID, RevisionsTab, Statusline, StatusSegment, StatuslineSpacer, useAuthoredResourceMutation, useResourceRevisions, type ChatterTab, type Occurrence, type PivotViewSpec, type ResourceListCalendarSpec, type ResourceViewDefaultGroups, type RecordSmartButtonDescriptor, type TimelineViewSpec, useChatterContent } from "@angee/ui";
 import { useParams } from "@tanstack/react-router";
 
 import { NotesReschedule } from "./documents";
@@ -20,6 +20,13 @@ const RECORD_SUBTITLE_FIELDS: readonly string[] = [
   "word_count",
 ];
 
+// Notes by status across the months they were last touched, measured by the
+// `word_count` sum the list already declares as an aggregate column.
+const NOTE_PIVOT = {
+  rows: [{ field: "status" }],
+  columns: [{ field: "updated_at", granularity: "month" }],
+} satisfies PivotViewSpec;
+
 // The timeline kind buckets the list's own rows by `updated_at` — the one date
 // every note carries. `body` is not a column, so it is selected as an extra
 // field for the entry text.
@@ -33,6 +40,7 @@ const noteList = (
   <List
     resource={MODEL}
     defaultGroups={NOTE_DEFAULT_GROUPS}
+    pivot={NOTE_PIVOT}
     timeline={NOTE_TIMELINE}
     fields={["body"]}
     order={{ updated_at: "DESC" }}

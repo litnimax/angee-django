@@ -268,6 +268,19 @@ TanStack apply the URL-owned filter object to in-memory rows.
   action controls or hooks, but they do not own table mechanics, duplicate route
   params, cache state, bespoke loading/error surfaces, or local copies of shared
   resource-view state.
+- **A cross-tabulated view is the grouping owner read twice, not a second
+  engine.** The pivot kind declares row axes, column axes and measures
+  (`ListView`'s `pivot` prop) and reads them all through the one `_groups`
+  surface: one grouped call per axis level, one per (row level × column level)
+  cell block, one `_aggregate` for the grand total — priced by axis depth, never
+  by cell count. Its axes are the same `ResourceViewGroup` the group-by picker
+  edits (rows are the group stack, columns the column stack), its measures are
+  the page's own `aggregate=` columns, and its cell drilldown is the ordinary
+  URL-owned filter. Every subtotal comes from the server: never re-derive a
+  subtotal by summing cells, which is wrong for `avg` and for any non-additive
+  measure. When a grouped capability is missing, extend the dialect owners
+  together (`docs/stack.md` → Hasura Dialect Rule); do not add pivot-only group
+  semantics on the client.
 - **Two-collection settings pages are a sanctioned family, not a double toolbar.**
   A `SettingsShell` may stack several `SettingsSection`s, each wrapping its own
   `ResourceList`/`DrawerResourceList` (integrate Templates: template sources +
@@ -598,6 +611,19 @@ Hard-won traps — the wise learn from others' mistakes (`docs/guidelines.md`).
 - **Layout slot ids use the `@angee/ui.*` symbol namespace.** Register new slots as
   `Symbol.for("@angee/ui.<name>-slot")` (see `layouts/slots.ts`); the legacy
   rendered-binding prefix is retired.
+- **Vite must load a config that imports `@angee/app/vite` with
+  `--configLoader runner`.** The default loader bundles the config but leaves a
+  linked workspace package external, so Node imports that `.ts` export directly and
+  dies with `ERR_UNKNOWN_FILE_EXTENSION` on any Node without type stripping — the
+  distro Node on Ubuntu is built without TypeScript support entirely
+  (`ERR_NO_TYPESCRIPT`). The example and the project template both pass the flag in
+  their `dev`/`build` scripts; a new web package that runs Vite must too.
+- **A generated import must point at an *installed* package, not at a checkout.**
+  Node/Vite resolve a package's own dependencies from the file that imports it, so
+  `runtime/web/app.ts` importing an addon's `src/` out of a bind-mounted framework
+  checkout fails on that addon's dependencies (`@angee/app`, `lucide-react`, …)
+  even though the file exists. `angee-web-codegen` therefore prefers
+  `web/node_modules/<pkg>/<sourceRoot>` over the manifest root; keep that order.
 
 ## Checks
 
