@@ -1,0 +1,35 @@
+// Authorization schema for the companies addon.
+// @rebac_package: companies
+// @rebac_package_version: 0.1.0
+// @rebac_schema_revision: 1
+
+// Roles-as-namespace anchor, mirroring uom/role: `includes` lets one companies
+// role imply another, and resources gate on `effective_member` so granted +
+// implied members both resolve. Platform admins (angee/role:admin) reach every
+// companies role through the const-backed `admin` relation.
+definition companies/role {
+    relation member:   auth/user | auth/group#member | angee/role:admin#member
+    relation includes: companies/role#effective_member
+    relation admin:    angee/role // rebac:const=admin
+
+    permission effective_member = member + includes + admin->member
+}
+
+// The company tree. `parent` mirrors the model's parent FK so the actor-context
+// slice can grant subtree visibility with arrows (a holding's member reads its
+// subsidiaries) without re-syncing relations — only permissions will change.
+//
+// Reads are open to authenticated actors FOR THIS SLICE ONLY: company
+// membership (the actor's current/allowed companies) arrives with the actor
+// context, which narrows `read` to members + parent arrows and bumps the schema
+// revision. Configuration is admin-only from the start.
+definition companies/company {
+    relation parent:  companies/company // rebac:field=parent
+    relation admin:   angee/role // rebac:const=admin
+    relation manager: companies/role:company_admin#effective_member
+
+    permission create = admin->member + manager
+    permission read   = authenticated
+    permission write  = admin->member + manager
+    permission delete = admin->member + manager
+}

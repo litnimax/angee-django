@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     "angee.storage_integrate",
     "angee.storage_integrate_iphone",
     "angee.parties",
+    "angee.companies",
     "angee.money",
     "angee.scheduling",
     "angee.sequence",
