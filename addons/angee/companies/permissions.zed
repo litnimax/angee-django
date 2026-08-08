@@ -1,7 +1,7 @@
 // Authorization schema for the companies addon.
 // @rebac_package: companies
 // @rebac_package_version: 0.1.0
-// @rebac_schema_revision: 1
+// @rebac_schema_revision: 2
 
 // Roles-as-namespace anchor, mirroring uom/role: `includes` lets one companies
 // role imply another, and resources gate on `effective_member` so granted +
@@ -15,21 +15,36 @@ definition companies/role {
     permission effective_member = member + includes + admin->member
 }
 
-// The company tree. `parent` mirrors the model's parent FK so the actor-context
-// slice can grant subtree visibility with arrows (a holding's member reads its
-// subsidiaries) without re-syncing relations — only permissions will change.
-//
-// Reads are open to authenticated actors FOR THIS SLICE ONLY: company
-// membership (the actor's current/allowed companies) arrives with the actor
-// context, which narrows `read` to members + parent arrows and bumps the schema
-// revision. Configuration is admin-only from the start.
+// The company tree. `parent` mirrors the model's parent FK; `member` tuples are
+// mirrored from CompanyMember rows (written on create, revoked on delete — see
+// angee.companies.models/signals). `read = member + parent->read` is the
+// multicompany visibility decision: a member reads their company, and through
+// the recursive parent arrow a holding's member reads every company in the
+// subtree below (the storage/folder arrow precedent). Configuration stays
+// admin/manager-only.
 definition companies/company {
     relation parent:  companies/company // rebac:field=parent
+    relation member:  auth/user | auth/group#member
     relation admin:   angee/role // rebac:const=admin
     relation manager: companies/role:company_admin#effective_member
 
     permission create = admin->member + manager
-    permission read   = authenticated
+    permission read   = member + parent->read + admin->member + manager
+    permission write  = admin->member + manager
+    permission delete = admin->member + manager
+}
+
+// The membership edge itself: whoever reads a company may see its roster
+// (through the company arrow the parent visibility carries up the tree), but
+// granting and revoking membership is configuration — admin/manager-only, a
+// plain member cannot edit the roster.
+definition companies/membership {
+    relation company: companies/company // rebac:field=company
+    relation admin:   angee/role // rebac:const=admin
+    relation manager: companies/role:company_admin#effective_member
+
+    permission create = admin->member + manager
+    permission read   = company->read + admin->member
     permission write  = admin->member + manager
     permission delete = admin->member + manager
 }

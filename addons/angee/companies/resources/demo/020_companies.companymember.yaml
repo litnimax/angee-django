@@ -1,0 +1,11 @@
+# Demo membership (demo tier): alice is a member of the group company, so she
+# reads both demo companies (the subsidiary through the parent arrow) — while
+# bob, deliberately no member, reads none. Loading a membership row writes its
+# REBAC `member` tuple through the model's save.
+_meta:
+  model: companies.CompanyMember
+rows:
+  - xref: member_alice_acme_group
+    fields:
+      company: companies.acme_group
+      user: iam.user_alice
