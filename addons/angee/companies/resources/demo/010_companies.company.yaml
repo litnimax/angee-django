@@ -1,0 +1,14 @@
+# Demo companies (demo tier): a two-level tree so the multicompany visibility
+# decision is observable out of the box — a member of the group company reads
+# the subsidiary through the parent arrow. `parent` names the group row by
+# `<app>.<xref>`.
+_meta:
+  model: companies.Company
+rows:
+  - xref: acme_group
+    fields:
+      name: Acme Group
+  - xref: acme_west
+    fields:
+      name: Acme West
+      parent: companies.acme_group

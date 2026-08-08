@@ -4,3 +4,9 @@ description = "The operational company tree: the multi-company scoping anchor, w
 keywords = ["companies", "company", "multicompany", "scope"]
 category = "Foundation"
 depends_on = ["angee.iam", "angee.resources", "angee.graphql", "angee.parties"]
+
+[resources]
+demo = [
+  "resources/demo/010_companies.company.yaml",
+  { path = "resources/demo/020_companies.companymember.yaml", depends_on = "resources/demo/010_companies.company.yaml" },
+]
