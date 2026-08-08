@@ -1,0 +1,6 @@
+[addon]
+name = "angee.companies"
+description = "The operational company tree: the multi-company scoping anchor, with an optional organization link."
+keywords = ["companies", "company", "multicompany", "scope"]
+category = "Foundation"
+depends_on = ["angee.iam", "angee.resources", "angee.graphql", "angee.parties"]
