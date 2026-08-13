@@ -1,12 +1,12 @@
 {
-  "name": "@angee/spaces",
+  "name": "@angee/workflows-parties",
   "version": "0.0.0",
-  "license": "LGPL-3.0-or-later",
+  "license": "AGPL-3.0-or-later",
   "private": true,
   "type": "module",
   "sideEffects": false,
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.tsx"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -15,9 +15,9 @@
   },
   "dependencies": {
     "@angee/app": "workspace:*",
-    "@angee/messaging": "workspace:*",
-    "@angee/ui": "workspace:*",
-    "lucide-react": "^1.21.0"
+    "@angee/parties": "workspace:*",
+    "@angee/refine": "workspace:*",
+    "@angee/ui": "workspace:*"
   },
   "peerDependencies": {
     "@tanstack/react-router": "^1",
