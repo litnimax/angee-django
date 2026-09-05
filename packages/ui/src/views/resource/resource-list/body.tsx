@@ -69,6 +69,7 @@ export function ResourceListBody<TRow extends Row = Row>({
   const resolvedFormFields = declarations.form?.fields ?? formFields;
   const resolvedFormGroups = declarations.form?.groups ?? formGroups;
   const resolvedFormActions = declarations.form?.actions ?? EMPTY_ACTIONS;
+  const resolvedFormLines = declarations.form?.lines ?? null;
   const ResolvedListComponent = declarations.list?.props.list ?? ListRenderer;
   const resolvedFacets = declarations.list
     ? mergePageFacets(facets, declarations.list.facets)
@@ -262,6 +263,7 @@ export function ResourceListBody<TRow extends Row = Row>({
       fields={resolvedFormFields}
       groups={resolvedFormGroups}
       actions={resolvedFormActions}
+      lines={resolvedFormLines}
       {...formRenderProps}
       defaultValues={
         resolvedCreating ? resolvedCreateDefaults : undefined

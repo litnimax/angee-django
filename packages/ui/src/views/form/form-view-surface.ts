@@ -97,6 +97,8 @@ export interface UseFormViewSurfaceProps {
   groups?: readonly GroupDescriptor[];
   children?: React.ReactNode;
   actions?: readonly ActionDescriptor[];
+  /** Pre-parsed `Lines` declaration for hosts that pass fields/groups as props. */
+  lines?: LinesDescriptor | null;
   returning?: readonly string[];
   defaultValues?: Record<string, unknown>;
   onSaved?: (row: Row) => void;
@@ -146,6 +148,7 @@ export function useFormViewSurface({
   groups,
   children,
   actions,
+  lines,
   returning,
   defaultValues,
   onSaved,
@@ -172,7 +175,10 @@ export function useFormViewSurface({
   const childFields = React.useMemo(() => parsePageFields(children), [children]);
   const childGroups = React.useMemo(() => parsePageGroups(children), [children]);
   const childActions = React.useMemo(() => parsePageActions(children), [children]);
-  const linesDeclaration = React.useMemo(() => parsePageLines(children), [children]);
+  const linesDeclaration = React.useMemo(
+    () => lines ?? parsePageLines(children),
+    [children, lines],
+  );
   const modelMetadata = useModelMetadata(resource);
   const schemaMetadata = useSchemaFieldMetadata();
   const dataResource = modelMetadata?.resource ?? null;

@@ -11,7 +11,7 @@ import { type ResourceViewDefaultGroups, type ResourceViewGroup, type ResourceVi
 import type { BoardLaneSource } from "../resource-view-types";
 import type { Occurrence } from "../../calendar/CalendarView";
 import type { AnyCalendarWindowSource } from "../../calendar/use-calendar-window";
-import { type ActionDescriptor, type FacetDescriptor, type GroupDescriptor } from "../../page";
+import { type ActionDescriptor, type FacetDescriptor, type GroupDescriptor, type LinesDescriptor } from "../../page";
 import { ResourceListBody } from "./body";
 import { parseResourceListDeclarations, validateResourceListDeclarations } from "./declarations";
 /** Where the open record's form renders relative to the list. */
@@ -157,6 +157,7 @@ export interface ResourceFormDeclaration {
   fields: readonly FormField[];
   groups: readonly GroupDescriptor[];
   actions: readonly ActionDescriptor[];
+  lines: LinesDescriptor | null;
 }
 
 /** Internal record-open state and commands resolved before `ResourceListBody`. */
