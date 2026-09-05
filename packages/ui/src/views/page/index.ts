@@ -15,7 +15,7 @@ import type { ColumnDescriptor, ColumnProps } from "./Column";
 import type { FacetDescriptor, FacetProps } from "./Facet";
 import type { FieldDescriptor, FieldProps } from "./Field";
 import type { GroupDescriptor, GroupProps } from "./Group";
-import type { LinesDescriptor, LinesProps } from "./Lines";
+import type { LinesDescriptor, LinesFooterContext, LinesProps } from "./Lines";
 import type { TabDescriptor, TabProps } from "./Tab";
 import { pageChildren, pageChildrenCacheKey, pageElementProps } from "./types";
 
@@ -67,6 +67,7 @@ export type {
   GroupDescriptor,
   GroupProps,
   LinesDescriptor,
+  LinesFooterContext,
   LinesProps,
   TabDescriptor,
   TabProps,

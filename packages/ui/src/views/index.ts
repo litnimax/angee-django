@@ -286,6 +286,7 @@ export type {
   LineCellResolve,
   LineCellResolveContext,
   LinesDescriptor,
+  LinesFooterContext,
   LinesProps,
   PageColumnAlign,
   PageElement,

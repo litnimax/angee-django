@@ -266,7 +266,15 @@ export function FormViewOverview({
             lines={linesResource}
             readOnly={formReadOnly}
             columns={linesDeclaration?.columns}
-            footer={linesDeclaration?.footer}
+            footer={
+              linesDeclaration?.footer
+                ? (rows) =>
+                    linesDeclaration.footer?.(rows, {
+                      record: surface.displayRecord,
+                      isCreate: surface.isCreate,
+                    })
+                : undefined
+            }
             rowErrors={lineRowErrors}
             setValue={form.setValue as EditableLinesSetValue}
           />
