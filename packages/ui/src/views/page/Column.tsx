@@ -5,6 +5,30 @@ import type { WidgetOption } from "../../widgets/types";
 import { PAGE_ELEMENT_SLOT } from "./types";
 
 export type PageColumnAlign = "left" | "center" | "right";
+
+/** The live row facts a line column's `resolve` hook reads besides the changed cell. */
+export interface LineCellResolveContext {
+  /** The edited row's values, with the changed cell already applied. */
+  row: Record<string, unknown>;
+  /** The edited row's position in the line set. */
+  index: number;
+  /** Every current line row, in order. */
+  rows: readonly Record<string, unknown>[];
+}
+
+/**
+ * An async row-defaults hook for a line cell: given the changed cell value,
+ * return a `{fieldName: value}` map of sibling cells to seed on the same row.
+ * See `ColumnProps.resolve`.
+ */
+export type LineCellResolve = (
+  value: unknown,
+  context: LineCellResolveContext,
+) =>
+  | Record<string, unknown>
+  | null
+  | undefined
+  | Promise<Record<string, unknown> | null | undefined>;
 export type ColumnAggregate =
   | "count"
   | "sum"
@@ -28,6 +52,22 @@ export interface ColumnProps<
   align?: PageColumnAlign;
   render?: (row: TRow) => ReactNode;
   tone?: Record<string, Tone>;
+  /**
+   * Lines composer only: the CSS grid track this column occupies (e.g. `"96px"`,
+   * `"2fr"`, `"minmax(0, 2fr)"`). Defaults to an equal `minmax(0, 1fr)` share.
+   */
+  width?: string;
+  /** Lines composer only: render this column's cells read-only. */
+  readOnly?: boolean;
+  /**
+   * Lines composer only: seed sibling cells of the same row when this cell
+   * changes, resolving defaults asynchronously (a product lookup filling label,
+   * UoM, price, taxes). Follows the computed-default law: a returned entry is
+   * applied only to cells of that row the user has not manually edited this
+   * session; entries for the changed cell itself are ignored; stale in-flight
+   * results drop.
+   */
+  resolve?: LineCellResolve;
 }
 
 export interface ColumnDescriptor<
@@ -49,6 +89,12 @@ export interface ColumnDescriptor<
   tone?: Record<string, Tone>;
   /** Money widget: path to the FK owning the row's currency (see `WidgetField.currencyField`). */
   currencyField?: string;
+  /** Lines composer only: the CSS grid track this column occupies (see `ColumnProps.width`). */
+  width?: string;
+  /** Lines composer only: render this column's cells read-only (see `ColumnProps.readOnly`). */
+  readOnly?: boolean;
+  /** Lines composer only: async sibling-cell defaults on change (see `ColumnProps.resolve`). */
+  resolve?: LineCellResolve;
 }
 
 /**

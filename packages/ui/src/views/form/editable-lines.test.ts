@@ -11,6 +11,7 @@ import {
   emptyLineRow,
   lineDiffConfig,
   lineToInput,
+  meaningfulLineInputs,
   recordLinesToRows,
   sameObservedLines,
 } from "./editable-lines";
@@ -344,5 +345,27 @@ describe("diffLines — M2M + enum", () => {
       labels: [],
       position: 0,
     });
+  });
+});
+
+describe("meaningfulLineInputs", () => {
+  test("keeps rows carrying content and drops blank composer rows", () => {
+    const payload = [
+      { product: "prd_1", quantity: "2", position: 0 },
+      { position: 1 },
+      { label: "", position: 2 },
+      { position: 3, taxes: [] },
+    ];
+    expect(meaningfulLineInputs(payload, config)).toEqual([
+      { product: "prd_1", quantity: "2", position: 0 },
+    ]);
+  });
+
+  test("a lone M2M pick or a zero count as content", () => {
+    const payload = [
+      { taxes: ["tax_1"], position: 0 },
+      { quantity: 0, position: 1 },
+    ];
+    expect(meaningfulLineInputs(payload, config)).toEqual(payload);
   });
 });

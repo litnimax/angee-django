@@ -190,7 +190,7 @@ export {
   type ResourceRecordPlacement,
   type RecordSmartButtonDescriptor,
 } from "./resource/ResourceList";
-export { useRouteRecordId } from "./resource/resource-routing";
+export { recordPath, useRouteRecordId } from "./resource/resource-routing";
 export {
   AggregatePanel,
   type AggregatePanelProps,
@@ -247,6 +247,7 @@ export {
   Facet,
   Field,
   Group,
+  Lines,
   Tab,
   mergePageFacets,
   pageChildren,
@@ -256,6 +257,7 @@ export {
   parsePageFacets,
   parsePageFields,
   parsePageGroups,
+  parsePageLines,
   parsePageTabs,
   PAGE_ELEMENT_SLOT,
 } from "./page";
@@ -277,8 +279,14 @@ export type {
   FacetProps,
   FieldDescriptor,
   FieldProps,
+  FieldResolve,
+  FieldResolveContext,
   GroupDescriptor,
   GroupProps,
+  LineCellResolve,
+  LineCellResolveContext,
+  LinesDescriptor,
+  LinesProps,
   PageColumnAlign,
   PageElement,
   PageElementKind,

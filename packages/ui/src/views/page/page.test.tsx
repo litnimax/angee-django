@@ -16,6 +16,8 @@ import {
   parsePageFacets,
   parsePageFields,
   parsePageGroups,
+  Lines,
+  parsePageLines,
 } from "./index";
 import type { ColumnDescriptor } from "./Column";
 import { slotContents } from "../../lib/slot-outlet";
@@ -304,5 +306,43 @@ describe("field descriptor resolution", () => {
     expect(isRelationIdField({ name: "a", kind: "many2one" })).toBe(true);
     expect(isRelationIdField({ name: "a", widget: "select" })).toBe(false);
     expect(isRelationIdField({ name: "a" })).toBe(false);
+  });
+});
+
+describe("parsePageLines", () => {
+  test("returns null without a Lines declaration", () => {
+    expect(parsePageLines(<Field name="title" />)).toBeNull();
+  });
+
+  test("parses label, footer, and Column overrides in order", () => {
+    const footer = (): null => null;
+    const parsed = parsePageLines(
+      <>
+        <Field name="title" />
+        <Lines label="Invoice Lines" footer={footer}>
+          <Column field="product" header="Product" width="2fr" />
+          <Column field="quantity" readOnly />
+        </Lines>
+      </>,
+    );
+    expect(parsed).toEqual({
+      label: "Invoice Lines",
+      footer,
+      columns: [
+        { field: "product", header: "Product", width: "2fr" },
+        { field: "quantity", readOnly: true },
+      ],
+    });
+  });
+
+  test("fails fast on a second Lines declaration", () => {
+    expect(() =>
+      parsePageLines(
+        <>
+          <Lines />
+          <Lines />
+        </>,
+      ),
+    ).toThrow("Form accepts at most one Lines declaration.");
   });
 });

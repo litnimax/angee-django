@@ -24,12 +24,14 @@ import {
 import { useForm, type UseFormReturn } from "react-hook-form";
 import { replaceEqualDeep, useMutation, useQueryClient } from "@tanstack/react-query";
 
+import { useLatestRef } from "../../lib/use-latest-ref";
 import type { UiTranslate } from "../../i18n";
 import { slugify } from "../../widgets";
 import { fieldWidgetId, type FieldDescriptor } from "../page";
 import {
   diffLines,
   lineDiffConfig,
+  meaningfulLineInputs,
   recordLinesToRows,
   sameObservedLines,
   type LineDiff,
@@ -135,6 +137,15 @@ export function useFormViewSave({
   const mounted = React.useRef(true);
   React.useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const submittingRef = React.useRef(false);
+  // The computed-default law (field.resolve): a field the user edited this
+  // session is never overwritten by a resolver's returned defaults. Cleared
+  // when the form retargets (resource/id change) and on an explicit discard.
+  const userEditedFieldsRef = React.useRef<Set<string>>(new Set());
+  const fieldResolveTokensRef = React.useRef<Map<string, number>>(new Map());
+  React.useEffect(() => {
+    userEditedFieldsRef.current = new Set();
+    fieldResolveTokensRef.current = new Map();
+  }, [resource, id]);
   const requiredFieldNames = React.useMemo<ReadonlySet<string>>(() => {
     if (!isCreate) return new Set();
     const required = new Set(modelMetadata?.rootFields?.requiredCreateFields ?? []);
@@ -196,16 +207,21 @@ export function useFormViewSave({
     [linesResource],
   );
   const linesField = linesResource?.field ?? null;
+  const submitOwner = submit ?? (isCreate ? createSubmit : undefined);
   const saveOperation = useSaveOperation(dataResource);
   const resourceSave = useAngeeResourceSave(saveOperation.target, {
     document: saveOperation.document,
   });
   const invalidate = useInvalidate();
+  // Lines edit on an existing record through the diff-apply `<resource>_save`
+  // (or a custom submit); on a create through the insert mutation's nested
+  // `lines: {data: [...]}` envelope (or the create submit owner).
   const linesActive =
-    !isCreate &&
     linesConfig !== null &&
     linesField !== null &&
-    (saveOperation.target !== null || Boolean(submit));
+    (isCreate
+      ? Boolean(dataResource?.roots.create) || Boolean(submitOwner)
+      : saveOperation.target !== null || Boolean(submit));
   const seedLineRows = React.useMemo(
     () =>
       linesActive && linesConfig && linesField
@@ -250,7 +266,7 @@ export function useFormViewSave({
       } : { values: formValues, errors: {} };
     },
   });
-  const { reset, resetDefaultValues, clearErrors, setError, setValue } = form;
+  const { reset, resetDefaultValues, clearErrors, setError, setValue, getValues } = form;
   const { dirtyFields } = form.formState;
   const syncRecordValues = React.useCallback((next: FormValues, lineBaseline?: unknown) => {
     // RHF merges dirty paths by index. A full-list line mutation is atomic, so
@@ -280,7 +296,6 @@ export function useFormViewSave({
   const saveError = form.formState.errors.root?.server?.message ?? null;
   const clearServerFieldError = React.useCallback((name: string) => clearErrors(name), [clearErrors]);
   const recordUnavailable = !isCreate && record == null;
-  const submitOwner = submit ?? (isCreate ? createSubmit : undefined);
   const customSubmit = useMutation({
     mutationFn: async ({ data, lines }: { data: FormValues; lines: LineDiff | null }) =>
       (await submitOwner?.(data, { resource, id: id ?? null, isCreate, record: displayRecord, lines })) ?? null,
@@ -318,8 +333,19 @@ export function useFormViewSave({
         if (saved) await invalidateResource();
         return saved;
       }
+      // Create-with-lines: ride the insert mutation's nested-insert envelope
+      // (`lines: {data: [...]}` on the insert input), so the parent and its
+      // children commit in the backend's one atomic create. Blank composer
+      // rows (only a position, no content) are dropped, not sent.
+      let createData = data;
+      if (isCreate && lines && linesField && linesConfig) {
+        const rows = meaningfulLineInputs(lines.payload, linesConfig);
+        if (rows.length > 0) {
+          createData = { ...data, [linesField]: { data: rows } };
+        }
+      }
       const response = isCreate
-        ? await create.mutateAsync({ values: data })
+        ? await create.mutateAsync({ values: createData })
         : await update.mutateAsync({ id: id as BaseKey, values: data });
       return response?.data ?? null;
     },
@@ -330,7 +356,8 @@ export function useFormViewSave({
       id,
       invalidateResource,
       isCreate,
-      resource,
+      linesConfig,
+      linesField,
       resourceSave,
       saveOperation.target,
       submitOwner,
@@ -485,9 +512,11 @@ export function useFormViewSave({
     if (record) { commitSavedRecord(patch, { refetchPartial: false }); clearErrors(); }
   }, [clearErrors, commitSavedRecord, record]);
 
+  const recordRef = useLatestRef(record);
   const afterFieldChange = React.useCallback(
     (field: FieldDescriptor, value: unknown): void => {
       clearErrors(field.name);
+      userEditedFieldsRef.current.add(field.name);
       if (isCreate || !field.createOnly) {
         const seeds = field.prefill?.(value);
         if (seeds) {
@@ -497,6 +526,37 @@ export function useFormViewSave({
               shouldTouch: true,
             });
           }
+        }
+        const resolve = field.resolve;
+        if (resolve) {
+          // Only the latest in-flight resolve for this field applies; a
+          // returned default lands only on fields the user has not edited
+          // this session, and never on the changed field itself.
+          const token = (fieldResolveTokensRef.current.get(field.name) ?? 0) + 1;
+          fieldResolveTokensRef.current.set(field.name, token);
+          void Promise.resolve(
+            resolve(value, {
+              values: getValues(),
+              record: recordRef.current,
+              isCreate,
+            }),
+          )
+            .then((defaults) => {
+              if (!defaults) return;
+              if (!mounted.current) return;
+              if (fieldResolveTokensRef.current.get(field.name) !== token) return;
+              for (const [name, seed] of Object.entries(defaults)) {
+                if (name === field.name) continue;
+                if (userEditedFieldsRef.current.has(name)) continue;
+                setValue(name, seed, {
+                  shouldDirty: true,
+                  shouldTouch: true,
+                });
+              }
+            })
+            .catch((error: unknown) => {
+              console.warn(`Field "${field.name}" resolve failed:`, error);
+            });
         }
       }
       if (fieldWidgetId(field) === "slug") {
@@ -514,7 +574,7 @@ export function useFormViewSave({
         });
       }
     },
-    [clearErrors, defaultSlugSource, formFields, isCreate, setValue],
+    [clearErrors, defaultSlugSource, formFields, getValues, isCreate, recordRef, setValue],
   );
   const fieldReadOnly = React.useCallback(
     (field: FieldDescriptor): boolean =>
@@ -524,6 +584,8 @@ export function useFormViewSave({
   const discardChanges = React.useCallback(() => {
     reset(isCreate ? undefined : values, { keepDirtyValues: false, keepDirty: false });
     formIsDirtyRef.current = false;
+    // Back to the clean baseline: nothing is a manual edit anymore.
+    userEditedFieldsRef.current = new Set();
   }, [isCreate, reset, values]);
 
   return {

@@ -15,6 +15,7 @@ import type { ColumnDescriptor, ColumnProps } from "./Column";
 import type { FacetDescriptor, FacetProps } from "./Facet";
 import type { FieldDescriptor, FieldProps } from "./Field";
 import type { GroupDescriptor, GroupProps } from "./Group";
+import type { LinesDescriptor, LinesProps } from "./Lines";
 import type { TabDescriptor, TabProps } from "./Tab";
 import { pageChildren, pageChildrenCacheKey, pageElementProps } from "./types";
 
@@ -23,6 +24,8 @@ export {
   Column,
   columnTone,
   type ColumnAggregate,
+  type LineCellResolve,
+  type LineCellResolveContext,
   type PageColumnAlign,
 } from "./Column";
 export { Facet } from "./Facet";
@@ -30,9 +33,12 @@ export {
   Field,
   fieldWidgetId,
   isRelationIdField,
+  type FieldResolve,
+  type FieldResolveContext,
   type PageFieldKind,
 } from "./Field";
 export { Group } from "./Group";
+export { Lines } from "./Lines";
 export { Tab } from "./Tab";
 export {
   PAGE_ELEMENT_SLOT,
@@ -60,6 +66,8 @@ export type {
   FieldProps,
   GroupDescriptor,
   GroupProps,
+  LinesDescriptor,
+  LinesProps,
   TabDescriptor,
   TabProps,
 };
@@ -135,6 +143,32 @@ export function parsePageActions(children: ReactNode): ActionDescriptor[] {
   });
 }
 
+/**
+ * Parse a form's single `Lines` declaration, or `null` when none is declared
+ * (the composer then renders every metadata column in metadata order). More
+ * than one `Lines` child fails fast — a form has one editable-lines section.
+ */
+export function parsePageLines(children: ReactNode): LinesDescriptor | null {
+  const declarations = pageChildren(children).flatMap((child) => {
+    const props = pageElementProps<LinesProps>(child, "lines");
+    return props ? [props] : [];
+  });
+  const [declaration, ...extra] = declarations;
+  if (declaration === undefined) return null;
+  if (extra.length > 0) {
+    throw new Error("Form accepts at most one Lines declaration.");
+  }
+  return linesDescriptor(declaration);
+}
+
+function linesDescriptor(props: LinesProps): LinesDescriptor {
+  return cachedDescriptor(linesDescriptorCache, props, () => ({
+    ...(props.label !== undefined ? { label: props.label } : {}),
+    ...(props.footer !== undefined ? { footer: props.footer } : {}),
+    columns: parsePageColumns(props.children),
+  }));
+}
+
 export function parsePageTabs(children: ReactNode): TabDescriptor[] {
   return cachedChildDescriptors(tabListCache, children, () => {
     const tabs = pageChildren(children).flatMap((child) => {
@@ -179,6 +213,9 @@ function columnDescriptor<TRow extends object = Record<string, unknown>>(
     ...(props.align !== undefined ? { align: props.align } : {}),
     ...(props.render !== undefined ? { render: props.render } : {}),
     ...(props.tone !== undefined ? { tone: props.tone } : {}),
+    ...(props.width !== undefined ? { width: props.width } : {}),
+    ...(props.readOnly !== undefined ? { readOnly: props.readOnly } : {}),
+    ...(props.resolve !== undefined ? { resolve: props.resolve } : {}),
   }));
 }
 
@@ -342,6 +379,7 @@ export function mergePageFacets(
 }
 
 const columnDescriptorCache = new WeakMap<object, unknown>();
+const linesDescriptorCache = new WeakMap<object, unknown>();
 const facetDescriptorCache = new WeakMap<object, unknown>();
 const fieldDescriptorCache = new WeakMap<object, unknown>();
 const groupDescriptorCache = new WeakMap<object, unknown>();

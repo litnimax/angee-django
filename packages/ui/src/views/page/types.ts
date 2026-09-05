@@ -11,6 +11,7 @@ export type PageElementKind =
   | "field"
   | "group"
   | "action"
+  | "lines"
   | "list"
   | "form"
   | "metric"

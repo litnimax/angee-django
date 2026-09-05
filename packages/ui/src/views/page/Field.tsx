@@ -13,6 +13,28 @@ export type PageFieldKind =
   | "selection"
   | (string & {});
 
+/** The live form facts a `Field.resolve` hook reads besides the changed value. */
+export interface FieldResolveContext {
+  /** The form's current values at the moment of the change. */
+  values: Record<string, unknown>;
+  /** The loaded record on an edit form; `null` while creating. */
+  record: Row | null;
+  isCreate: boolean;
+}
+
+/**
+ * An async sibling-defaults hook: given the changed value, return a
+ * `{fieldName: value}` map of defaults to seed. See `FieldProps.resolve`.
+ */
+export type FieldResolve = (
+  value: unknown,
+  context: FieldResolveContext,
+) =>
+  | Record<string, unknown>
+  | null
+  | undefined
+  | Promise<Record<string, unknown> | null | undefined>;
+
 export interface FieldProps {
   name: string;
   label?: ReactNode;
@@ -50,6 +72,16 @@ export interface FieldProps {
    */
   prefill?: (value: unknown) => Record<string, unknown> | null | undefined;
   /**
+   * Seed sibling fields when this field's value changes, resolving the defaults
+   * asynchronously (a server lookup: the partner's payment term, a product's
+   * price). Unlike `prefill` (a sync preset that overwrites), `resolve` follows
+   * the computed-default law: a returned entry is applied only to fields the
+   * user has **not** manually edited this session, so a recompute never
+   * clobbers explicit input. Entries for the changed field itself are ignored.
+   * Only the latest in-flight resolve per field applies (stale results drop).
+   */
+  resolve?: FieldResolve;
+  /**
    * For a `widget="slug"` field: the form field this slug auto-derives from while
    * creating (lowercased + hyphenated), until the user edits the slug. Defaults to
    * the record's `title` field. The derive runs in the form, not the backend.
@@ -78,6 +110,8 @@ export interface FieldDescriptor {
   showWhen?: (values: Row) => boolean;
   /** Load the chosen preset onto sibling fields when this field changes (see `FieldProps.prefill`). */
   prefill?: (value: unknown) => Record<string, unknown> | null | undefined;
+  /** Async sibling defaults on change, skipping user-edited fields (see `FieldProps.resolve`). */
+  resolve?: FieldResolve;
   /** Source field a `widget="slug"` field derives from on create (see `FieldProps.slugFrom`). */
   slugFrom?: string;
   title?: boolean;

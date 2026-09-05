@@ -2743,6 +2743,134 @@ describe("FormView", () => {
   });
 });
 
+describe("FormView — create with lines (F6)", () => {
+  afterEach(cleanup);
+  beforeEach(() => {
+    sdkMocks.record = null;
+    sdkMocks.mutate.mockReset();
+    sdkMocks.save.mockReset();
+    sdkMocks.mutate.mockImplementation(async ({ data }: { data: Row }) => ({
+      id: "doc-new",
+      ...data,
+    }));
+  });
+
+  test("creates through the insert mutation with the nested lines envelope", async () => {
+    renderSaleDocCreate();
+
+    // The composer renders on a create form; fill the parent and one line.
+    fireEvent.change(screen.getByLabelText("Title"), {
+      target: { value: "Order" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add line" }));
+    // Textboxes: [0] the header title input, [1] the row's label cell (the
+    // number cells parse their input, so only the String cell takes text).
+    const label = screen.getAllByRole("textbox")[1]!;
+    fireEvent.change(label, { target: { value: "Widget" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(sdkMocks.mutate).toHaveBeenCalledTimes(1));
+    expect(sdkMocks.mutate).toHaveBeenCalledWith({
+      data: {
+        title: "Order",
+        lines: { data: [{ label: "Widget", position: 0 }] },
+      },
+    });
+    // The diff-apply save mutation is an update-only path.
+    expect(sdkMocks.save).not.toHaveBeenCalled();
+  });
+
+  test("drops blank composer rows and omits the envelope when none remain", async () => {
+    renderSaleDocCreate();
+
+    fireEvent.change(screen.getByLabelText("Title"), {
+      target: { value: "Order" },
+    });
+    // An added-but-never-filled row must not create an empty child.
+    fireEvent.click(screen.getByRole("button", { name: "Add line" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(sdkMocks.mutate).toHaveBeenCalledTimes(1));
+    expect(sdkMocks.mutate).toHaveBeenCalledWith({
+      data: { title: "Order" },
+    });
+  });
+});
+
+describe("FormView — field resolve", () => {
+  afterEach(cleanup);
+  beforeEach(() => {
+    sdkMocks.record = null;
+    sdkMocks.mutate.mockReset();
+  });
+
+  const resolveFields = [
+    { name: "title", label: "Title", title: true },
+    {
+      name: "summary",
+      label: "Summary",
+      resolve: async (value: unknown) => ({
+        details: `${String(value)}-detail`,
+        summary: "never-applied",
+      }),
+    },
+    { name: "details", label: "Details" },
+  ] satisfies readonly FormField[];
+
+  test("seeds sibling fields asynchronously, never the changed field itself", async () => {
+    renderWithProviders(
+      <FormView resource="notes.Note" id={null} fields={resolveFields} />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Summary"), {
+      target: { value: "abc" },
+    });
+
+    await waitFor(() => {
+      expect(
+        (screen.getByLabelText("Details") as HTMLInputElement).value,
+      ).toBe("abc-detail");
+    });
+    expect(
+      (screen.getByLabelText("Summary") as HTMLInputElement).value,
+    ).toBe("abc");
+  });
+
+  test("never overwrites a field the user edited this session", async () => {
+    renderWithProviders(
+      <FormView resource="notes.Note" id={null} fields={resolveFields} />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Details"), {
+      target: { value: "manual" },
+    });
+    fireEvent.change(screen.getByLabelText("Summary"), {
+      target: { value: "abc" },
+    });
+
+    await act(async () => {
+      await nextTask();
+    });
+    expect(
+      (screen.getByLabelText("Details") as HTMLInputElement).value,
+    ).toBe("manual");
+  });
+});
+
+function renderSaleDocCreate(): void {
+  renderWithProviders(
+    <FormView
+      resource="demo.SaleDoc"
+      id={null}
+      fields={[{ name: "title", label: "Title", title: true }]}
+    />,
+    SALES_CREATE_METADATA,
+    undefined,
+    undefined,
+    SALES_DOCUMENTS,
+  );
+}
+
 function saleDocRecord(): Row {
   return {
     id: "doc-1",
@@ -2836,6 +2964,23 @@ const SALES_METADATA: SchemaFieldMetadata = {
     },
   },
 };
+
+const SALES_CREATE_METADATA: SchemaFieldMetadata = (() => {
+  const base = SALES_METADATA.types.SaleDocType!;
+  return {
+    types: {
+      SaleDocType: {
+        ...base,
+        rootFields: { ...base.rootFields, create: "insert_sale_docs_one" },
+        resource: {
+          ...base.resource!,
+          roots: { ...base.resource!.roots, create: "insert_sale_docs_one" },
+          capabilities: [...(base.resource!.capabilities ?? []), "create"],
+        },
+      },
+    },
+  };
+})();
 
 const SALES_DOCUMENTS = {
   console: { saves: { "demo.SaleDoc": { kind: "Document", definitions: [] } } },

@@ -18,10 +18,12 @@ import {
   parsePageActions,
   parsePageFields,
   parsePageGroups,
+  parsePageLines,
   parsePageTabs,
   type ActionDescriptor,
   type FieldDescriptor,
   type GroupDescriptor,
+  type LinesDescriptor,
   type TabDescriptor,
 } from "../page";
 import {
@@ -121,6 +123,8 @@ export interface FormViewSurface
   titleFieldMessages: readonly string[];
   statusField: FieldDescriptor | undefined;
   bodyField: FieldDescriptor | undefined;
+  /** The form's parsed `Lines` declaration (column overrides, footer), if any. */
+  linesDeclaration: LinesDescriptor | null;
   sections: readonly FormSectionModel[];
   subtitleParts: readonly React.ReactNode[];
   lineRowErrors: readonly (ValidationErrors | undefined)[] | undefined;
@@ -168,6 +172,7 @@ export function useFormViewSurface({
   const childFields = React.useMemo(() => parsePageFields(children), [children]);
   const childGroups = React.useMemo(() => parsePageGroups(children), [children]);
   const childActions = React.useMemo(() => parsePageActions(children), [children]);
+  const linesDeclaration = React.useMemo(() => parsePageLines(children), [children]);
   const modelMetadata = useModelMetadata(resource);
   const schemaMetadata = useSchemaFieldMetadata();
   const dataResource = modelMetadata?.resource ?? null;
@@ -354,7 +359,9 @@ export function useFormViewSurface({
         modelMetadata?.fields[field.name],
       );
     }
-    const lines = isCreate ? null : modelMetadata?.resource?.linesResource;
+    // Selected on create too: the insert mutation returns the nested-inserted
+    // lines, so the saved record reseeds the composer without a refetch.
+    const lines = modelMetadata?.resource?.linesResource;
     if (lines?.field) {
       for (const path of lineReadSelectionPaths(lines, schemaMetadata)) {
         paths.add(`${lines.field}.${path}`);
@@ -370,7 +377,7 @@ export function useFormViewSurface({
       if (path) paths.add(path);
     }
     return [...paths];
-  }, [formFields, isCreate, modelMetadata, relationByField, returning, schemaMetadata]);
+  }, [formFields, modelMetadata, relationByField, returning, schemaMetadata]);
   const refineFields = React.useMemo(
     () => refineFieldsFromPaths(selection),
     [selection],
@@ -503,6 +510,7 @@ export function useFormViewSurface({
     titleFieldMessages,
     statusField,
     bodyField,
+    linesDeclaration,
     sections,
     subtitleParts,
     lineRowErrors,
