@@ -115,6 +115,40 @@ export function useAuthoredQueryBatch<TDocument extends AuthoredDocument>(
   return new Map(scopes.map((scope, index) => [scope.key, results[index]!]));
 }
 
+/** The imperative authored read `useAuthoredFetch` returns. */
+export type AuthoredFetch = <TDocument extends AuthoredDocument>(
+  document: TDocument,
+  variables?: AuthoredVariables<TDocument>,
+  options?: AuthoredOperationOptions,
+) => Promise<DocumentData<TDocument>>;
+
+/**
+ * Imperative authored read for callback contexts — a form's `resolve` hook, an
+ * action handler — where a reactive `useAuthoredQuery` cannot run. Rides the
+ * query cache (`fetchQuery`), so repeated identical lookups within the cache's
+ * freshness window resolve without another round trip.
+ */
+export function useAuthoredFetch(): AuthoredFetch {
+  const activeProvider = useActiveDataProviderName();
+  const dataProvider = useDataProvider();
+  const client = useQueryClient();
+  return useCallback(
+    (document, variables, options = {}) => {
+      const provider = options.dataProviderName ?? activeProvider ?? "default";
+      const configured = authoredQueryOptions(
+        client,
+        dataProvider,
+        provider,
+        document,
+        variables,
+        [],
+      );
+      return client.fetchQuery(configured) as ReturnType<AuthoredFetch>;
+    },
+    [activeProvider, client, dataProvider],
+  ) as AuthoredFetch;
+}
+
 /** Invalidate every authored read registered against any supplied model. */
 export function useInvalidateAuthoredModels(): (
   modelLabels: readonly string[],
