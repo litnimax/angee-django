@@ -64,6 +64,8 @@ export interface EditableLinesProps {
   name: string;
   /** The resource's editable-lines contract (`modelMetadata.resource.linesResource`). */
   lines: DataResourceLinesMetadata;
+  /** Owning document, passed to domain widgets without interpreting its fields. */
+  parentRow?: Row | null;
   readOnly?: boolean;
   /**
    * Footer content (e.g. document totals) the composing form supplies. Receives the
@@ -103,6 +105,7 @@ export function EditableLines({
   control,
   name,
   lines,
+  parentRow,
   readOnly,
   footer,
   rowErrors,
@@ -176,6 +179,8 @@ export function EditableLines({
                   name={name}
                   control={control}
                   columns={columns}
+                  row={rows[index]}
+                  parentRow={parentRow}
                   gridStyle={gridStyle}
                   readOnly={readOnly}
                   rowError={rowErrors?.[index]}
@@ -216,6 +221,8 @@ function LineRow({
   name,
   control,
   columns,
+  row,
+  parentRow,
   gridStyle,
   readOnly,
   rowError,
@@ -228,6 +235,8 @@ function LineRow({
   name: string;
   control: Control<Record<string, unknown>>;
   columns: readonly LineColumn[];
+  row?: Row;
+  parentRow?: Row | null;
   gridStyle: React.CSSProperties;
   readOnly?: boolean;
   rowError?: ValidationErrors;
@@ -288,6 +297,8 @@ function LineRow({
               ) : (
                 <FieldDescriptorControl
                   field={column.descriptor}
+                  row={row}
+                  parentRow={parentRow}
                   value={controller.value}
                   readOnly={readOnly}
                   onChange={controller.onChange}

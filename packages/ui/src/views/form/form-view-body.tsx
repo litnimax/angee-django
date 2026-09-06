@@ -259,6 +259,7 @@ export function FormViewOverview({
             control={form.control}
             name={linesField}
             lines={linesResource}
+            parentRow={surface.displayRecord}
             readOnly={formReadOnly}
             rowErrors={lineRowErrors}
           />

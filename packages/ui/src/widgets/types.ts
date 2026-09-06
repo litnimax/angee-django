@@ -108,6 +108,8 @@ export interface WidgetControlProps {
 export interface WidgetRenderProps<TValue = unknown, TRow = unknown> {
   value?: TValue | null;
   row?: TRow;
+  /** Owning document for a widget rendered inside editable child lines. */
+  parentRow?: unknown;
   field?: WidgetField;
   /** Validation messages scoped to this widget's descriptor field. */
   messages?: readonly string[];

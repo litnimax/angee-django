@@ -7,6 +7,14 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
+from django.db import models
+from strawberry.types import get_object_definition
+from strawberry.types.base import StrawberryList, StrawberryOptional
+from strawberry.types.enum import StrawberryEnumDefinition
+from strawberry.types.lazy_type import LazyType
+from strawberry_django_hasura import SnakeNameConverter
+
 from angee.base.impl import ImplClassField
 from angee.data import metadata as data_contract
 from angee.data.field_classification import (
@@ -16,23 +24,13 @@ from angee.data.field_classification import (
     RESOURCE_FIELD_SCALARS as _RESOURCE_FIELD_SCALARS,
 )
 from angee.data.field_classification import (
-    RESOURCE_FIELD_WIDGETS as _RESOURCE_FIELD_WIDGETS,
-)
-from angee.data.field_classification import (
     is_archive_field,
+    is_resource_field_widget,
     model_field_scalar,
     money_currency_field,
     resource_field_kind,
     resource_field_widget,
 )
-from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
-from django.db import models
-from strawberry.types import get_object_definition
-from strawberry.types.base import StrawberryList, StrawberryOptional
-from strawberry.types.enum import StrawberryEnumDefinition
-from strawberry.types.lazy_type import LazyType
-from strawberry_django_hasura import SnakeNameConverter
-
 from angee.graphql.introspection import surface_field_names, surface_name
 
 _FILTER_CONTROL_FIELDS = frozenset({"AND", "OR", "NOT", "DISTINCT", "and", "or", "not", "distinct"})
@@ -335,7 +333,7 @@ def _validate_resource_field(model_label: str, field: data_contract.DataResource
         raise ImproperlyConfigured(
             f"resource metadata for {model_label} field '{field.name}' declares unsupported scalar '{field.scalar}'."
         )
-    if field.widget is not None and field.widget not in _RESOURCE_FIELD_WIDGETS:
+    if field.widget is not None and not is_resource_field_widget(field.widget):
         raise ImproperlyConfigured(
             f"resource metadata for {model_label} field '{field.name}' declares unsupported widget '{field.widget}'."
         )

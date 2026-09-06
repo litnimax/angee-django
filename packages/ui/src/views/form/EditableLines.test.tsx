@@ -6,10 +6,10 @@ import type { DataResourceLinesMetadata } from "@angee/metadata";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { AppRuntimeProvider } from "../../runtime";
-import { defaultWidgets } from "../../widgets";
+import { defaultWidgets, type WidgetRenderProps } from "../../widgets";
 import { EditableLines } from "./EditableLines";
 
-const LINES: DataResourceLinesMetadata = {
+const LINES = {
   field: "lines",
   modelLabel: "demo.Line",
   positionField: "position",
@@ -54,11 +54,13 @@ const LINES: DataResourceLinesMetadata = {
       requiredOnCreate: false,
     },
   ],
-};
+} satisfies DataResourceLinesMetadata;
 
 function Host({
   footer,
+  inspectContext = false,
 }: {
+  inspectContext?: boolean;
   footer?: (rows: readonly Record<string, unknown>[]) => React.ReactNode;
 }): React.ReactElement {
   const form = useForm<Record<string, unknown>>({
@@ -69,9 +71,30 @@ function Host({
       ],
     },
   });
+  const contextWidget = {
+    read: ({ row, parentRow }: WidgetRenderProps) => (
+      <span>
+        {String((row as { label: string }).label)} / {String((parentRow as { company: string }).company)}
+      </span>
+    ),
+  };
+  const lines = inspectContext
+    ? {
+        ...LINES,
+        fields: LINES.fields.map((field) =>
+          field.name === "label" ? { ...field, widget: "demo.lines.context" } : field,
+        ),
+      }
+    : LINES;
   return (
-    <AppRuntimeProvider runtime={{ widgets: defaultWidgets }}>
-      <EditableLines control={form.control} name="lines" lines={LINES} footer={footer} />
+    <AppRuntimeProvider runtime={{ widgets: { ...defaultWidgets, "demo.lines.context": contextWidget } }}>
+      <EditableLines
+        control={form.control}
+        name="lines"
+        lines={lines}
+        parentRow={{ company: "Acme" }}
+        footer={footer}
+      />
     </AppRuntimeProvider>
   );
 }
@@ -79,6 +102,11 @@ function Host({
 afterEach(cleanup);
 
 describe("EditableLines", () => {
+  test("passes the live child and owning document to a registered widget", () => {
+    render(<Host inspectContext />);
+    expect(screen.getByText("Widget / Acme")).toBeTruthy();
+    expect(screen.getByText("Gadget / Acme")).toBeTruthy();
+  });
   test("renders one editable cell row per seeded line, hiding the position column", () => {
     render(<Host />);
 
