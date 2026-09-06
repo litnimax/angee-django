@@ -215,3 +215,11 @@ Tax.posting_distributions требует для выбранной сторон�
 ARPEE commit **`a8d9b13`** (`fix(accounting): compute included taxes jointly and preserve rounded totals`). Финальный адресный accounting/sales/purchase/tax прогон после уточнения возвращаемых из save сумм — **104 passed, 18.675 с**. Предшествующий полный ARPEE прогон — 322 passed; полный набор после изменения только возврата amount-полей не повторялся. SQLite tax module — 14 passed. Ruff E/F/I, git diff --check и angee build --check проходят; миграций и изменений SDL нет. Backend/frontend отвечают HTTP 200; временный PostgreSQL остановлен.
 
 Налоги зафиксированы отдельным шагом согласно «one by one». PaymentTerm/график задолженности не изменялся и остается следующим пакетом. Рабочее дерево ARPEE после коммита чистое; журнал решений публикуется в тот же gist и сохраняется отдельным docs-коммитом Angee. Git push не выполнялся.
+
+## 021 — Partner в списке счетов (2026-09-06)
+
+По запросу пользователя в общий InvoiceWorkbench добавлена декларация Column для partner после номера документа. Используется существующий relation renderer и перевод col.partner. Колонка доступна в Customer Invoices и Vendor Bills, использующих один компонент. Backend, schema и миграции не изменялись.
+
+ARPEE commit **`6b1be0f`** (`feat(accounting): show partner in invoice lists`). Авторизованный browser smoke подтвердил заголовок Partner и заполненные названия контрагентов. Страницы invoices/payments/new payment открылись без page errors и HTTP>=400; git diff --check прошел. Для однострочной декларации новые тесты не добавлялись.
+
+Публикация этой записи в существующий gist отклонена автоматической проверкой разрешений: требуется подтверждение конкретного назначения и содержимого. Запись сохранена локально; gist пока не обновлен.
