@@ -105,6 +105,9 @@ function MoneyEdit({
       readOnly={readOnly}
       inputMode="decimal"
       aria-label={widgetLabel(field, "Amount")}
+      // The form's field chrome keeps borders transparent until hover, so an
+      // empty amount needs a placeholder to be visible at all.
+      placeholder="0.00"
       className="tabular-nums"
       onChange={(event) => onChange?.(event.currentTarget.value)}
     />
