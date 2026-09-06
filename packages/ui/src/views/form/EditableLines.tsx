@@ -138,79 +138,88 @@ export function EditableLines({
     if (from >= 0 && to >= 0) move(from, to);
   };
 
-  const gridStyle = { gridTemplateColumns: gridTemplate(columns.length) };
+  // Header and rows reserve identical drag/action tracks. Minimum cell widths
+  // belong to the grid; a narrow form scrolls this region rather than overlapping
+  // neighboring controls. M2M chips get enough space for their selection summary.
+  const widths = columns.map((column) => column.relationMulti ? 160 : 128);
+  const gridStyle = {
+    gridTemplateColumns: `32px ${widths.map((width) => `minmax(${width}px, 1fr)`).join(" ")} 68px`,
+  };
+  const minWidth = widths.reduce((total, width) => total + width, 100 + 18 + 8 * (columns.length + 1));
 
   return (
-    <div className="grid gap-2">
-      {fields.length > 0 ? (
-        <div
-          className="grid items-center gap-2 px-2 text-xs font-medium uppercase tracking-wide text-fg-muted"
-          style={gridStyle}
-          aria-hidden
-        >
-          <span />
-          {columns.map((column) => (
-            <span key={column.field.name} className="truncate">
-              {column.header}
-            </span>
-          ))}
-          <span />
-        </div>
-      ) : null}
-
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        onDragEnd={onDragEnd}
-      >
-        <SortableContext
-          items={fields.map((row) => row.rhfKey)}
-          strategy={verticalListSortingStrategy}
-        >
-          <div className="grid gap-1">
-            {fields.length === 0 ? (
-              <p className="px-2 py-3 text-13 text-fg-muted">{t("lines.empty")}</p>
-            ) : (
-              fields.map((row, index) => (
-                <LineRow
-                  key={row.rhfKey}
-                  id={row.rhfKey}
-                  index={index}
-                  name={name}
-                  control={control}
-                  columns={columns}
-                  row={rows[index]}
-                  parentRow={parentRow}
-                  gridStyle={gridStyle}
-                  readOnly={readOnly}
-                  rowError={rowErrors?.[index]}
-                  t={t}
-                  onDuplicate={() =>
-                    insert(index + 1, duplicateLineRow(rows[index] ?? {}, config) as never)
-                  }
-                  onRemove={() => remove(index)}
-                />
-              ))
-            )}
-          </div>
-        </SortableContext>
-      </DndContext>
-
-      {footer ? <div>{footer(rows)}</div> : null}
-
-      {readOnly ? null : (
-        <div>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => append(emptyLineRow(fields.length, config) as never)}
+    <div className="min-w-0 overflow-x-auto">
+      <div className="grid gap-2" style={{ minWidth }}>
+        {fields.length > 0 ? (
+          <div
+            className="grid items-center gap-2 border border-transparent px-2 text-xs font-medium uppercase tracking-wide text-fg-muted"
+            style={gridStyle}
+            aria-hidden
           >
-            <Glyph name="plus" size={16} />
-            {t("lines.add")}
-          </Button>
-        </div>
-      )}
+            <span />
+            {columns.map((column) => (
+              <span key={column.field.name} className="truncate">
+                {column.header}
+              </span>
+            ))}
+            <span />
+          </div>
+        ) : null}
+
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={onDragEnd}
+        >
+          <SortableContext
+            items={fields.map((row) => row.rhfKey)}
+            strategy={verticalListSortingStrategy}
+          >
+            <div className="grid gap-1">
+              {fields.length === 0 ? (
+                <p className="px-2 py-3 text-13 text-fg-muted">{t("lines.empty")}</p>
+              ) : (
+                fields.map((row, index) => (
+                  <LineRow
+                    key={row.rhfKey}
+                    id={row.rhfKey}
+                    index={index}
+                    name={name}
+                    control={control}
+                    columns={columns}
+                    row={rows[index]}
+                    parentRow={parentRow}
+                    gridStyle={gridStyle}
+                    readOnly={readOnly}
+                    rowError={rowErrors?.[index]}
+                    t={t}
+                    onDuplicate={() =>
+                      insert(index + 1, duplicateLineRow(rows[index] ?? {}, config) as never)
+                    }
+                    onRemove={() => remove(index)}
+                  />
+                ))
+              )}
+            </div>
+          </SortableContext>
+        </DndContext>
+
+        {footer ? <div>{footer(rows)}</div> : null}
+
+        {readOnly ? null : (
+          <div>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => append(emptyLineRow(fields.length, config) as never)}
+            >
+              <Glyph name="plus" size={16} />
+              {t("lines.add")}
+            </Button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -373,10 +382,6 @@ function rowMessages(
   fieldName: string,
 ): readonly string[] {
   return rowError?.fieldErrors[fieldName] ?? [];
-}
-
-function gridTemplate(columnCount: number): string {
-  return `auto repeat(${columnCount}, minmax(0, 1fr)) auto`;
 }
 
 function sortableTransformStyle(
