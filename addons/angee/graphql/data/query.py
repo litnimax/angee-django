@@ -343,7 +343,15 @@ class ResourceQueryProjection:
                 source_field = require_field_for_path(self.model, axis.field if axis else name.replace(".", "__"))
             except FieldPathError:
                 pass  # A final computed/aliased scalar has no model field.
-        relation_field = is_to_one_relation(source_field) if source_field is not None else False
+        # A GenericForeignKey walks like a to-one relation but has no single
+        # related model (``related_model is None``); its node projection is an
+        # opaque object (e.g. a ``{model_label, record_id}`` reference), so it
+        # must not classify as a relation here.
+        relation_field = (
+            is_to_one_relation(source_field) and source_field.related_model is not None
+            if source_field is not None
+            else False
+        )
         kind = (
             display.kind
             if display
