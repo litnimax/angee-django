@@ -195,6 +195,12 @@ Rules that follow from the layering:
   library primitives (`strawberry-django`, `hasura_model_resource`, `changes`,
   aggregate builders) instead of reimplementing ORM, permission, or serialization
   behavior.
+- Declare computed GraphQL field dependencies with native Strawberry-Django
+  `only`, `select_related`, and `prefetch_related` hints. This includes inherited
+  `AngeeNode.display_name`: bind its existing resolver on the concrete type with
+  the fields its model's `__str__` actually reads. Test narrow selections at
+  multiple row counts; selecting the underlying field elsewhere can hide a
+  deferred-field N+1.
 - Model-backed `hasura_model_resource(...)` surfaces expose sqid public identity. Use
   `AngeeDataModel`/`SqidMixin` for concrete rows. For third-party Django models
   that Angee exposes but does not own, pass an explicit sqid public identity
@@ -204,6 +210,13 @@ Rules that follow from the layering:
   and call the owner. Command modules should not contain reusable business logic,
   import generated runtime models directly, or duplicate resource/composer/schema
   behavior.
+- Declare resource query intent once on the resource; finalize its capabilities
+  from the final composed schema and active execution backend. Relation identity
+  comes from the target resource's identity policy, never from a display label or
+  a consumer's guessed field name. Keep output values distinct from comparison
+  input domains, and group summaries distinct from optional drill capability.
+  Extend native lookup seams for database operators; never advertise an operator
+  that the exposed comparison input or executor cannot accept.
 - Vendor SDK clients are details. Keep SDK request/response quirks in the
   provider addon or backend class that owns that vendor, and map them into
   Angee-owned models/actions at the boundary. Do not let SDK field names become
@@ -613,17 +626,14 @@ Hard-won traps — the wise learn from others' mistakes (`docs/guidelines.md`).
   reason. Keep the gate on the shared `runtime_status` rather than a private
   health key: a private one is a further axis the generic verbs cannot clear, so
   it reintroduces the same latch on the generic path.
-- **A method on `Integration` cannot be overridden by an Integration child.**
-  The composer emits a child as `class Child(Integration, AbstractChild)`, so the
-  parent's *abstract source* precedes the child's own source in the MRO and
-  shadows it — `angee.integrate.models.Integration` wins over
-  `angee.messaging.models.Channel`. A seam a child must override therefore belongs
-  on a base that follows the child source (`Bridge` owns `start_live` /
-  `stop_live` / `_next_sync_at` for exactly this reason), never on `Integration`.
-  A parent verb that needs child behaviour has to compose instead: reach the
-  concrete row by the primary key it shares (`sync_integration` is the
-  precedent) — and note that walking `bridge_models` fans a query across every
-  installed bridge's table, so it is not free.
+- **Integration children use the ordinary emitted Django MRO.** The composer
+  emits donors, the child's abstract source, then its concrete parent, so child
+  behavior can override parent behavior and cooperative methods delegate with
+  `super()`. A verb starting from an `Integration` parent row must still resolve
+  the concrete child before dispatch because Django does not downcast multi-table
+  parent instances automatically (`sync_integration` is the precedent). Walking
+  `bridge_models` fans a query across every installed bridge table, so it is not
+  free.
 - **`hasura_model_resource` create `full_clean`s the input, so model + input defaults must agree.**
   The Hasura model-resource create path builds a dummy instance from the input and calls
   `full_clean()` before saving — two traps follow. (1) A `JSONField(default=dict)`
@@ -768,13 +778,13 @@ Hard-won traps — the wise learn from others' mistakes (`docs/guidelines.md`).
   inputs too: a child enum/choices column is a `String` on the line insert input
   (write the lowercase value), while the child node projects it as an enum (read
   UPPERCASE); an M2M child column is `[ID]` (public sqids in and out).
-- **F6 line-cell metadata is projected from the child node surface, not the bare
-  model** — `HasuraLines(node=…)`'s child fields reconstruct through
-  `resource_fields(node, model)` (the same classifier the parent uses), because the
-  node owns a choices column's wire enum values and an M2M's `kind:"list"` relation
-  target. A writable child column the node does not expose falls back to the model
-  reconstruction, which still cannot carry enum/list — so expose any enum/M2M line
-  cell on the child node.
+- **F6 line-cell metadata is projected from the final child node and nested
+  input surfaces.** `HasuraLines(node=…)` declares the child node owner; after
+  schema composition, its executable GraphQL types supply enum values,
+  relation/list targets, accepted inputs, and required inputs. Input-only fields
+  retain their Django relation and widget semantics with `readable=False`.
+  Expose enum and M2M line cells on the child node so their complete read shape is
+  present in the final schema.
 - **Intersect write-only fields out of the read/return selection** — a field
   absent from the SDL read type (e.g. `password`) makes the detail query invalid
   and the form loads blank if it is selected.
@@ -835,6 +845,34 @@ Hard-won traps — the wise learn from others' mistakes (`docs/guidelines.md`).
   `GraphQLSchemas` connects publishers from declared `changes` metadata after
   app population, so building a schema no longer mutates process-global signal
   state.
+- **Resource metadata is finalized from each named schema once.** A
+  `HasuraResource` remains the native owner of its generated roots, types, and
+  readable/writable field surfaces. Addon surfaces contribute that native
+  reference plus only explicit Angee policy that the composed schema cannot
+  recover, such as curated group axes, subtitle paths, editable lines, row
+  model, and change/revision capabilities. `GraphQLSchemas` builds the complete
+  Strawberry schema, projects one neutral `DataResourceMetadata` per model from
+  its graphql-core schema, and attaches that same tuple for `resources()`, MCP,
+  publishers, and serialized artifacts. Declare resource behavior through the
+  existing Hasura/Pydantic resource and authored-root helpers; do not construct
+  partial resource descriptions for later reconciliation.
+- **Migrate metadata snapshot and merge callers to the built schema owner.** Read
+  finalized descriptions through `GraphQLSchemas.resources(name)` or serialized
+  artifacts through `GraphQLSchemas.render_metadata()`. The former
+  `make_data_resource_metadata()`, `attach_data_resource_metadata()`, and
+  `data_resource_metadata()` surface-snapshot path was removed, along with
+  `merge_data_resources()`, `merge_resource_fields()`, and the `merge()` methods
+  on resource descriptions, roots, type names, and subtitles. The former
+  `resource_fields()`, `model_resource_fields()`, and
+  `require_resource_selection_path()` reconstruction helpers were also removed;
+  metadata projection and selection validation now use the composed schema
+  internally, so public callers should consume the finalized descriptions.
+- **A custom model value field registers its GraphQL wire type when its field
+  module imports.** Call `angee.graphql.field_types.register_field_type()` beside
+  the field declaration. `GraphQLConfig.ready()` may discover and build final
+  schemas before later app `ready()` callbacks run, so registration from a later
+  callback is unsupported and can leave Strawberry's exact-class `auto` lookup
+  unconfigured.
 - **Change events read through the row unless the model declares another read
   anchor.** A target-derived child or polymorphic edge may implement
   `change_read_resource()` and return the `ObjectRef` whose `read` permission
@@ -890,11 +928,15 @@ Hard-won traps — the wise learn from others' mistakes (`docs/guidelines.md`).
   `registry_setting`** — the key→path mapping (e.g. `ANGEE_STORAGE_BACKEND_CLASSES`)
   is supplied by the owning addon's `autoconfig`, so every settings module that
   installs the addon must carry a **non-empty** mapping, including a bare module
-  that skips the composer (`tests/settings.py` declares storage, integration,
-  VCS, inference, and OAuth provider registries explicitly). An empty
+  that skips the composer (`tests/settings.py` declares storage, VCS, inference,
+  and OAuth provider registries explicitly). An empty
   registry raises `ImproperlyConfigured` at import — give the addon a
   noop/null-object default so the set is never empty. The column stores the key
-  (`local`), never a dotted path.
+  (`local`), never a dotted path. The one bounded exception is a deconstructed
+  historical migration field: migrations intentionally omit `base_class`, so it
+  may reconstruct its declared default after the registry has been removed. This
+  exists only to replay and remove old columns; active model fields still require
+  a typed base and a non-empty registry.
 - **Implementation subclasses must replace every inherited semantic default that changes.**
   See `ImplBase.effective_defaults()` for the merge contract. An OpenAI-compatible
   backend that omits its own `name` and `vendor` silently creates an OpenAI provider row.

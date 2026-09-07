@@ -5,11 +5,13 @@ from __future__ import annotations
 import importlib.util
 
 import pytest
-from angee.base.impl import ImplBase, ImplChoice
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured, ValidationError
 from django.db import models
+from django.test import override_settings
+from pydantic import BaseModel, Field
 
-from tests.conftest import Integration, OAuthClient
+from angee.base.impl import ImplBase, ImplChoice, ImplClassField
+from tests.conftest import Integration, OAuthClient, VcsBridge
 
 
 class _BaseImpl(ImplBase):
@@ -46,6 +48,16 @@ class _ConfigRefined(_ConfigBase):
     defaults = {"authorize_params": {"port": 2, "tls": True}}
 
 
+class _ScalarConfig(BaseModel):
+    endpoint: str = Field(default="https://example.test", description="Service endpoint.")
+    retries: int
+
+
+class _TypedConfigImpl(ImplBase):
+    key = "typed"
+    config_model = _ScalarConfig
+
+
 def test_impl_owner_public_import_contract() -> None:
     """The impl mechanism has one public owner and no split legacy modules."""
 
@@ -64,17 +76,34 @@ def test_impl_owner_public_import_contract() -> None:
     assert ImplDefaultsMixin.__name__ == "ImplDefaultsMixin"
     assert callable(impl_registry)
     assert callable(resolve_impl_class)
-    legacy_modules = ("impl" "_types", "registry")
+    legacy_modules = ("impl_types", "registry")
     for legacy_module in legacy_modules:
         assert importlib.util.find_spec(f"angee.base.{legacy_module}") is None
+
+
+@override_settings(ANGEE_EMPTY_IMPLS={})
+def test_historical_impl_field_reconstructs_without_removed_registry() -> None:
+    """Serialized migration fields retain their stored default after their registry is removed."""
+
+    with pytest.raises(ImproperlyConfigured, match="registry .* is empty"):
+        ImplClassField(
+            base_class=ImplBase,
+            registry_setting="ANGEE_EMPTY_IMPLS",
+            default="none",
+        )
+
+    historical = ImplClassField(registry_setting="ANGEE_EMPTY_IMPLS", default="none")
+    _, _, args, kwargs = historical.deconstruct()
+    reconstructed = ImplClassField(*args, **kwargs)
+
+    assert reconstructed.base_class is None
+    assert reconstructed.get_default() == "none"
+    assert reconstructed.deconstruct()[3]["registry_setting"] == "ANGEE_EMPTY_IMPLS"
 
 
 def test_model_impl_field_is_the_public_declared_accessor() -> None:
     """Models expose their impl field through the declared public seam."""
 
-    from angee.base.impl import ImplClassField  # noqa: PLC0415
-
-    assert isinstance(Integration.impl_field("impl_class"), ImplClassField)
     with pytest.raises(FieldDoesNotExist, match="Integration.lifecycle is not an ImplClassField"):
         Integration.impl_field("lifecycle")
     assert not hasattr(Integration, "_impl_field")
@@ -114,17 +143,67 @@ def test_choice_metadata_falls_back_to_titlecased_key() -> None:
         icon="",
         category="demo",
         defaults=_RefinedImpl.effective_defaults(),
+        config_schema=None,
     )
+
+
+def test_config_patch_preserves_siblings_and_reports_changed_model_fields() -> None:
+    """Patches replace supplied keys, remove nulls, and leave the input object alone."""
+
+    original = {"endpoint": "https://example.test", "obsolete": True, "options": {"old": 1}}
+    bridge = VcsBridge(config=original)
+
+    assert bridge.apply_config_patch({"obsolete": None, "options": {"new": 2}}) == {"config"}
+    assert bridge.config == {"endpoint": "https://example.test", "options": {"new": 2}}
+    assert original == {"endpoint": "https://example.test", "obsolete": True, "options": {"old": 1}}
+    assert bridge.apply_config_patch({"obsolete": None, "options": {"new": 2}}) == set()
+    assert bridge.apply_config_patch({}) == set()
+
+
+def test_typed_config_projects_supported_scalars_and_validates_paths() -> None:
+    """The native declaration owns defaults, form metadata, and validation paths."""
+
+    assert _TypedConfigImpl.effective_defaults()["config"] == {"endpoint": "https://example.test"}
+    assert _TypedConfigImpl.config_form_spec() == {
+        "type": "object",
+        "properties": {
+            "endpoint": {
+                "type": "string",
+                "label": "Endpoint",
+                "description": "Service endpoint.",
+                "defaultValue": "https://example.test",
+            },
+            "retries": {"type": "integer", "label": "Retries"},
+        },
+        "required": ["retries"],
+    }
+
+    with pytest.raises(ValidationError, match="config.retries"):
+        _TypedConfigImpl.normalize_config({"endpoint": "https://example.test"})
+
+
+def test_typed_config_rejects_constraints_the_form_wire_cannot_express() -> None:
+    """A constraint cannot silently disappear from the projected form contract."""
+
+    class ConstrainedConfig(BaseModel):
+        token: str = Field(min_length=8)
+
+    class ConstrainedImpl(ImplBase):
+        config_model = ConstrainedConfig
+
+    with pytest.raises(ImproperlyConfigured, match="unsupported constraints"):
+        ConstrainedImpl.config_form_spec()
 
 
 def test_materialize_seeds_only_unprovided_fields() -> None:
     """Materialise fills fields the caller did not supply; a supplied field is kept."""
 
     client = OAuthClient(authorize_endpoint="https://kept/authorize")
-    _RefinedImpl.materialize(client, provided=frozenset({"authorize_endpoint"}))
+    changed = _RefinedImpl.materialize(client, provided=frozenset({"authorize_endpoint"}))
     assert client.authorize_endpoint == "https://kept/authorize"  # supplied → kept
     assert client.token_endpoint == "https://refined/token"  # unsupplied → seeded
     assert client.userinfo_endpoint == "https://refined/userinfo"  # unsupplied → seeded
+    assert changed == {"token_endpoint", "userinfo_endpoint"}
 
 
 def test_materialize_seeds_boolean_default_when_unprovided() -> None:
@@ -139,8 +218,9 @@ def test_materialize_keeps_explicit_value_equal_to_default() -> None:
     """A supplied value is never overwritten, even when it equals the model default."""
 
     client = OAuthClient(login_enabled=False)
-    _BoolImpl.materialize(client, provided=frozenset({"login_enabled"}))
+    changed = _BoolImpl.materialize(client, provided=frozenset({"login_enabled"}))
     assert client.login_enabled is False  # caller's explicit False survives the impl's True
+    assert changed == set()
 
 
 def test_materialize_deep_copies_mutable_defaults() -> None:

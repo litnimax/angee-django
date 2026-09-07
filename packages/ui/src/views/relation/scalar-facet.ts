@@ -7,6 +7,7 @@ import type {
   ResourceFacetOption,
   } from "@angee/refine";
 import {
+  ResourceQuery,
   type ModelFieldMetadata,
 } from "@angee/metadata";
 import type {
@@ -18,14 +19,10 @@ import type {
   ResourceToolbarFilterOption,
 } from "../../toolbars";
 import type { ResourceViewFilter, ResourceViewGroup } from "../resource/resource-view-model";
-import { facetRequestSpec } from "./facet-query";
 import { useUiT } from "../../i18n";
 import type { UiTranslate } from "../../i18n";
 import {
-  resourceViewGroupToAggregateDimension,
   groupLabel,
-  hasuraGroupDimension,
-  hasuraGroupOrderForDimensions,
 } from "../resource/resource-view-list-body";
 import { resourceFieldGroupLabel } from "../resource/model-metadata-defaults";
 import type { ColumnDescriptor } from "../page";
@@ -50,7 +47,6 @@ export interface ScalarFacetDeclaration {
   label: React.ReactNode;
   group: ResourceViewGroup;
   spec: FacetRequestSpec;
-  neutralizeFilterFields: readonly string[];
 }
 
 /** Build server-backed scalar choice facets from the model's resource metadata. */
@@ -68,14 +64,10 @@ export function useScalarFacets<TRow extends object>(
   const resource = metadata?.resource ?? null;
   const groupOperation = useGroupOperation(resource);
   const facetSpecs = React.useMemo(
-    () =>
-      facets.map((facet) =>
-        facetRequestSpec(
-          facet.spec,
-          activeFilter,
-          facet.neutralizeFilterFields,
-        )),
-    [activeFilter, facets],
+    () => resource ? facets.map((facet) => ({
+      ...facet.spec, ...ResourceQuery.from(resource).toFacet(facet.field, activeFilter),
+    })) : [],
+    [activeFilter, facets, resource],
   );
   const facetQuery = useAngeeFacets(groupOperation.target, {
     document: groupOperation.document,
@@ -138,7 +130,7 @@ function scalarFilterOption(
     id: `${facet.field}:${option.value}`,
     label,
     chipLabel: label,
-    filter: { [facet.field]: { exact: option.value } },
+    filter: ResourceQuery.from(metadata!).axis(facet.field).drill({ key: option.key })!,
   };
 }
 
@@ -149,7 +141,7 @@ function scalarFacetOptionLabel(
   emptyValueLabel: string,
   t: UiTranslate,
 ): React.ReactNode {
-  const value = option.key[facet.spec.valueKey ?? facet.field] ?? option.value;
+  const value = ResourceQuery.from(metadata!).axis(facet.field).bucketLabel({ key: option.key });
   return groupLabel(value, facet.group, metadata, emptyValueLabel, t);
 }
 
@@ -158,65 +150,21 @@ export function scalarFacetDeclarations<TRow extends object>(
   metadata: ModelMetadata | null,
 ): readonly ScalarFacetDeclaration[] {
   if (!metadata?.resource) return [];
-  const filterable = new Set(metadata.resource.filterFields);
-  const groupable = new Set(metadata.resource.groupByFields);
+  const query = ResourceQuery.from(metadata);
   const columnsByField = new Map(columns.map((column) => [column.field, column]));
   const facets: ScalarFacetDeclaration[] = [];
-  const seen = new Set<string>();
-
-  for (const alias of metadata.resource.groupAliases ?? []) {
-    if (!filterable.has(alias.aggregateField)) continue;
-    if (!groupable.has(alias.aggregateField)) continue;
-    const field = metadata.fields[alias.aggregateField];
-    if (!isCategoricalScalar(field, columnsByField.get(alias.field))) continue;
-    const group = {
-      field: alias.field,
-      aggregateField: alias.aggregateField,
-      aggregateKey: alias.aggregateKey,
-    };
-    addScalarFacet(facets, seen, metadata, alias.aggregateField, group, {
-      labelField: alias.field,
+  for (const [fieldName, field] of Object.entries(query.fields)) {
+    if (!field.filter || !query.axes[fieldName]?.server || !query.axes[fieldName]?.drill) continue;
+    if (!isCategoricalScalar(metadata.fields[fieldName], columnsByField.get(fieldName))) continue;
+    const group = { field: fieldName };
+    facets.push({
+      id: fieldName, field: fieldName,
+      label: resourceFieldGroupLabel(fieldName, metadata.fields[fieldName]), group,
+      spec: { id: fieldName, ...query.toFacet(fieldName), pageSize: SCALAR_FACET_OPTION_LIMIT },
     });
   }
 
-  for (const fieldName of metadata.resource.filterFields) {
-    if (!groupable.has(fieldName) || seen.has(fieldName)) continue;
-    const field = metadata.fields[fieldName];
-    if (!isCategoricalScalar(field, columnsByField.get(fieldName))) continue;
-    addScalarFacet(facets, seen, metadata, fieldName, { field: fieldName });
-  }
-
   return facets;
-}
-
-function addScalarFacet(
-  facets: ScalarFacetDeclaration[],
-  seen: Set<string>,
-  metadata: ModelMetadata,
-  fieldName: string,
-  group: ResourceViewGroup,
-  options: { labelField?: string } = {},
-): void {
-  const identity = resourceViewGroupToAggregateDimension(group, metadata);
-  const dimension = hasuraGroupDimension(identity);
-  const orderBy = hasuraGroupOrderForDimensions([dimension]);
-  const labelField = options.labelField ?? fieldName;
-  const label = resourceFieldGroupLabel(labelField, metadata.fields[labelField]);
-  seen.add(fieldName);
-  facets.push({
-    id: fieldName,
-    field: fieldName,
-    label,
-    group,
-    spec: {
-      id: fieldName,
-      dimensions: [dimension],
-      ...(orderBy ? { orderBy } : {}),
-      ...(dimension.key ? { valueKey: dimension.key } : {}),
-      pageSize: SCALAR_FACET_OPTION_LIMIT,
-    },
-    neutralizeFilterFields: [fieldName],
-  });
 }
 
 function isCategoricalScalar<TRow extends object>(

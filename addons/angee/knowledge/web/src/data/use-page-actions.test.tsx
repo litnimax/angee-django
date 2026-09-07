@@ -12,7 +12,7 @@ import { beforeEach,
 import {
   ModelMetadataProvider,
 } from "@angee/metadata";
-import { withTestResourceInventory } from "@angee/metadata/testing";
+import { withTestResourceInventory, testResourceQuery, testQueryField } from "@angee/metadata/testing";
 import { OperationDocumentsProvider } from "@angee/refine";
 import type {
   SchemaFieldMetadata,
@@ -174,22 +174,18 @@ describe("knowledge page actions", () => {
 const PAGE_METADATA: SchemaFieldMetadata = withTestResourceInventory({
   types: {
     PageType: {
-      typeName: "PageType",
       fields: {
         title: { name: "title", kind: "scalar", scalar: "String" },
       },
-      rootFields: {
-        list: "pages",
-        create: "createPage",
-        update: "updatePage",
-        delete: "deletePage",
-      },
       resource: {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "title": testQueryField("title", { scalar: "String", kind: "scalar", filter: null, sort: { field: "title" } }),
+                "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: {}, sort: { default: [] } }),
+
         schemaName: "console",
         modelLabel: "knowledge.Page",
         appLabel: "knowledge",
         modelName: "Page",
-        publicIdField: "id",
+
         roots: {
           list: "pages",
           create: "createPage",
@@ -203,11 +199,11 @@ const PAGE_METADATA: SchemaFieldMetadata = withTestResourceInventory({
           deletePayload: "PageDeletePreview",
         },
         capabilities: ["list", "create", "update", "delete"],
-        filterFields: [],
-        orderFields: ["title"],
+
+
         aggregateFields: [],
-        groupByFields: [],
-        relationAxes: [],
+
+
       },
     },
   },

@@ -1,5 +1,5 @@
-import { ANGEE_FILTER_LOOKUP_OPERATORS, clampPageSize, type AngeeFilterLookupOperator } from "@angee/refine";
-import { DEFAULT_PAGE_SIZE } from "../page-size";
+import { FILTER_OPERATORS, type FilterOperator } from "@angee/metadata";
+import { DEFAULT_PAGE_SIZE, normalisePageSize } from "../page-size";
 import type { ResourceViewInitialState } from "./filter";
 export const RESOURCE_VIEW_KINDS = ["list", "board", "calendar"] as const;
 
@@ -9,13 +9,6 @@ export type CalendarViewMode = (typeof CALENDAR_VIEW_MODES)[number];
 export const DEFAULT_CALENDAR_VIEW_MODE: CalendarViewMode = "month";
 /** The anchor date's serialized shape — a local `yyyy-MM-dd`. */
 export const CALENDAR_ANCHOR_FORMAT = "yyyy-MM-dd";
-export const RESOURCE_VIEW_GROUP_GRANULARITIES = [
-  "day",
-  "week",
-  "month",
-  "quarter",
-  "year",
-] as const;
 export const DEFAULT_RESOURCE_VIEW_PAGE_SIZE = DEFAULT_PAGE_SIZE;
 
 export type ResourceViewKind = (typeof RESOURCE_VIEW_KINDS)[number];
@@ -94,20 +87,14 @@ export function availableResourceViewKinds(
   });
 }
 
-export type ResourceViewGroupGranularity =
-  (typeof RESOURCE_VIEW_GROUP_GRANULARITIES)[number];
+export type ResourceViewGroupGranularity = string;
 export const RESOURCE_VIEW_SORT_DIRECTIONS = ["asc", "desc"] as const;
 export type ResourceViewSortDirection =
   (typeof RESOURCE_VIEW_SORT_DIRECTIONS)[number];
 export type ResourceViewOrderDirection = "ASC" | "DESC";
-export const RESOURCE_VIEW_LOOKUP_OPERATORS = ANGEE_FILTER_LOOKUP_OPERATORS;
-export type ResourceViewLookupOperator = AngeeFilterLookupOperator;
-export const RESOURCE_VIEW_RELATION_LOOKUP_OPERATORS = ["sqid", "pk"] as const;
-export type ResourceViewRelationLookupOperator =
-  (typeof RESOURCE_VIEW_RELATION_LOOKUP_OPERATORS)[number];
-export type ResourceViewFacetLookupOperator =
-  | ResourceViewLookupOperator
-  | ResourceViewRelationLookupOperator;
+export const RESOURCE_VIEW_LOOKUP_OPERATORS = FILTER_OPERATORS;
+export type ResourceViewLookupOperator = FilterOperator;
+export type ResourceViewFacetLookupOperator = FilterOperator;
 
 /** Whether a string is one of the supported lookup operators. */
 export function isLookupOperator(value: string): value is ResourceViewLookupOperator {
@@ -115,5 +102,5 @@ export function isLookupOperator(value: string): value is ResourceViewLookupOper
 }
 
 export function defaultResourceViewPageSize(initial: ResourceViewInitialState): number {
-  return clampPageSize(initial.pageSize ?? DEFAULT_RESOURCE_VIEW_PAGE_SIZE);
+  return normalisePageSize(initial.pageSize ?? DEFAULT_RESOURCE_VIEW_PAGE_SIZE);
 }

@@ -1,27 +1,26 @@
-import type { ModelFieldMetadata, ModelMetadata } from "./artifact";
+import {
+  relationModelLabelForField,
+  type DataResourceMetadata,
+  type ModelFieldMetadata,
+  type ModelMetadata,
+} from "./artifact";
+import type { QueryField } from "./query-schema";
 
-/**
- * A to-one relation the node projects as a bare `ID` scalar rather than a nested
- * object (`relationObject: false`): the wire carries the related row's public id
- * as a leaf, so a detail/form query selects it directly instead of emitting a
- * sub-selection the `ID` scalar would reject.
- */
-export function isScalarIdRelation(field: ModelFieldMetadata): boolean {
-  return field.kind === "scalar" && field.scalar === "ID" && Boolean(field.relationTarget);
+/** A to-one relation explicitly projected by the node as a scalar identity. */
+export function isScalarIdRelation(
+  field: ModelFieldMetadata,
+  model?: ModelMetadata | null,
+): boolean {
+  return field.kind === "relation" && field.relationObject === false
+    && relationModelLabelForField(field, model) !== undefined;
 }
 
-/**
- * Is this field a to-one relation, whichever way the node projects it?
- *
- * The projection is a wire detail — an object sub-selection or a bare `ID` leaf —
- * not a different kind of fact. Both shapes name the same related model, carry the
- * same relation filter, and group by the same identity axis, so anything reasoning
- * about *relation-ness* must ask this rather than test `kind === "relation"` and
- * silently drop every scalar-id relation.
- */
-export function isToOneRelationField(field: ModelFieldMetadata | undefined): boolean {
-  if (!field) return false;
-  return field.kind === "relation" || isScalarIdRelation(field);
+/** Final field metadata owns relation classification for both projection shapes. */
+export function isToOneRelationField(
+  field: ModelFieldMetadata | undefined,
+  _model?: ModelMetadata | null,
+): boolean {
+  return field?.kind === "relation";
 }
 
 const SCALAR_WIDGET: Readonly<Record<string, string>> = {
@@ -44,7 +43,7 @@ export type ResourceFilterFieldType =
 
 export interface ChoiceFacetSupport {
   fieldName: string;
-  field?: ModelFieldMetadata;
+  field?: Pick<QueryField, "kind" | "scalar">;
   hasOptions?: boolean;
   hasTone?: boolean;
   allowStatusFallback?: boolean;
@@ -70,7 +69,7 @@ export function defaultWidgetForModelField(
 
 export function filterFieldType(
   fieldName: string,
-  field: ModelFieldMetadata | undefined,
+  field: Pick<QueryField, "kind" | "scalar"> | undefined,
   support: Omit<ChoiceFacetSupport, "fieldName" | "field"> = {},
 ): ResourceFilterFieldType | null {
   if (field?.kind === "enum") return "selection";
@@ -95,9 +94,8 @@ export function fieldUpdatable(
   metadata: ModelMetadata | null | undefined,
   fieldName: string,
 ): boolean {
-  if (!metadata?.rootFields?.update && !metadata?.resource?.roots.update) return false;
-  const updateFields =
-    metadata.rootFields?.updateFields ?? metadata.resource?.updateFields;
+  if (!metadata?.resource.roots.update) return false;
+  const updateFields = metadata.resource.updateFields;
   if (updateFields && !updateFields.includes(fieldName)) return false;
   return metadata.fields[fieldName]?.updatable !== false;
 }
@@ -121,7 +119,7 @@ function looksLikeDateField(fieldName: string): boolean {
 
 /** Resolve date semantics from declared metadata, with a name fallback only when absent. */
 export function isDateField(
-  field: ModelFieldMetadata | undefined,
+  field: Pick<QueryField, "kind" | "scalar"> | undefined,
   fieldName: string,
 ): boolean {
   if (field) {
@@ -129,4 +127,12 @@ export function isDateField(
       (field.scalar === "DateTime" || field.scalar === "Date");
   }
   return looksLikeDateField(fieldName);
+}
+
+/** Resolve an authored display path through its declared query sort capability. */
+export function resourceOrderFieldForPath(
+  path: string,
+  resource: DataResourceMetadata | null | undefined,
+): string | null {
+  return resource ? resource.query.fields[path]?.sort?.field ?? null : path;
 }

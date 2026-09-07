@@ -4,17 +4,14 @@ This addon owns the integration layer end to end. The connection substrate — t
 ``OAuthClient`` registration, the user's ``ExternalAccount`` at a provider, and the
 per-user ``Credential`` material — authenticates everything above it. On top of
 that sit the third-party ``Vendor`` catalogue, the first-class ``Integration``
-an integration runs over, concrete child integration kinds such as ``VcsBridge``,
-addon-owned children such as ``agents.InferenceProvider``, the
-host-agnostic VCS inventory (``VcsBridge`` + ``Repository``/``Source``/
-``Template``), and outbound ``WebhookSubscription``.
+an integration runs over, addon-owned concrete child integration kinds, and
+outbound ``WebhookSubscription``.
 
 This addon is pure OAuth: it connects *out* to external systems and never
 authenticates a session. OIDC login fields and ID-token verification live one
 level up in ``iam_integrate_oidc``, which extends this OAuth base and composes the
-``iam`` user. Host-specific VCS backends live in their own addons
-(``integrate_github``) and are named per ``VcsBridge.backend_class`` row; this
-addon never imports them.
+``iam`` user. Concrete capabilities and their implementation selectors live in
+their owning addons; this addon never imports them.
 """
 
 from __future__ import annotations
@@ -23,6 +20,7 @@ import json
 import logging
 import secrets
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from functools import cache
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -33,8 +31,8 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core import checks
 from django.core.exceptions import ImproperlyConfigured, ValidationError
-from django.db import IntegrityError, connections, models, transaction
-from django.db.models import Q
+from django.db import connections, models, transaction
+from django.db.models import Prefetch, Q
 from django.utils import timezone
 from django.utils.module_loading import import_string
 from django.utils.text import capfirst
@@ -57,23 +55,22 @@ from angee.base.impl import ImplClassField, ImplDefaultsMixin
 from angee.base.mixins import AuditMixin, SqidMixin
 from angee.base.models import AngeeManager, AngeeModel, AngeeQuerySet
 from angee.base.transitions import StateTransitions, save_state, transition
-from angee.integrate import registry
 from angee.integrate.credentials import CredentialKind, handler_for
 from angee.integrate.events import EventKind
 from angee.integrate.impl import IntegrationImpl
+from angee.integrate.live import PairingProjection, PairingState, armed_material_key
 from angee.integrate.locks import bridge_is_locked
 from angee.integrate.net import validate_public_url
+from angee.integrate.oauth.client import OAuthClientProtocol
 from angee.integrate.oauth.discovery import discovery_document
 from angee.integrate.oauth.errors import OAuthFlowError
 from angee.integrate.oauth.providers import OAuthProviderType
 from angee.integrate.sync import bridge_progress_context, bridge_sync_context
-from angee.integrate.vcs.backend import VCSBackend
-from angee.integrate.vcs.templates import parse_template_meta
 from angee.integrate.webhooks import PinnedWebhookClient, WebhookDeliveryError
-from angee.jobs.locks import LockKey, record_lock_key, task_locks_are_cross_process
+from angee.jobs.locks import LockKey, record_lock_key, task_lock, task_locks_are_cross_process
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +78,25 @@ logger = logging.getLogger(__name__)
 # use it (e.g. provisioning) gets a token with life left rather than one about to lapse.
 _OAUTH_REFRESH_MARGIN = timedelta(minutes=5)
 _UNSET = object()
+_INTEGRATION_FAILURE_MESSAGE = "Integration operation failed."
+_WEBHOOK_FAILURE_MESSAGE = "Webhook delivery failed."
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrationFailure:
+    """An integration-owned, safe failure message for persisted telemetry."""
+
+    message: str
+
+
+def _safe_integration_failure(error: Exception) -> IntegrationFailure:
+    """Project one integration exception to bounded user-facing telemetry."""
+
+    if isinstance(error, OAuthFlowError):
+        return IntegrationFailure(error.public_message)
+    if isinstance(error, ValidationError):
+        return IntegrationFailure("Integration configuration is invalid.")
+    return IntegrationFailure(_INTEGRATION_FAILURE_MESSAGE)
 
 
 class AccountStatus(models.TextChoices):
@@ -775,6 +791,12 @@ class CredentialManager(AngeeManager.from_queryset(CredentialQuerySet)):  # type
         for guard in credential_disconnect_guards():
             guard(credential)
 
+    def prepare_disconnect(self, credential: Any) -> None:
+        """Validate a disconnect and schedule remote revocation after commit."""
+
+        self.check_disconnect(credential)
+        transaction.on_commit(credential.revoke_remote, robust=True)
+
     def live_oauth_for_user(self, user: Any, oauth_client: Any) -> Any | None:
         """Return this user's active, non-expired OAuth credential for one client."""
 
@@ -1001,6 +1023,17 @@ class Credential(SqidMixin, AuditMixin, AngeeModel):
 
     runtime = True
 
+    def revoke_remote(self) -> None:
+        """Revoke this credential's OAuth token when its provider supports it."""
+
+        oauth_client = self.oauth_client
+        if oauth_client is None or not getattr(oauth_client, "revoke_endpoint", ""):
+            return
+        token = str(self.reveal().get("access_token") or "")
+        if not token:
+            return
+        OAuthClientProtocol(oauth_client).revoke_token(token)
+
     sqid_prefix = "crd_"
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -1179,8 +1212,12 @@ class Credential(SqidMixin, AuditMixin, AngeeModel):
             return
         try:
             self._refresh_locked()
-        except OAuthFlowError, ValueError:
-            logger.warning("Credential %s refresh failed; using the existing token.", self.pk, exc_info=True)
+        except (OAuthFlowError, ValueError) as error:
+            logger.warning(
+                "Credential %s refresh failed (%s); using the existing token.",
+                self.pk,
+                type(error).__name__,
+            )
             self._record_refresh_failure()
 
     def refresh_now(self) -> None:
@@ -1343,80 +1380,62 @@ class IntegrationRuntimeStatus(models.TextChoices):
             raise ValueError(f"Unsupported integration runtime status: {raw}") from error
 
 
-class IntegrationManager(AngeeManager):
-    """Manager factories for invariants that span Integration and its impl row."""
+class IntegrationQuerySet(AngeeQuerySet[Any]):
+    """Chainable collection scopes for integration and bridge rows."""
 
-    def impl_class_for_key(self, key: str) -> type[IntegrationImpl]:
-        """Return the implementation class registered for ``key`` on this model."""
+    def due_for_enqueue(self, *, timestamp: datetime, stale_before: datetime) -> Any:
+        """Return bridge rows due for a new queue attempt or stale recovery."""
 
-        return cast(type[IntegrationImpl], self.model.resolve_impl_class("impl_class", key))
+        return self.filter(Q(next_sync_at__lte=timestamp) | Q(sync_stage="queued", updated_at__lte=stale_before))
 
-    def disconnected_for(self, user: Any, *, vendor: Any, impl_class: str) -> Any:
-        """Return the user's parent row for one disconnected integration."""
-
-        with system_context(reason="integrate.integration.disconnected"):
-            integration = (
-                self.filter(
-                    owner=user,
-                    vendor=vendor,
-                    impl_class=impl_class,
-                    kind=Integration.integration_kind_label,
-                )
-                .order_by("pk")
-                .first()
-            )
-            if integration is not None:
-                return integration
-            try:
-                with transaction.atomic():
-                    return self.create(
-                        owner=user,
-                        vendor=vendor,
-                        impl_class=impl_class,
-                        kind=Integration.integration_kind_label,
-                        lifecycle=IntegrationLifecycle.DISCONNECTED,
-                    )
-            except IntegrityError:
-                return self.get(
-                    owner=user,
-                    vendor=vendor,
-                    impl_class=impl_class,
-                    kind=Integration.integration_kind_label,
-                )
-
-    def connect_from_credential(
+    def live_account_owners(
         self,
-        user: Any,
+        bridge: Any,
+        impl_key: str,
+        external_id: str,
         *,
-        vendor: Any,
-        credential: Any,
-        impl_class: str = "none",
+        identity_key: str,
     ) -> Any:
-        """Attach ``credential`` to the user's parent row and connect it."""
+        """Return other rows retaining the same backend account claim."""
 
-        integration = self.disconnected_for(user, vendor=vendor, impl_class=impl_class)
-        with system_context(reason="integrate.integration.connect_from_credential"), transaction.atomic():
-            integration = self.locked_get(pk=integration.pk)
-            account = getattr(credential, "external_account", None)
-            if str(integration.lifecycle) == str(IntegrationLifecycle.CONNECTED):
-                integration.credential = credential
-                integration.account = account
-                integration.runtime_status = cast(IntegrationRuntimeStatus, IntegrationRuntimeStatus.OK)
-                integration.last_error = ""
-                integration.last_error_at = None
-                integration.save(
-                    update_fields=[
-                        "account",
-                        "credential",
-                        "last_error",
-                        "last_error_at",
-                        "runtime_status",
-                        "updated_at",
-                    ]
+        return (
+            self.filter(
+                **{
+                    bridge.live_impl_field: impl_key,
+                    f"subscription_state__{identity_key}": external_id,
+                    "lifecycle__in": (str(bridge.Lifecycle.CONNECTED), str(bridge.Lifecycle.PAUSED)),
+                }
+            )
+            .exclude(pk=bridge.pk)
+            .order_by("pk")
+        )
+
+    def with_concrete_children(self, *, actor: Any, exposed_model_labels: set[str]) -> Any:
+        """Prefetch installed and actor-readable concrete children in fixed queries."""
+
+        prefetches: list[Prefetch] = []
+        for child_model in _integration_child_models(cast(type[Integration], self.model)):
+            accessor = self.model.concrete_child_accessor(child_model)
+            prefetches.append(
+                Prefetch(
+                    accessor,
+                    queryset=child_model.objects.sudo(reason="integrate.integration.child_integrity"),
+                    to_attr=self.model.concrete_child_cache_attr(child_model, authorized=False),
                 )
-            else:
-                integration.connect(credential=credential, account=account)
-        return integration
+            )
+            if child_model._meta.label in exposed_model_labels:
+                prefetches.append(
+                    Prefetch(
+                        accessor,
+                        queryset=child_model.objects.with_actor(actor),
+                        to_attr=self.model.concrete_child_cache_attr(child_model, authorized=True),
+                    )
+                )
+        return self.prefetch_related(*prefetches)
+
+
+class IntegrationManager(AngeeManager.from_queryset(IntegrationQuerySet)):  # type: ignore[misc]
+    """Manager factories for invariants that span Integration and its impl row."""
 
     def sync_kinds(self) -> int:
         """Backfill parent rows with the concrete integration kind they materialize."""
@@ -1438,8 +1457,8 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
     The first-class "what we're connected to and what runs over it": it draws a
     ``credential`` (and optionally an ``account``) from the connection substrate to
     authenticate, points at a catalogue ``vendor``, and stores the implementation
-    key that owns integration-level behavior. Domain-specific state and config live
-    on concrete child models.
+    capability. Domain-specific behavior, state, and config live on concrete child
+    models.
     """
 
     runtime = True
@@ -1456,13 +1475,96 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
     display_name = models.CharField(max_length=255, blank=True, default="")
     kind = models.CharField(max_length=80, db_index=True, default=integration_kind_label)
     """Human integration type/kind label, denormalized for server-side grouping."""
+
+    @classmethod
+    def check(cls, **kwargs: Any) -> list[Any]:
+        """Reject concrete descendants whose native parent path cannot be routed."""
+
+        errors = super().check(**kwargs)
+        for child_model in _integration_child_models(cls):
+            if child_model._meta.parents.get(cls) is None:
+                errors.append(
+                    checks.Error(
+                        f"{child_model._meta.label} is an indirect Integration descendant.",
+                        hint="Declare routed integration capabilities as direct Integration MTI children.",
+                        obj=child_model,
+                        id="integrate.E004",
+                    )
+                )
+        return errors
+
+    @classmethod
+    def concrete_child_models(cls) -> tuple[type[Integration], ...]:
+        """Return installed concrete descendants in stable model-label order."""
+
+        return _integration_child_models(cls)
+
+    @classmethod
+    def concrete_child_accessor(cls, child_model: type[Integration]) -> str:
+        """Return the native reverse accessor for one direct concrete child."""
+
+        parent_link = child_model._meta.parents.get(cls)
+        if parent_link is None:
+            raise ImproperlyConfigured(
+                f"{child_model._meta.label} is an indirect Integration descendant; "
+                "concrete-target routing requires a direct capability owner."
+            )
+        return str(parent_link.remote_field.get_accessor_name())
+
+    @classmethod
+    def concrete_child_cache_attr(cls, child_model: type[Integration], *, authorized: bool) -> str:
+        """Return the private per-query cache name for one concrete child type."""
+
+        scope = "authorized" if authorized else "integrity"
+        return f"_angee_integration_child_{scope}_{child_model._meta.app_label}_{child_model._meta.model_name}"
+
+    def _concrete_child(self, model: type[Integration], *, actor: Any, authorized: bool) -> Integration | None:
+        """Return one child from this row's collection cache or scoped storage."""
+
+        cache_name = type(self).concrete_child_cache_attr(model, authorized=authorized)
+        if hasattr(self, cache_name):
+            value = getattr(self, cache_name)
+            if isinstance(value, list | tuple):
+                return value[0] if value else None
+            return cast(Integration | None, value)
+        queryset = (
+            model.objects.with_actor(actor)
+            if authorized
+            else model.objects.sudo(reason="integrate.integration.child_integrity")
+        )
+        return cast(Integration | None, queryset.filter(pk=self.pk).first())
+
+    def concrete_children(
+        self, *, actor: Any, exposed_model_labels: set[str]
+    ) -> tuple[list[Integration], list[Integration]]:
+        """Return installed and actor-readable child rows without leaking denied siblings."""
+
+        integrity: list[Integration] = []
+        authorized: list[Integration] = []
+        for child_model in type(self).concrete_child_models():
+            child = self._concrete_child(child_model, actor=actor, authorized=False)
+            if child is None:
+                continue
+            integrity.append(child)
+            if child_model._meta.label in exposed_model_labels:
+                visible = self._concrete_child(child_model, actor=actor, authorized=True)
+                if visible is not None:
+                    authorized.append(visible)
+        return integrity, authorized
+
+    @property
+    def capability_impl(self) -> Any:
+        """Return the one implementation selected by a concrete capability child."""
+
+        fields = [field for field in self._meta.get_fields() if isinstance(field, ImplClassField)]
+        if len(fields) != 1:
+            raise ImproperlyConfigured(
+                f"{self._meta.label} must declare exactly one child implementation field; found {len(fields)}."
+            )
+        impl_class = fields[0].resolve_for(self)
+        return impl_class(self)
+
     vendor = models.ForeignKey("integrate.Vendor", on_delete=models.PROTECT, related_name="integrations")
-    impl_class = ImplClassField(
-        base_class=IntegrationImpl,
-        registry_setting="ANGEE_INTEGRATION_IMPLS",
-        default="none",
-    )
-    """Registry key for the implementation this integration runs."""
     # PROTECT: a present credential is the integration's authentication. It may
     # belong to a principal other than ``owner`` (an org/app-install credential), so
     # deleting a credential still in use is refused rather than silently breaking
@@ -1526,13 +1628,6 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
         ordering = ("-updated_at",)
         rebac_resource_type = "integrate/integration"
         rebac_id_attr = "sqid"
-        constraints = (
-            models.UniqueConstraint(
-                fields=("owner", "vendor", "impl_class"),
-                condition=Q(kind="Integration"),
-                name="uniq_integrate_parent_owner_vendor_impl",
-            ),
-        )
 
     def __str__(self) -> str:
         """Return a stable vendor-qualified integration label."""
@@ -1581,13 +1676,6 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
         label = str(getattr(vendor, "display_name", "") or getattr(vendor, "slug", "") or "integration")
         return f"{label} ({self.lifecycle})"
 
-    @property
-    def impl(self) -> IntegrationImpl:
-        """Return this row's integration-level implementation."""
-
-        impl_class = cast(type[IntegrationImpl], self.resolve_impl("impl_class"))
-        return impl_class(self)
-
     @transition(
         lifecycle,
         source=[IntegrationLifecycle.DISCONNECTED, IntegrationLifecycle.PAUSED],
@@ -1596,6 +1684,11 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
     )
     def connect(self, *, credential: Any = _UNSET, account: Any = _UNSET) -> None:
         """Mark this integration connected, optionally attaching connection rows."""
+
+        self._transition_fields = self._set_connection_fields(credential=credential, account=account)
+
+    def _set_connection_fields(self, *, credential: Any = _UNSET, account: Any = _UNSET) -> set[str]:
+        """Attach connection rows and reset health, returning the fields changed."""
 
         fields: set[str] = set()
         if credential is not _UNSET:
@@ -1608,7 +1701,32 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
         self.last_error = ""
         self.last_error_at = None
         fields.update({"last_error", "last_error_at", "runtime_status"})
-        self._transition_fields = fields
+        return fields
+
+    def attach_connection(
+        self,
+        credential: Any,
+        *,
+        account: Any = _UNSET,
+        connect_disconnected: bool = True,
+    ) -> None:
+        """Attach a credential and reset health while preserving paused rows."""
+
+        resolved_account = getattr(credential, "external_account", None) if account is _UNSET else account
+        if self.pk is None:
+            self._set_connection_fields(credential=credential, account=resolved_account)
+            if connect_disconnected and self.lifecycle == IntegrationLifecycle.DISCONNECTED:
+                self.lifecycle_transitions.force_state(
+                    self,
+                    IntegrationLifecycle.CONNECTED,
+                    reason="unsaved integration attach resolves initial lifecycle before insert",
+                )
+            return
+        if connect_disconnected and self.lifecycle == IntegrationLifecycle.DISCONNECTED:
+            self.connect(credential=credential, account=resolved_account)
+            return
+        fields = self._set_connection_fields(credential=credential, account=resolved_account)
+        self.save(update_fields=[*fields, "updated_at"])
 
     @transition(
         lifecycle,
@@ -1646,42 +1764,14 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
     def attach_credential(self, credential: Any) -> None:
         """Attach a live credential and connect this disconnected integration."""
 
-        account = getattr(credential, "external_account", None)
-        if self.pk is None:
-            self.credential = credential
-            self.account = account
-            self.runtime_status = cast(IntegrationRuntimeStatus, IntegrationRuntimeStatus.OK)
-            self.last_error = ""
-            self.last_error_at = None
-            if self.lifecycle == IntegrationLifecycle.DISCONNECTED:
-                self.lifecycle_transitions.force_state(
-                    self,
-                    IntegrationLifecycle.CONNECTED,
-                    reason="unsaved integration attach resolves initial lifecycle before insert",
-                )
-            return
-        if self.lifecycle == IntegrationLifecycle.DISCONNECTED:
-            with system_context(reason="integrate.integration.attach_credential"), transaction.atomic():
-                self.connect(credential=credential, account=account)
-            return
-        self.credential = credential
-        self.account = account
-        self.runtime_status = cast(IntegrationRuntimeStatus, IntegrationRuntimeStatus.OK)
-        self.last_error = ""
-        self.last_error_at = None
         with system_context(reason="integrate.integration.attach_credential"), transaction.atomic():
-            self.save(
-                update_fields=[
-                    "account",
-                    "credential",
-                    "last_error",
-                    "last_error_at",
-                    "runtime_status",
-                    "updated_at",
-                ]
-            )
+            self.attach_connection(credential)
 
-    def report_status(self, status: IntegrationRuntimeStatus | str, error: str = "") -> None:
+    def report_status(
+        self,
+        status: IntegrationRuntimeStatus | str,
+        error: str | IntegrationFailure = "",
+    ) -> None:
         """Record implementation status telemetry and persist this integration.
 
         ``status`` is a runtime status, resolved by member name (``ERROR`` — the
@@ -1698,7 +1788,9 @@ class Integration(SqidMixin, ImplDefaultsMixin, AuditMixin, AngeeModel):
         self.runtime_status = normalized
         self.last_used_at = reported_at
         self.last_used_status = raw_status or normalized.value
-        self.last_error = error
+        self.last_error = (
+            error.message if isinstance(error, IntegrationFailure) else (_INTEGRATION_FAILURE_MESSAGE if error else "")
+        )
         self.last_error_at = reported_at if error else None
 
         if self.pk is None:
@@ -1772,8 +1864,12 @@ class Bridge(models.Model, metaclass=RebacModelBase):
         LIVE = "live", "Live"
         STOPPED = "stopped", "Stopped"
 
-    live_impl_field: ClassVar[str] = "impl_class"
-    """Name the ImplClassField that selects this bridge's runtime implementation."""
+    live_impl_field: ClassVar[str | None] = None
+    """Name the ImplClassField that may select a long-lived session implementation.
+
+    Periodic-only bridges leave this unset. Their periodic sync remains in the due
+    scheduler, but the live-session reconciler does not inspect or dispatch them.
+    """
 
     config = models.JSONField(default=dict, blank=True)
     """Bridge-scoped settings interpreted by the selected backend."""
@@ -1804,11 +1900,28 @@ class Bridge(models.Model, metaclass=RebacModelBase):
 
         abstract = True
 
+    @classmethod
+    def live_implementation_field(cls) -> ImplClassField | None:
+        """Return this bridge's explicitly declared live implementation field."""
+
+        field_name = cls.live_impl_field
+        if field_name is None:
+            return None
+        field = cls._meta.get_field(field_name)
+        if not isinstance(field, ImplClassField):
+            raise ImproperlyConfigured(
+                f"{cls._meta.label}.{field_name} must be an ImplClassField to select live implementations."
+            )
+        return field
+
     @property
     def live_impl(self) -> IntegrationImpl:
         """Return this bridge's selected runtime implementation."""
 
-        impl_class = cast(type[IntegrationImpl], self.resolve_impl(self.live_impl_field))
+        field = type(self).live_implementation_field()
+        if field is None:
+            raise TypeError(f"{self._meta.label} is a periodic-only bridge.")
+        impl_class = cast(type[IntegrationImpl], self.resolve_impl(field.name))
         return impl_class(self)
 
     @property
@@ -1816,6 +1929,156 @@ class Bridge(models.Model, metaclass=RebacModelBase):
         """Return whether a worker currently holds this bridge's live sync lock."""
 
         return bridge_is_locked(self)
+
+    def live_account_lock_key(self, impl_key: str, external_id: str) -> LockKey:
+        """Return the cross-worker lock for one backend-normalized account id."""
+
+        if not external_id:
+            raise ValueError("A live bridge account id is required.")
+        return LockKey(f"{impl_key}-account", (external_id,))
+
+    def live_account_lock(self, impl_key: str, external_id: str) -> Any:
+        """Try to hold the account-scoped ownership lock."""
+
+        return task_lock(self.live_account_lock_key(impl_key, external_id))
+
+    def live_account_owners(
+        self,
+        impl_key: str,
+        external_id: str,
+        *,
+        identity_key: str,
+        queryset: Any | None = None,
+    ) -> Any:
+        """Return other rows that retain the same durable live-account claim."""
+
+        scope = queryset if queryset is not None else type(self).objects.all()
+        return scope.live_account_owners(
+            self,
+            impl_key,
+            external_id,
+            identity_key=identity_key,
+        )
+
+    def claim_live_account(self, impl_key: str, external_id: str, *, identity_key: str) -> bool:
+        """Persist this row's account claim when no live sibling owns it."""
+
+        if not external_id:
+            raise ValueError("A live bridge account id is required.")
+        model = type(self)
+        with system_context(reason="integrate.live.account.claim"), transaction.atomic():
+            row = model.objects.sudo(reason="integrate.live.account.claim.row").lock_if_supported().get(pk=self.pk)
+            owners = row.live_account_owners(
+                impl_key,
+                external_id,
+                identity_key=identity_key,
+                queryset=model.objects.sudo(reason="integrate.live.account.claim.owner"),
+            )
+            if owners.exists():
+                return False
+            state = dict(row.subscription_state)
+            state[identity_key] = external_id
+            row.subscription_state = state
+            row.save(update_fields=["subscription_state", "updated_at"])
+        self.refresh_from_db()
+        return True
+
+    def update_live_state(
+        self,
+        *,
+        identity_key: str,
+        drop_identity: bool = False,
+        drop_pairing_report: bool = False,
+        desired: Any | None = None,
+    ) -> None:
+        """Apply durable live-session state changes and save only changed fields."""
+
+        fields: list[str] = []
+        state = dict(self.subscription_state)
+        if drop_identity:
+            state.pop(identity_key, None)
+        if desired is not None:
+            state["desired"] = str(getattr(desired, "value", desired))
+        if state != self.subscription_state:
+            self.subscription_state = state
+            fields.append("subscription_state")
+        if drop_pairing_report:
+            progress = dict(self.sync_progress) if isinstance(self.sync_progress, Mapping) else {}
+            details = dict(progress.get("details") or {}) if isinstance(progress.get("details"), Mapping) else {}
+            if details.pop("pairing", None) is not None:
+                progress["details"] = details
+                self.sync_progress = progress
+                fields.append("sync_progress")
+        if fields:
+            self.save(update_fields=[*fields, "updated_at"])
+
+    def disconnect_live_account(self, *, identity_key: str, clear_identity: bool) -> None:
+        """Disconnect under a row lock and optionally clear claim and pairing state."""
+
+        model = type(self)
+        with system_context(reason="integrate.live.account.disconnect"), transaction.atomic():
+            row = model.objects.sudo(reason="integrate.live.account.disconnect.row").lock_if_supported().get(pk=self.pk)
+            row.set_lifecycle(type(row).Lifecycle.DISCONNECTED)
+            if clear_identity:
+                row.update_live_state(identity_key=identity_key, drop_identity=True, drop_pairing_report=True)
+        self.refresh_from_db()
+
+    def release_live_account(self, *, identity_key: str, desired: Any) -> None:
+        """Clear a void account claim without changing operator-owned lifecycle."""
+
+        model = type(self)
+        with system_context(reason="integrate.live.account.release"), transaction.atomic():
+            row = model.objects.sudo(reason="integrate.live.account.release.row").lock_if_supported().get(pk=self.pk)
+            row.update_live_state(identity_key=identity_key, drop_identity=True, desired=desired)
+        self.refresh_from_db()
+
+    def live_pairing(self, impl: Any) -> Any:
+        """Project pairing state from durable row facts and backend identity formatting."""
+
+        progress: Mapping[str, Any] = self.sync_progress if isinstance(self.sync_progress, Mapping) else {}
+        details_value = progress.get("details")
+        details: Mapping[str, Any] = details_value if isinstance(details_value, Mapping) else {}
+        report_value = details.get("pairing")
+        report: Mapping[str, Any] = report_value if isinstance(report_value, Mapping) else {}
+        reported = PairingState.from_report(report.get("state"))
+        raw_identity = self.subscription_state.get(impl.state_identity_key) or report.get("own_id") or ""
+        own_id = impl.normalize_account_id(str(raw_identity))
+        lifecycle = type(self).Lifecycle.from_value(self.lifecycle)
+        if lifecycle is type(self).Lifecycle.PAUSED:
+            state = PairingState.PAUSED
+        elif lifecycle is type(self).Lifecycle.DISCONNECTED:
+            state = PairingState.STOPPED
+        elif reported in (PairingState.AWAITING_PASSWORD, PairingState.LOGGED_OUT, PairingState.DUPLICATE_ACCOUNT):
+            state = reported
+        elif own_id:
+            state = PairingState.PAIRED
+        elif self.subscription_state.get("desired") != self.LiveState.LIVE:
+            state = PairingState.STOPPED
+        elif reported is PairingState.AWAITING_SCAN:
+            state = PairingState.AWAITING_SCAN
+        else:
+            state = PairingState.STARTING
+        duplicate = None
+        if own_id and state is PairingState.DUPLICATE_ACCOUNT:
+            duplicate = self.live_account_owners(
+                impl.key,
+                own_id,
+                identity_key=impl.state_identity_key,
+            ).first()
+        return PairingProjection(
+            state=state,
+            qr=str(report.get("qr") or "") if state is PairingState.AWAITING_SCAN else "",
+            message=str(report.get("message") or "") if state is PairingState.AWAITING_PASSWORD else "",
+            can_skip=(
+                bool(report.get("can_skip")) and bool(armed_material_key(self.subscription_state))
+                if state is PairingState.AWAITING_PASSWORD
+                else False
+            ),
+            own_id=own_id,
+            account_label=impl.account_label(own_id) if own_id else "",
+            duplicate_channel_id="" if duplicate is None else str(duplicate.sqid),
+            duplicate_channel_name="" if duplicate is None else str(duplicate.display_name),
+        )
 
     # The persisted stages that assert a live run. Their whole legitimate lifetime
     # is spent holding the advisory sync lock, so a row carrying one without the
@@ -1994,7 +2257,8 @@ class Bridge(models.Model, metaclass=RebacModelBase):
     def record_sync_error(self, error: Exception, *, now: datetime) -> None:
         """Persist one failed scheduler sync result and error status report."""
 
-        error_message = f"{type(error).__name__}: {error}"[:500]
+        failure = _safe_integration_failure(error)
+        error_message = failure.message
         self.last_sync_status = "error"
         self.sync_stage = self.SyncStage.FAILED
         self.sync_error = error_message
@@ -2003,7 +2267,7 @@ class Bridge(models.Model, metaclass=RebacModelBase):
         self.sync_progress = progress
         self.next_sync_at = self._next_sync_at(now=now)
         with transaction.atomic():
-            cast(Any, self).report_status(status=IntegrationRuntimeStatus.ERROR, error=error_message)
+            cast(Any, self).report_status(status=IntegrationRuntimeStatus.ERROR, error=failure)
             self.save(
                 update_fields=[
                     "last_sync_status",
@@ -2097,429 +2361,6 @@ class Bridge(models.Model, metaclass=RebacModelBase):
         """
 
         return now + timedelta(seconds=int(self.poll_interval))
-
-
-class RepoVisibility(models.TextChoices):
-    """Visibility of a git remote on its host."""
-
-    PUBLIC = "public", "Public"
-    PRIVATE = "private", "Private"
-    INTERNAL = "internal", "Internal"
-
-
-class VcsBridge(Bridge):
-    """The VCS sync child model over ``Integration``.
-
-    A :class:`Bridge`: the scheduler refreshes its repositories' sources over the
-    host REST API and an inbound push webhook triggers the same refresh. The
-    host-specific wire format is the integration child row's non-model
-    :class:`~angee.integrate.vcs.backend.VCSBackend` implementation — so
-    github/gitlab/bitbucket share this one table, differing only in behavior.
-    Django keeps the inventory only; the operator performs every git operation,
-    consuming :meth:`Source.materialize_spec`.
-    """
-
-    runtime = True
-    extends = "integrate.Integration"
-    integration_kind_label = "VCS bridge"
-
-    backend_class = ImplClassField(
-        base_class=VCSBackend,
-        registry_setting="ANGEE_VCS_BACKEND_CLASSES",
-        default="local",
-    )
-    """Registry key for the VCS backend bound to this bridge."""
-    webhook_secret = EncryptedField(blank=True)
-    """Shared secret for verifying inbound push webhooks (per account, not per repo)."""
-
-    class Meta:
-        """Django model options for the VCS bridge child model."""
-
-        abstract = True
-        ordering = ("-updated_at",)
-        rebac_resource_type = "integrate/vcs_bridge"
-        rebac_id_attr = "sqid"
-
-    @property
-    def backend(self) -> VCSBackend:
-        """Return this bridge's selected VCS backend."""
-
-        backend_class = cast(type[VCSBackend], self.resolve_impl("backend_class"))
-        return backend_class(self)
-
-    def repositories_by_org(self) -> dict[str, list[Any]]:
-        """Return every visible repository grouped and sorted by owning org."""
-
-        groups: dict[str, list[Any]] = {}
-        for descriptor in self.backend.ls_repos():
-            groups.setdefault(descriptor.org, []).append(descriptor)
-        return {org: sorted(repos, key=lambda item: item.name) for org, repos in sorted(groups.items())}
-
-    def discover(self, source: Any, *, marker: str, parse: Callable[[bytes], dict[str, Any]]) -> list[dict[str, Any]]:
-        """Return one descriptor per directory under ``source`` bearing ``marker``.
-
-        The single enumeration walk shared by every source kind: list the source's
-        subtree, read each ``marker`` blob, parse it, record the bearing directory,
-        and return the descriptors in deterministic order. A source kind's output
-        manager supplies only its ``marker`` filename and ``parse`` function.
-        """
-
-        backend = self.backend
-        repository = source.repository
-        ref = source.ref or repository.default_branch
-        descriptors: list[dict[str, Any]] = []
-        for entry in backend.ls_tree(repository, ref=ref, path=source.path, recursive=True):
-            if entry.type != "blob" or entry.name != marker:
-                continue
-            descriptor = dict(parse(backend.cat_file(repository, ref=ref, path=entry.path)))
-            descriptor.setdefault("path", _parent_path(entry.path))
-            descriptors.append(descriptor)
-        return sorted(descriptors, key=_descriptor_key)
-
-    def sync(self) -> int:
-        """Refresh every inventoried repository's sources over REST (Bridge contract).
-
-        Repository discovery (creating rows from the account) is the explicit
-        ``discoverRepositories`` action; the scheduled/webhook ``sync`` refreshes the
-        content of already-inventoried repositories.
-        """
-
-        source_model = apps.get_model("integrate", "Source")
-        with system_context(reason="integrate.vcs_bridge.sync.sources"):
-            sources = tuple(
-                source_model.objects.filter(repository__vcs_bridge=self)
-                .select_related("repository", "repository__vcs_bridge")
-                .order_by("repository_id", "pk")
-            )
-        return sum(source.refresh() for source in sources)
-
-    def handle_webhook(self, payload: Any) -> None:
-        """Re-sync this bridge's inventory on an inbound push webhook."""
-
-        del payload
-        self.sync()
-
-    def verify_webhook(self, request: Any) -> bool:
-        """Return whether an inbound push webhook is authentic for this bridge."""
-
-        return self.backend.verify_webhook(self, request)
-
-    def search_repositories(self, query: str) -> list[Any]:
-        """Return host repositories whose name matches ``query`` (the add typeahead)."""
-
-        backend = self.backend
-        return backend.search_repos(query, org=backend.repository_search_scope())
-
-    def import_repository(self, name: str) -> Any:
-        """Inventory one repository by its host ``name`` (a picked typeahead result)."""
-
-        repository_model = apps.get_model("integrate", "Repository")
-        return repository_model.objects.add(self, self.backend.get_repo(name))
-
-    def discover_repositories(self, *, org: str = "") -> int:
-        """Inventory every repository the account exposes (bulk import; prunes vanished)."""
-
-        repository_model = apps.get_model("integrate", "Repository")
-        return repository_model.objects.reconcile(self, self.backend.ls_repos(org=org))
-
-
-class RepositoryManager(AngeeManager):
-    """Manager owning the upsert/reconcile of repository rows from a host listing."""
-
-    def reconcile(self, vcs_bridge: Any, descriptors: Iterable[Any]) -> int:
-        """Upsert one repository row per descriptor and prune rows that vanished.
-
-        Bulk import for ``discoverRepositories``: prunes against the full listing,
-        so the caller must pass every repository (see ``GitHubBackend.ls_repos``
-        pagination), never a partial page.
-        """
-
-        descriptor_list = list(descriptors)
-        descriptors_by_name = {str(descriptor.name): descriptor for descriptor in descriptor_list}
-        now = timezone.now()
-        with system_context(reason="integrate.repository.reconcile"), transaction.atomic():
-            self.bulk_create(
-                [
-                    self._row_from_descriptor(vcs_bridge, descriptor, now=now)
-                    for descriptor in descriptors_by_name.values()
-                ],
-                update_conflicts=True,
-                unique_fields=["vcs_bridge", "name"],
-                update_fields=[
-                    "org",
-                    "remote",
-                    "ssh_remote",
-                    "remote_id",
-                    "default_branch",
-                    "visibility",
-                    "web_url",
-                    "archived",
-                    "updated_at",
-                ],
-            )
-            self.filter(vcs_bridge=vcs_bridge).exclude(name__in=descriptors_by_name).delete()
-        return len(descriptor_list)
-
-    def add(self, vcs_bridge: Any, descriptor: Any) -> Any:
-        """Inventory one repository (no prune) — the typeahead "add this repo" path."""
-
-        with system_context(reason="integrate.repository.add"), transaction.atomic():
-            return self._upsert(vcs_bridge, descriptor)
-
-    def _upsert(self, vcs_bridge: Any, descriptor: Any) -> Any:
-        """Create or update one repository row from a host descriptor."""
-
-        repository, _created = self.update_or_create(
-            vcs_bridge=vcs_bridge,
-            name=descriptor.name,
-            defaults={
-                "org": descriptor.org,
-                "remote": descriptor.remote,
-                "ssh_remote": descriptor.ssh_remote,
-                "remote_id": descriptor.remote_id,
-                "default_branch": descriptor.default_branch,
-                "visibility": descriptor.visibility,
-                "web_url": descriptor.web_url,
-                "archived": descriptor.archived,
-            },
-        )
-        return repository
-
-    def _row_from_descriptor(self, vcs_bridge: Any, descriptor: Any, *, now: datetime) -> Any:
-        """Return an unsaved repository row projected from one host descriptor."""
-
-        return self.model(
-            vcs_bridge=vcs_bridge,
-            name=descriptor.name,
-            org=descriptor.org,
-            remote=descriptor.remote,
-            ssh_remote=descriptor.ssh_remote,
-            remote_id=descriptor.remote_id,
-            default_branch=descriptor.default_branch,
-            visibility=descriptor.visibility,
-            web_url=descriptor.web_url,
-            archived=descriptor.archived,
-            created_at=now,
-            updated_at=now,
-        )
-
-
-class Repository(SqidMixin, AuditMixin, AngeeModel):
-    """Inventory of one git remote, reached through its ``VcsBridge``.
-
-    A plain noun: Django records the remote; the operator clones it. ``org`` groups
-    the account's repositories in the browse list.
-    """
-
-    runtime = True
-
-    sqid_prefix = "repo_"
-    vcs_bridge = models.ForeignKey(
-        "integrate.VcsBridge",
-        on_delete=models.CASCADE,
-        related_name="repositories",
-    )
-    org = models.CharField(max_length=255, db_index=True)
-    name = models.CharField(max_length=255)
-    """The repository's ``owner/repo`` path on its remote host."""
-    remote = models.CharField(max_length=512)
-    """The HTTPS remote URL the operator clones."""
-    ssh_remote = models.CharField(max_length=255, blank=True)
-    remote_id = models.CharField(max_length=128, blank=True)
-    default_branch = models.CharField(max_length=255, default="main")
-    visibility = StateField(choices_enum=RepoVisibility, default=RepoVisibility.PRIVATE)
-    web_url = models.URLField(blank=True)
-    archived = models.BooleanField(default=False)
-
-    objects = RepositoryManager()
-
-    class Meta:
-        """Django model options for repository inventory."""
-
-        abstract = True
-        ordering = ("org", "name")
-        rebac_resource_type = "integrate/repository"
-        rebac_id_attr = "sqid"
-        constraints = (
-            models.UniqueConstraint(
-                fields=("vcs_bridge", "name"),
-                name="uniq_integrate_repository_name",
-            ),
-        )
-
-    def __str__(self) -> str:
-        """Return the repository's host path."""
-
-        return self.name
-
-
-class Source(SqidMixin, AuditMixin, AngeeModel):
-    """A pointer into a ``Repository`` at a ``ref`` and ``path``, with a ``kind``.
-
-    One noun for every source kind. ``kind`` binds the source to an output model
-    (``Template``/``Skill``) whose manager reconciles its rows; :meth:`refresh`
-    dispatches there. The operator materializes a source from
-    :meth:`materialize_spec`.
-    """
-
-    runtime = True
-
-    sqid_prefix = "src_"
-    repository = models.ForeignKey("integrate.Repository", on_delete=models.CASCADE, related_name="sources")
-    kind = models.CharField(max_length=64)
-    """The source kind (e.g. ``template``, ``skill``); resolves to an output model."""
-    ref = models.CharField(max_length=255, blank=True)
-    """Branch, tag, or commit oid; blank resolves to the repository's default branch."""
-    path = models.CharField(max_length=1024, blank=True)
-    """Pathspec of the subtree this source points at within the repository."""
-    last_synced_at = models.DateTimeField(null=True, blank=True)
-
-    objects = AngeeManager()
-
-    class Meta:
-        """Django model options for source inventory."""
-
-        abstract = True
-        ordering = ("kind", "path")
-        rebac_resource_type = "integrate/source"
-        rebac_id_attr = "sqid"
-
-    def __str__(self) -> str:
-        """Return a kind-qualified source label."""
-
-        return f"{self.kind}:{self.path or '/'}"
-
-    @classmethod
-    def kind_models(cls) -> tuple[type[models.Model], ...]:
-        """Return the output models that declare a ``source_kind`` (e.g. ``Template``).
-
-        ``Source`` owns "what a kind resolves to": an output model binds itself to a
-        kind with a ``source_kind`` class attribute; the integration registry owns
-        the deterministic app scan and contract check.
-        """
-
-        return registry.source_kind_models()
-
-    @classmethod
-    def available_kinds(cls) -> tuple[str, ...]:
-        """Return the source kinds any installed addon contributes an output model for."""
-
-        return tuple(sorted({str(model.source_kind) for model in cls.kind_models()}))
-
-    @classmethod
-    def target_for_kind(cls, kind: str) -> type[models.Model]:
-        """Return the output model bound to one source ``kind`` or raise."""
-
-        for model in cls.kind_models():
-            if model.source_kind == kind:
-                return model
-        known = ", ".join(cls.available_kinds()) or "none registered"
-        raise ValueError(f"No output model for source kind {kind!r} (known: {known}).")
-
-    def refresh(self) -> int:
-        """Re-enumerate over REST into the kind's output rows; return the row count."""
-
-        return int(type(self).target_for_kind(self.kind).objects.sync_from_source(self))
-
-    def materialize_spec(self) -> dict[str, str]:
-        """Return the operator handoff coordinates to clone and check out this source."""
-
-        repository = self.repository
-        return {
-            "remote": str(repository.remote),
-            "ssh_remote": str(repository.ssh_remote),
-            "ref": str(self.ref or repository.default_branch),
-            "path": str(self.path),
-        }
-
-
-class TemplateManager(AngeeManager):
-    """Manager owning the reconcile of template rows from a template source."""
-
-    def sync_from_source(self, source: Any) -> int:
-        """Walk the source for ``copier.yml`` and upsert/prune ``Template`` rows."""
-
-        vcs_bridge = source.repository.vcs_bridge
-        descriptors = vcs_bridge.discover(source, marker="copier.yml", parse=parse_template_meta)
-        descriptors_by_path = {str(descriptor.get("path", "")): descriptor for descriptor in descriptors}
-        now = timezone.now()
-        with system_context(reason="integrate.template.sync"), transaction.atomic():
-            self.bulk_create(
-                [self._row_from_descriptor(source, descriptor, now=now) for descriptor in descriptors_by_path.values()],
-                update_conflicts=True,
-                unique_fields=["source", "path"],
-                update_fields=["name", "kind", "inputs", "updated_at"],
-            )
-            self.filter(source=source).exclude(path__in=descriptors_by_path).delete()
-            source.last_synced_at = now
-            source.save(update_fields=["last_synced_at", "updated_at"])
-        return len(descriptors)
-
-    def _row_from_descriptor(self, source: Any, descriptor: dict[str, Any], *, now: datetime) -> Any:
-        """Return an unsaved template row projected from one discovered descriptor."""
-
-        return self.model(
-            source=source,
-            path=str(descriptor.get("path", "")),
-            name=str(descriptor.get("name", "")),
-            kind=str(descriptor.get("kind", "")),
-            inputs=list(descriptor.get("inputs", [])),
-            created_at=now,
-            updated_at=now,
-        )
-
-
-class Template(SqidMixin, AuditMixin, AngeeModel):
-    """One Copier template discovered under a ``Source`` (``source_kind="template"``).
-
-    The operator renders these; the kind here is the *template* kind from the
-    manifest's ``_angee.kind`` (stack/workspace/service).
-    """
-
-    runtime = True
-    source_kind = "template"
-    """Binds the ``template`` source kind to this output model (see ``registry``)."""
-
-    sqid_prefix = "tpl_"
-    source = models.ForeignKey("integrate.Source", on_delete=models.CASCADE, related_name="templates")
-    name = models.CharField(max_length=255, blank=True)
-    kind = models.CharField(max_length=64, blank=True)
-    """The template kind from ``_angee.kind`` (stack/workspace/service)."""
-    path = models.CharField(max_length=1024, blank=True)
-    inputs = models.JSONField(default=list, blank=True)
-
-    objects = TemplateManager()
-
-    class Meta:
-        """Django model options for discovered templates."""
-
-        abstract = True
-        ordering = ("kind", "name")
-        rebac_resource_type = "integrate/template"
-        rebac_id_attr = "sqid"
-        constraints = (
-            models.UniqueConstraint(
-                fields=("source", "path"),
-                name="uniq_integrate_template_path",
-            ),
-        )
-
-    def __str__(self) -> str:
-        """Return a kind-qualified template label."""
-
-        return f"{self.kind}:{self.name or self.path}"
-
-
-def _parent_path(path: str) -> str:
-    """Return the directory containing ``path`` (empty string at the root)."""
-
-    return path.rsplit("/", 1)[0] if "/" in path else ""
-
-
-def _descriptor_key(descriptor: dict[str, Any]) -> tuple[str, str]:
-    """Return a stable ``(kind, name|path)`` sort key for one discovered descriptor."""
-
-    return (str(descriptor.get("kind", "")), str(descriptor.get("name") or descriptor.get("path", "")))
 
 
 class WebhookSubscriptionManager(AngeeManager):
@@ -2691,7 +2532,11 @@ class WebhookSubscription(SqidMixin, AuditMixin, AngeeModel):
         try:
             status = self.deliver(body)
         except Exception as exc:  # noqa: BLE001 — delivery failure is telemetry, not a caller exception.
-            logger.exception("Webhook delivery failed for subscription %s.", self.public_id)
+            logger.error(
+                "Webhook delivery failed for subscription %s (%s).",
+                self.public_id,
+                type(exc).__name__,
+            )
             message = self._delivery_error_message(exc)
             self.record_delivery_failure(status=self._delivery_failure_status(exc), error=message)
             return False, message
@@ -2721,9 +2566,11 @@ class WebhookSubscription(SqidMixin, AuditMixin, AngeeModel):
     def _delivery_error_message(exc: Exception) -> str:
         """Return a compact telemetry message for a delivery exception."""
 
+        if isinstance(exc, WebhookDeliveryError) and exc.status:
+            return f"Webhook returned HTTP {exc.status}."
         if isinstance(exc, ValidationError):
-            return "; ".join(str(message) for message in exc.messages)
-        return f"{type(exc).__name__}: {exc}"
+            return "Webhook target is invalid."
+        return _WEBHOOK_FAILURE_MESSAGE
 
     def rotate_secret(self) -> str:
         """Generate a new signing secret, persist it, and return the plaintext once.

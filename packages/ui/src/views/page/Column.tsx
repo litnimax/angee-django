@@ -6,7 +6,7 @@ import { PAGE_ELEMENT_SLOT } from "./types";
 
 export type PageColumnAlign = "left" | "center" | "right";
 
-/** The live row facts a line column's `resolve` hook reads besides the changed cell. */
+/** The live row facts a line column's `resolveDefaults` hook reads besides the changed cell. */
 export interface LineCellResolveContext {
   /** The edited row's values, with the changed cell already applied. */
   row: Record<string, unknown>;
@@ -19,7 +19,7 @@ export interface LineCellResolveContext {
 /**
  * An async row-defaults hook for a line cell: given the changed cell value,
  * return a `{fieldName: value}` map of sibling cells to seed on the same row.
- * See `ColumnProps.resolve`.
+ * See `ColumnProps.resolveDefaults`.
  */
 export type LineCellResolve = (
   value: unknown,
@@ -67,7 +67,7 @@ export interface ColumnProps<
    * session; entries for the changed cell itself are ignored; stale in-flight
    * results drop.
    */
-  resolve?: LineCellResolve;
+  resolveDefaults?: LineCellResolve;
 }
 
 export interface ColumnDescriptor<
@@ -93,8 +93,8 @@ export interface ColumnDescriptor<
   width?: string;
   /** Lines composer only: render this column's cells read-only (see `ColumnProps.readOnly`). */
   readOnly?: boolean;
-  /** Lines composer only: async sibling-cell defaults on change (see `ColumnProps.resolve`). */
-  resolve?: LineCellResolve;
+  /** Lines composer only: async sibling-cell defaults on change (see `ColumnProps.resolveDefaults`). */
+  resolveDefaults?: LineCellResolve;
 }
 
 /**

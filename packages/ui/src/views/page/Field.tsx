@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import type { Row } from "@angee/metadata";
 
 import { PAGE_ELEMENT_SLOT } from "./types";
-import type { WidgetOption } from "../../widgets/types";
+import type { FieldPresentation } from "../../widgets/types";
 
 export type PageFieldKind =
   | "text"
@@ -13,7 +13,7 @@ export type PageFieldKind =
   | "selection"
   | (string & {});
 
-/** The live form facts a `Field.resolve` hook reads besides the changed value. */
+/** The live form facts a `Field.resolveDefaults` hook reads besides the changed value. */
 export interface FieldResolveContext {
   /** The form's current values at the moment of the change. */
   values: Record<string, unknown>;
@@ -24,7 +24,7 @@ export interface FieldResolveContext {
 
 /**
  * An async sibling-defaults hook: given the changed value, return a
- * `{fieldName: value}` map of defaults to seed. See `FieldProps.resolve`.
+ * `{fieldName: value}` map of defaults to seed. See `FieldDescriptor.resolveDefaults`.
  */
 export type FieldResolve = (
   value: unknown,
@@ -35,71 +35,12 @@ export type FieldResolve = (
   | undefined
   | Promise<Record<string, unknown> | null | undefined>;
 
-export interface FieldProps {
+export interface FieldDescriptor extends FieldPresentation {
   name: string;
-  label?: ReactNode;
   widget?: string;
   readOnly?: boolean;
-  /** Editable only while creating; read-only (and never patched) on an edit. */
-  createOnly?: boolean;
-  /** Editable only while editing; read-only (and never sent) on a create. */
-  editOnly?: boolean;
-  /**
-   * The value a create form seeds this field with — the per-field owner of a
-   * create default (converging the page-level `createDefaults` seed onto the
-   * field that owns it). On create, `emptyDraft` seeds the field from
-   * `defaultValue` (falling back to the widget's empty value), and the seeded
-   * value is included in the create payload **even when the field is
-   * `readOnly`/`createOnly`** — so a fixed, non-editable field still submits its
-   * default. Precedence: explicit user edit > `defaultValue` > empty value. No
-   * effect on edit; `editOnly` fields are still omitted on create.
-   */
-  defaultValue?: unknown;
-  /**
-   * Render (and submit) this field only when the predicate matches the form's
-   * current values — the form's discriminated-field mechanism. Mirrors
-   * `Action.visibleWhen`, but evaluates against live form values so a `kind`
-   * select can swap the body. A hidden field is never sent.
-   */
-  showWhen?: (values: Row) => boolean;
-  /**
-   * Seed sibling fields when this field's value changes — the impl-defaults
-   * mechanism. Returns a `{fieldName: value}` map (camelCase form field names) the
-   * form applies as the chosen preset, overwriting those fields (so boolean defaults
-   * land too). Pair with `useImplPrefill(model, field)` for an `ImplClassField`.
-   * Mark the field `createOnly` when saved rows must not be re-seeded; leave it
-   * editable when changing the impl should rematerialize defaults in the form.
-   */
-  prefill?: (value: unknown) => Record<string, unknown> | null | undefined;
-  /**
-   * Seed sibling fields when this field's value changes, resolving the defaults
-   * asynchronously (a server lookup: the partner's payment term, a product's
-   * price). Unlike `prefill` (a sync preset that overwrites), `resolve` follows
-   * the computed-default law: a returned entry is applied only to fields the
-   * user has **not** manually edited this session, so a recompute never
-   * clobbers explicit input. Entries for the changed field itself are ignored.
-   * Only the latest in-flight resolve per field applies (stale results drop).
-   */
-  resolve?: FieldResolve;
-  /**
-   * For a `widget="slug"` field: the form field this slug auto-derives from while
-   * creating (lowercased + hyphenated), until the user edits the slug. Defaults to
-   * the record's `title` field. The derive runs in the form, not the backend.
-   */
-  slugFrom?: string;
-  title?: boolean;
-  body?: boolean;
-  kind?: PageFieldKind;
-  options?: readonly WidgetOption[];
-  placeholder?: string;
-  description?: ReactNode;
-}
-
-export interface FieldDescriptor {
-  name: string;
-  label?: ReactNode;
-  widget?: string;
-  readOnly?: boolean;
+  /** Require a value independently of generated model create metadata. */
+  required?: boolean;
   /** Editable only while creating; read-only (and never patched) on an edit. */
   createOnly?: boolean;
   /** Editable only while editing; read-only (and never sent) on a create. */
@@ -108,21 +49,26 @@ export interface FieldDescriptor {
   defaultValue?: unknown;
   /** Render and submit this field only when the predicate matches form values (see `FieldProps`). */
   showWhen?: (values: Row) => boolean;
+  /** Resolve implementation-dependent presentation from current form values. */
+  resolve?: (values: Row) => FieldDescriptor;
   /** Load the chosen preset onto sibling fields when this field changes (see `FieldProps.prefill`). */
   prefill?: (value: unknown) => Record<string, unknown> | null | undefined;
-  /** Async sibling defaults on change, skipping user-edited fields (see `FieldProps.resolve`). */
-  resolve?: FieldResolve;
+  /** Keep dirty sibling values when applying a preset, except for names explicitly replaced below. */
+  prefillPreserveDirty?: boolean;
+  /** Fields a preset must replace even when they are dirty (for example private implementation config). */
+  prefillReplace?: readonly string[];
+  /** Async sibling defaults on change, skipping user-edited fields (see `FieldResolve`). */
+  resolveDefaults?: FieldResolve;
   /** Source field a `widget="slug"` field derives from on create (see `FieldProps.slugFrom`). */
   slugFrom?: string;
   title?: boolean;
   body?: boolean;
   kind?: PageFieldKind;
-  options?: readonly WidgetOption[];
-  placeholder?: string;
   description?: ReactNode;
-  /** Money widget: path to the FK owning the row's currency (see `WidgetField.currencyField`). */
-  currencyField?: string;
 }
+
+/** JSX declaration shape and resolved descriptor share one lifecycle contract. */
+export interface FieldProps extends FieldDescriptor {}
 
 /**
  * The widget id a field descriptor resolves to: its explicit `widget`, else its

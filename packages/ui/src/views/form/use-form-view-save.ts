@@ -21,7 +21,7 @@ import {
   type Fields,
   type HttpError,
 } from "@refinedev/core";
-import { useForm, type UseFormReturn } from "react-hook-form";
+import { set, useForm, type FieldErrors, type UseFormReturn } from "react-hook-form";
 import { replaceEqualDeep, useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { useLatestRef } from "../../lib/use-latest-ref";
@@ -148,16 +148,16 @@ export function useFormViewSave({
   }, [resource, id]);
   const requiredFieldNames = React.useMemo<ReadonlySet<string>>(() => {
     if (!isCreate) return new Set();
-    const required = new Set(modelMetadata?.rootFields?.requiredCreateFields ?? []);
+    const required = new Set(modelMetadata?.resource.requiredCreateFields ?? []);
     return new Set(
       formFields
-        .filter((field) => required.has(field.name) && !field.readOnly)
+        .filter((field) => (field.required || required.has(field.name)) && !field.readOnly)
         .map((field) => field.name),
     );
   }, [formFields, isCreate, modelMetadata]);
   const writableFieldNames = React.useMemo<ReadonlySet<string> | null>(() => {
     const writable = isCreate
-      ? modelMetadata?.rootFields?.createFields
+      ? modelMetadata?.resource.createFields
       : submit
         ? undefined
         : modelMetadata
@@ -262,11 +262,11 @@ export function useFormViewSave({
     resolver: (formValues) => {
       const missing = missingRequiredFieldNames(formValues, formFields, requiredFieldNames);
       return missing.length ? {
-        values: {}, errors: Object.fromEntries(missing.map((name) => [name, { type: "required", message: t("form.required") }])),
+        values: {}, errors: requiredErrors(missing, t("form.required")),
       } : { values: formValues, errors: {} };
     },
   });
-  const { reset, resetDefaultValues, clearErrors, setError, setValue, getValues } = form;
+  const { reset, resetDefaultValues, resetField, clearErrors, getFieldState, setError, setValue, getValues } = form;
   const { dirtyFields } = form.formState;
   const syncRecordValues = React.useCallback((next: FormValues, lineBaseline?: unknown) => {
     // RHF merges dirty paths by index. A full-list line mutation is atomic, so
@@ -520,14 +520,24 @@ export function useFormViewSave({
       if (isCreate || !field.createOnly) {
         const seeds = field.prefill?.(value);
         if (seeds) {
+          const replacements = new Set(field.prefillReplace ?? []);
           for (const [name, seed] of Object.entries(seeds)) {
+            if (
+              field.prefillPreserveDirty &&
+              !replacements.has(name) &&
+              getFieldState(name).isDirty
+            ) continue;
+            if (field.prefillPreserveDirty && !replacements.has(name)) {
+              resetField(name, { defaultValue: seed });
+              continue;
+            }
             setValue(name, seed, {
               shouldDirty: true,
               shouldTouch: true,
             });
           }
         }
-        const resolve = field.resolve;
+        const resolve = field.resolveDefaults;
         if (resolve) {
           // Only the latest in-flight resolve for this field applies; a
           // returned default lands only on fields the user has not edited
@@ -574,7 +584,7 @@ export function useFormViewSave({
         });
       }
     },
-    [clearErrors, defaultSlugSource, formFields, getValues, isCreate, recordRef, setValue],
+    [clearErrors, defaultSlugSource, formFields, getFieldState, getValues, isCreate, recordRef, resetField, setValue],
   );
   const fieldReadOnly = React.useCallback(
     (field: FieldDescriptor): boolean =>
@@ -582,11 +592,11 @@ export function useFormViewSave({
     [recordUnavailable],
   );
   const discardChanges = React.useCallback(() => {
-    reset(isCreate ? undefined : values, { keepDirtyValues: false, keepDirty: false });
+    reset(isCreate ? emptyValues : values, { keepDirtyValues: false, keepDirty: false });
     formIsDirtyRef.current = false;
     // Back to the clean baseline: nothing is a manual edit anymore.
     userEditedFieldsRef.current = new Set();
-  }, [isCreate, reset, values]);
+  }, [emptyValues, isCreate, reset, values]);
 
   return {
     form,
@@ -610,4 +620,10 @@ export function useFormViewSave({
     afterFieldChange,
     fieldReadOnly,
   };
+}
+
+function requiredErrors(names: readonly string[], message: string): FieldErrors<FormValues> {
+  const errors: FieldErrors<FormValues> = {};
+  for (const name of names) set(errors, name, { type: "required", message });
+  return errors;
 }

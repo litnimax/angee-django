@@ -183,23 +183,26 @@ def test_kind_mutation_to_service_clears_password_and_blocks_auth() -> None:
     assert not user.has_usable_password()
 
 
-def test_people_queryset_fails_loud_when_owner_scope_is_missing() -> None:
-    """People-facing IAM query helpers require the owner-declared people() scope."""
+@pytest.mark.django_db
+def test_overview_requires_swappable_user_people_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The IAM overview requires the swapped user's queryset-owned people() scope."""
 
     from angee.iam import roles
 
-    class QuerySet:
+    class MissingPeopleScope:
         pass
 
     class Manager:
-        def all(self) -> QuerySet:
-            return QuerySet()
+        def all(self) -> MissingPeopleScope:
+            return MissingPeopleScope()
 
     class UserModel:
         _default_manager = Manager()
 
+    monkeypatch.setattr(roles, "get_user_model", lambda: UserModel)
+
     with pytest.raises(AttributeError, match="people"):
-        roles._people_queryset(UserModel)
+        roles.OverviewInfo.build(peek_limit=1)
 
 
 @pytest.mark.django_db

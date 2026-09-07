@@ -2,7 +2,7 @@
 
 An :class:`Agent` is a definition the operator later renders into a workspace and
 service. It draws on three catalogues this addon also owns: :class:`Skill` rows
-discovered from an ``integrate.Source``, :class:`MCPServer`/:class:`MCPTool` rows,
+discovered from an ``integrate_vcs.Source``, :class:`MCPServer`/:class:`MCPTool` rows,
 and an :class:`InferenceProvider` integration child with its
 :class:`InferenceModel` rows. Templates are agents with
 ``is_template`` set. This addon keeps definitions only; the operator owns lifecycle.
@@ -161,12 +161,14 @@ class InferenceProvider(ImplDefaultsMixin, metaclass=RebacModelBase):
 
     runtime = True
     extends = "integrate.Integration"
+    integration_create_mode = "FORM"
     integration_kind_label = "Inference provider"
 
     backend_class = ImplClassField(
         base_class=InferenceBackend,
         registry_setting="ANGEE_INFERENCE_BACKEND_CLASSES",
         default="manual",
+        create_only=True,
     )
     """Registry key for the inference backend this provider uses."""
     name = models.CharField(max_length=128)
@@ -359,7 +361,7 @@ class SkillManager(AngeeManager):
 
 
 class Skill(SqidMixin, AuditMixin, AngeeModel):
-    """One skill discovered under an ``integrate.Source`` (``source_kind="skill"``).
+    """One skill discovered under an ``integrate_vcs.Source`` (``source_kind="skill"``).
 
     The operator mounts the skill's directory into an agent's workspace; Django keeps
     the inventory only. Discovery reuses the integrate source walk.
@@ -367,10 +369,10 @@ class Skill(SqidMixin, AuditMixin, AngeeModel):
 
     runtime = True
     source_kind = "skill"
-    """Binds the ``skill`` source kind to this output model (see ``integrate.Source``)."""
+    """Binds the ``skill`` source kind to this output model (see ``integrate_vcs.Source``)."""
 
     sqid_prefix = "skl_"
-    source = models.ForeignKey("integrate.Source", on_delete=models.CASCADE, related_name="skills")
+    source = models.ForeignKey("integrate_vcs.Source", on_delete=models.CASCADE, related_name="skills")
     name = models.CharField(max_length=200, blank=True)
     description = models.TextField(blank=True)
     path = models.CharField(max_length=1024, blank=True)
@@ -631,7 +633,7 @@ class Agent(SqidMixin, AuditMixin, AngeeModel):
     as container env, and the model-handle convention; ``none`` renders no service
     (a workspace-only agent)."""
     workspace_template = models.ForeignKey(
-        "integrate.Template",
+        "integrate_vcs.Template",
         on_delete=models.PROTECT,
         null=True,
         blank=True,

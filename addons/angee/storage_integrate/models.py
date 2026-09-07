@@ -50,6 +50,7 @@ class Mount(Bridge):
 
     runtime = True
     extends = "integrate.Integration"
+    integration_create_mode = "CONNECT"
     integration_kind_label = "Mount"
     live_impl_field = "backend_class"
 
@@ -57,6 +58,7 @@ class Mount(Bridge):
         base_class=MountBackend,
         registry_setting="ANGEE_STORAGE_MOUNT_BACKEND_CLASSES",
         default="local_folder",
+        create_only=True,
     )
     drive = models.ForeignKey(
         "storage.Drive",
@@ -172,7 +174,7 @@ class Mount(Bridge):
                 continue
             # Each manager write owns its atomic block; with no transaction
             # around sync, a contained DataError is already rolled back.
-            except (DataError, exceptions.UploadError, OSError, ValidationError):
+            except DataError, exceptions.UploadError, OSError, ValidationError:
                 counts["errors"] += 1
                 self._report_batch(counts)
                 continue
@@ -212,9 +214,7 @@ class Mount(Bridge):
                     "metadata",
                 )
             )
-            for pk, storage_path, content_hash, size_bytes, is_trashed, metadata in rows.iterator(
-                chunk_size=2000
-            ):
+            for pk, storage_path, content_hash, size_bytes, is_trashed, metadata in rows.iterator(chunk_size=2000):
                 mount_metadata = metadata.get("mount") if isinstance(metadata, Mapping) else None
                 mount_values = mount_metadata if isinstance(mount_metadata, Mapping) else {}
                 source_path = (
@@ -227,7 +227,7 @@ class Mount(Bridge):
                 raw_mtime_ns = mount_values.get("mtime_ns")
                 try:
                     mtime_ns = int(raw_mtime_ns) if raw_mtime_ns is not None else None
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     mtime_ns = None
                 freshness[source_path] = _MountFileState(
                     pk=pk,
@@ -279,7 +279,7 @@ class Mount(Bridge):
                 )
             # Each ensure_path write owns its atomic block; with no transaction
             # around sync, a contained DataError is already rolled back.
-            except (DataError, exceptions.UploadError, OSError, ValidationError):
+            except DataError, exceptions.UploadError, OSError, ValidationError:
                 counts["errors"] += 1
                 continue
 

@@ -160,7 +160,17 @@ export function createAngeeAuthProviderFromRequest(
           ? { authenticated: true }
           : { authenticated: false, redirectTo: loginPath };
       } catch (caught) {
-        return { authenticated: false, error: authErrorFromUnknown(caught) };
+        if (isUnauthorizedError(caught)) {
+          return {
+            authenticated: false,
+            redirectTo: loginPath,
+            error: sharedErrorFromUnknown(caught) ?? new Error("Authentication required."),
+          };
+        }
+        // Reject transient failures so TanStack Query retains any last
+        // successful authentication result without inventing a first-load
+        // session or redirecting to login.
+        throw sharedErrorFromUnknown(caught) ?? new Error("Request failed.");
       }
     },
     async getIdentity() {
@@ -201,7 +211,7 @@ export function createAngeeAuthProviderFromRequest(
       }
     },
     async onError(error) {
-      const resolved = authErrorFromUnknown(error);
+      const resolved = sharedErrorFromUnknown(error) ?? new Error("Request failed.");
       return isUnauthorizedError(error)
         ? { logout: true, redirectTo: loginPath, error: resolved }
         : { error: resolved };
@@ -524,11 +534,39 @@ function errorFromUnknownOrNull(value: unknown): Error | null {
 }
 
 function authErrorFromUnknown(value: unknown): Error {
-  return sharedErrorFromUnknown(value) ?? new Error("GraphQL auth request failed");
+  const record = recordValue(value);
+  const response = recordValue(record?.response);
+  const status = response?.status ?? record?.statusCode ?? record?.status;
+  if (status === 429) {
+    return new Error("Too many sign-in attempts. Try again later or contact an administrator.");
+  }
+  if (status === 401 || status === 403 || hasAuthGraphQLError(response?.errors)) {
+    return new Error("Invalid username or password.");
+  }
+  // Transport Error messages may serialize the complete GraphQL request,
+  // including password variables. Auth surfaces expose only bounded copy.
+  return new Error("Sign-in request failed. Please try again.");
+}
+
+function hasAuthGraphQLError(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.some((item) => {
+    const error = recordValue(item);
+    const extensions = recordValue(error?.extensions);
+    return extensions?.code === "UNAUTHENTICATED" || extensions?.code === "FORBIDDEN";
+  });
 }
 
 function isUnauthorizedError(value: unknown): boolean {
   const record = recordValue(value);
   const response = recordValue(record?.response);
-  return response?.status === 401 || record?.statusCode === 401 || record?.status === 401;
+  return response?.status === 401 || record?.statusCode === 401 || record?.status === 401
+    || hasGraphQLErrorCode(response?.errors, "UNAUTHENTICATED");
+}
+
+function hasGraphQLErrorCode(value: unknown, code: string): boolean {
+  return Array.isArray(value) && value.some((item) => {
+    const error = recordValue(item);
+    return recordValue(error?.extensions)?.code === code;
+  });
 }

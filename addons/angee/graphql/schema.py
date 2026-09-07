@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+import traceback
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
@@ -23,9 +25,10 @@ from strawberry.utils.str_converters import to_camel_case
 from strawberry_django_hasura import hasura_config
 
 from angee.addons import addon_manifest, optional_addon_module, resolve_addon_reference
-from angee.data.metadata import DataResourceMetadata, merge_data_resources, serialize_data_resources
+from angee.data.metadata import DataResourceMetadata, serialize_data_resources
 from angee.graphql.data.metadata import (
-    data_resource_metadata,
+    data_resource_contributions,
+    finalize_data_resources,
     readable_model_field_names,
 )
 from angee.graphql.ids import assert_unique_sqid_prefixes
@@ -38,6 +41,10 @@ from graphql import GraphQLError, GraphQLSchema
 
 DEFAULT_SCHEMA_NAME = "public"
 """Default GraphQL schema name served by Angee hosts."""
+
+logger = logging.getLogger(__name__)
+_INTERNAL_ERROR_MESSAGE = "An unexpected error occurred."
+_EXPECTED_ERROR_CODES = frozenset({"VALIDATION", "BAD_USER_INPUT", "UNAUTHENTICATED", "PERMISSION_DENIED", "FORBIDDEN"})
 
 SCHEMA_PART_KEYS: tuple[str, ...] = (
     "query",
@@ -79,10 +86,49 @@ class AngeeSchema(strawberry.Schema):
     ) -> None:
         """Attach GraphQL error codes before Strawberry logs errors."""
 
+        errors_to_log: list[GraphQLError] = []
         for error in errors:
+            if error.path is None and isinstance(error.original_error, GraphQLError):
+                # graphql-core's request coercion errors echo submitted values.
+                # Preserve them for the client without passing them to logging.
+                error.extensions = {"code": (error.extensions or {}).get("code", "BAD_USER_INPUT")}
+                continue
             self._apply_rebac_code(error)
             self._apply_validation_error(error)
-        super().process_errors(errors, execution_context)
+            self._sanitize_unexpected_error(error)
+            errors_to_log.append(error)
+        super().process_errors(errors_to_log, execution_context)
+
+    @staticmethod
+    def _sanitize_unexpected_error(error: GraphQLError) -> None:
+        """Keep resolver implementation details out of public GraphQL errors."""
+
+        original = error.original_error
+        if original is None or isinstance(original, MissingActorError | PermissionDenied):
+            return
+        if _unwrap_validation_error(original) is not None:
+            return
+        if isinstance(original, GraphQLError) and (error.extensions or {}).get("code") in _EXPECTED_ERROR_CODES:
+            extensions = error.extensions or {}
+            code = extensions["code"]
+            error.extensions = {"code": code}
+            if code == "VALIDATION":
+                error.extensions.update(
+                    {key: extensions[key] for key in ("validationErrors", "formErrors") if key in extensions}
+                )
+            return
+        logger.error(
+            "Unexpected GraphQL resolver error (%s) at path %s.\n%s",
+            type(original).__name__,
+            error.path,
+            "".join(traceback.format_tb(original.__traceback__)),
+        )
+        error.message = _INTERNAL_ERROR_MESSAGE
+        error.extensions = {"code": "INTERNAL"}
+        # Strawberry logs ``original_error`` with its traceback. Detach it after
+        # recording its class, path and frames so secrets in exception values do
+        # not merely move from the response into ordinary application logs.
+        error.original_error = None
 
     def _apply_rebac_code(self, error: GraphQLError) -> None:
         """Attach the code owned by a REBAC denial exception."""
@@ -116,7 +162,9 @@ class AngeeSchema(strawberry.Schema):
                 if field == NON_FIELD_ERRORS:
                     form_errors.extend(messages)
                 else:
-                    field_errors[to_camel_case(field)] = list(messages)
+                    head, separator, nested = field.partition(".")
+                    path = f"{to_camel_case(head)}.{nested}" if separator else to_camel_case(head)
+                    field_errors[path] = list(messages)
         else:
             form_errors.extend(validation.messages)
         error.extensions = {
@@ -252,16 +300,9 @@ class GraphQLSchemas:
         return self.build(name)._schema
 
     def resources(self, name: str = DEFAULT_SCHEMA_NAME) -> tuple[DataResourceMetadata, ...]:
-        """Return model resource metadata contributed to the named schema bucket."""
+        """Return the named schema's finalized model resource descriptions."""
 
-        try:
-            parts = self.parts[name]
-        except KeyError as error:
-            available = ", ".join(self.names()) or "none"
-            raise ImproperlyConfigured(
-                f"GraphQL schema {name!r} has no contributions; available schemas: {available}"
-            ) from error
-        return self._data_resources_from_parts(parts)
+        return cast(AngeeSchema, self.build(name)).angee_resources
 
     def change_publisher_models(self) -> tuple[type[models.Model], ...]:
         """Return every model declared into the GraphQL change feed.
@@ -271,17 +312,17 @@ class GraphQLSchemas:
         every trigger save.
         """
 
-        cached: tuple[type[models.Model], ...] | None = getattr(
-            self, "_change_publisher_models", None
-        )
+        cached: tuple[type[models.Model], ...] | None = getattr(self, "_change_publisher_models", None)
         if cached is not None:
             return cached
         models_by_label: dict[str, type[models.Model]] = {}
         for schema_name in self.names():
-            for resource in self.resources(schema_name):
-                if resource.model is None or "changes" not in resource.capabilities:
-                    continue
-                models_by_label[resource.model._meta.label_lower] = resource.model
+            parts = self.parts[schema_name]
+            for surface in parts.subscription:
+                for contribution in data_resource_contributions(surface):
+                    if contribution.model is None or "changes" not in contribution.capabilities:
+                        continue
+                    models_by_label[contribution.model._meta.label_lower] = contribution.model
         result = tuple(models_by_label[label] for label in sorted(models_by_label))
         self._change_publisher_models = result
         return result
@@ -296,15 +337,11 @@ class GraphQLSchemas:
 
         from angee.graphql.publishing import connect_publishers
 
-        readable_by_model = {
-            model: set[str]() for model in self.change_publisher_models()
-        }
+        readable_by_model = {model: set[str]() for model in self.change_publisher_models()}
         for schema_name in self.names():
             for resource in self.resources(schema_name):
                 if resource.model in readable_by_model:
-                    readable_by_model[resource.model].update(
-                        readable_model_field_names(resource)
-                    )
+                    readable_by_model[resource.model].update(readable_model_field_names(resource))
         for model, readable_fields in readable_by_model.items():
             connect_publishers(model, readable_fields=readable_fields)
 
@@ -329,8 +366,6 @@ class GraphQLSchemas:
         self._assert_rebac_managers(name, types)
         assert_unique_sqid_prefixes(types)
         self._describe_choice_enums(types)
-        resources = self._data_resources_from_parts(parts)
-        self._assert_revision_visibility(resources)
         schema = AngeeSchema(
             query=query,
             mutation=self._merge_root(name, "mutation", parts.mutation),
@@ -350,19 +385,13 @@ class GraphQLSchemas:
             ),
             config=hasura_config(),
         )
+        resources = finalize_data_resources(
+            schema._schema,
+            (*parts.query, *parts.mutation, *parts.subscription),
+        )
+        self._assert_revision_visibility(resources)
         self._attach_schema_metadata(schema, name=name, resources=resources)
         return schema
-
-    def _data_resources_from_parts(
-        self,
-        parts: SchemaParts,
-    ) -> tuple[DataResourceMetadata, ...]:
-        """Return merged resource metadata from normalized schema parts."""
-
-        metadata: list[DataResourceMetadata] = []
-        for surface in (*parts.query, *parts.mutation, *parts.subscription):
-            metadata.extend(data_resource_metadata(surface))
-        return merge_data_resources(tuple(metadata))
 
     def _attach_schema_metadata(
         self,
@@ -396,9 +425,7 @@ class GraphQLSchemas:
     def _schema_types(self, parts: SchemaParts) -> tuple[object, ...]:
         """Return concrete and native extension types registered with Strawberry."""
 
-        return SchemaParts._dedupe_by_identity(
-            parts.types + parts.type_extensions + parts.input_extensions
-        )
+        return SchemaParts._dedupe_by_identity(parts.types + parts.type_extensions + parts.input_extensions)
 
     def render_sdl(self) -> dict[str, str]:
         """Return printed GraphQL SDL for every contributed schema."""

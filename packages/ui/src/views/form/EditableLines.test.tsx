@@ -164,14 +164,14 @@ describe("EditableLines — column overrides", () => {
   });
 });
 
-describe("EditableLines — cell resolve", () => {
+describe("EditableLines — cell resolveDefaults", () => {
   test("seeds sibling cells of the row, skipping the changed cell itself", async () => {
     render(
       <Host
         columns={[
           {
             field: "label",
-            resolve: (value) =>
+            resolveDefaults: (value) =>
               Promise.resolve({ note: "seeded", label: `${String(value)}!` }),
           },
           { field: "note" },
@@ -199,7 +199,7 @@ describe("EditableLines — cell resolve", () => {
         columns={[
           {
             field: "label",
-            resolve: () => Promise.resolve({ note: "seeded" }),
+            resolveDefaults: () => Promise.resolve({ note: "seeded" }),
           },
           { field: "note" },
         ]}

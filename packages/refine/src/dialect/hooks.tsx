@@ -11,11 +11,7 @@ import {
   type HttpError,
 } from "@refinedev/core";
 
-import {
-  crudFiltersFromFilterRecord,
-  refineFieldsFromPaths,
-  refineSortersFromAngeeOrder,
-} from "../filter-codec";
+import { listQueryMeta, type ListQueryTarget } from "../list-query";
 import {
   aggregateRequest,
   actionRequest,
@@ -49,13 +45,14 @@ import {
   useOperationDocuments,
 } from "../operation-documents";
 import { useActiveDataProviderName } from "./data-provider-context";
-import { invalidateAuthoredQueries } from "../query-invalidation";
+import { authoredQueryMeta, invalidateAuthoredQueries } from "../query-invalidation";
+import { useAuthoredLiveInterest } from "./authored-hooks";
 import { stableKey, useStableArray } from "../stable-deps";
 
 type Row = Record<string, unknown>;
 type InvalidateParams = Parameters<ReturnType<typeof useInvalidate>>[0];
 
-export interface ListBatchTarget {
+export interface ListBatchTarget extends ListQueryTarget {
   dataProviderName: string | undefined;
   resourceIdentifier: string;
   resourceName: string;
@@ -98,13 +95,15 @@ export interface GroupByBatchScope {
 /** One leaf `list` request in a batch, addressed by a caller-stable `key`. */
 export interface AngeeListBatchScope {
   key: string;
-  filter: Record<string, unknown> | undefined;
-  order: Record<string, unknown> | undefined;
+  where: Record<string, unknown> | undefined;
+  orderBy: unknown;
   page: number;
   pageSize: number;
 }
 
 export interface AngeeListBatchEntry {
+  /** Refetch this active native record page. */
+  refetch: () => void;
   rows: readonly Row[];
   total: number | undefined;
   fetching: boolean;
@@ -292,6 +291,9 @@ function useGroupByRequestBatch(
   const { document, enabled = true } = options;
   const canQuery = enabled && target !== null;
   const activeScopes = canQuery ? scopes : EMPTY_GROUP_BY_SCOPES;
+  const models = useStableArray(target?.modelLabel ? [target.modelLabel] : []);
+  // Group discovery remains live even when every lane is collapsed or summary-only.
+  useAuthoredLiveInterest(canQuery && activeScopes.length > 0, models);
   const scopesKey = stableKey(activeScopes);
   const dataProvider = useDataProvider();
   const requests = useMemo(() => {
@@ -328,6 +330,7 @@ function useGroupByRequestBatch(
         return response.data;
       },
       enabled: canQuery,
+      meta: authoredQueryMeta(models),
     })),
   });
   return useMemo(
@@ -404,24 +407,19 @@ export function useAngeeListBatch(
   const identifier = target?.resourceIdentifier ?? "";
   const schemaName = target?.dataProviderName;
   const fieldsKey = stableKey(options.fields);
-  const listMeta = useMemo(
-    () => ({ fields: refineFieldsFromPaths(options.fields) }),
-    [fieldsKey],
-  );
   const scopesKey = stableKey(activeScopes);
   const requests = useMemo(
     () =>
       activeScopes.map((scope) => ({
         scope,
-        filters: crudFiltersFromFilterRecord(scope.filter) ?? [],
-        sorters: refineSortersFromAngeeOrder(scope.order) ?? [],
+        meta: listQueryMeta(target!, options.fields, scope.where, scope.orderBy),
         pagination: {
           mode: "server" as const,
           currentPage: scope.page,
           pageSize: scope.pageSize,
         },
       })),
-    [activeScopes, scopesKey],
+    [activeScopes, scopesKey, target, fieldsKey],
   );
   // One static, resource-level live subscription re-opens the websocket changes()
   // feed for these rows: refine's auto liveMode invalidates the resource list cache
@@ -436,20 +434,20 @@ export function useAngeeListBatch(
     meta: { dataProviderName: schemaName },
   });
   const queries = useQueries({
-    queries: requests.map(({ filters, sorters, pagination }) => ({
+    queries: requests.map(({ meta, pagination }) => ({
       queryKey: keys()
         .data(schemaName)
         .resource(identifier)
         .action("list")
-        .params({ ...listMeta, filters, pagination, sorters })
+        .params({ ...meta, filters: [], pagination, sorters: [] })
         .get(),
       queryFn: () =>
         dataProvider(schemaName).getList({
           resource: resourceName,
           pagination,
-          filters,
-          sorters,
-          meta: listMeta,
+          filters: [],
+          sorters: [],
+          meta,
         }),
       enabled: canQuery,
     })),
@@ -463,6 +461,7 @@ export function useAngeeListBatch(
           return [
             scope.key,
             {
+              refetch: () => { void query?.refetch(); },
               rows: (data?.data ?? []) as readonly Row[],
               total: data?.total,
               fetching: query?.isFetching ?? false,

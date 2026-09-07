@@ -2,6 +2,8 @@
 
 import { act, renderHook } from "@testing-library/react";
 import { describe, expect, test } from "vitest";
+import { boundedGraphQLTransportError } from "@angee/refine";
+import { errorFromUnknown } from "../../data/errors";
 
 import {
   directDottedPathMessages,
@@ -115,27 +117,64 @@ describe("useDottedPathFieldErrors", () => {
 });
 
 describe("validationErrorsFromError", () => {
+  test("reads a bounded native validation error exactly once", () => {
+    const error = boundedGraphQLTransportError({
+      request: { variables: { secret: "must-not-render" } },
+      response: {
+        status: 400,
+        errors: [{
+          message: "Fix this field.",
+          extensions: {
+            code: "VALIDATION",
+            validationErrors: { "config.local_root": ["Required."] },
+            formErrors: ["Check the form."],
+          },
+        }],
+      },
+    });
+
+    expect(errorFromUnknown(error)?.message).toBe("Fix this field.");
+    expect(validationErrorsFromError(error)).toEqual({
+      fieldErrors: { "config.local_root": ["Required."] },
+      formErrors: ["Check the form."],
+    });
+  });
+
+  test("does not use transport messages containing request variables", () => {
+    const secret = "form-secret-sentinel";
+    const error = Object.assign(new Error(`request variables ${secret}`), {
+      request: { variables: { secret } },
+      response: { status: 500 },
+    });
+    expect(validationErrorsFromError(error)).toEqual({
+      fieldErrors: {},
+      formErrors: ["Request failed."],
+    });
+  });
   test("splits a structured extension into field and form messages", () => {
     const error = {
       message: "[GraphQL] validation failed",
-      graphQLErrors: [
-        {
-          message: "validation failed",
-          extensions: {
-            code: "VALIDATION",
-            validationErrors: {
-              slug: ["This field cannot be blank."],
-              clientId: ["This field cannot be blank."],
+      request: { variables: { password: "must-not-render" } },
+      response: {
+        errors: [
+          {
+            message: "validation failed",
+            extensions: {
+              code: "VALIDATION",
+              validationErrors: {
+                "config.local_root": ["This field cannot be blank."],
+                clientId: ["This field cannot be blank."],
+              },
+              formErrors: ["Provider is misconfigured."],
             },
-            formErrors: ["Provider is misconfigured."],
           },
-        },
-      ],
+        ],
+      },
     };
 
     expect(validationErrorsFromError(error)).toEqual({
       fieldErrors: {
-        slug: ["This field cannot be blank."],
+        "config.local_root": ["This field cannot be blank."],
         clientId: ["This field cannot be blank."],
       },
       formErrors: ["Provider is misconfigured."],
@@ -145,8 +184,14 @@ describe("validationErrorsFromError", () => {
   test("merges field messages across multiple graphQL errors", () => {
     const error = {
       graphQLErrors: [
-        { extensions: { validationErrors: { slug: ["Required."] } } },
-        { extensions: { validationErrors: { slug: ["Too short."] } } },
+        {
+          message: "Validation failed.",
+          extensions: { code: "VALIDATION", validationErrors: { slug: ["Required."] } },
+        },
+        {
+          message: "Validation failed.",
+          extensions: { code: "VALIDATION", validationErrors: { slug: ["Too short."] } },
+        },
       ],
     };
 
@@ -165,6 +210,17 @@ describe("validationErrorsFromError", () => {
 
   test("returns empty maps for an unrecognised value", () => {
     expect(validationErrorsFromError(undefined)).toEqual({
+      fieldErrors: {},
+      formErrors: ["Could not save record."],
+    });
+  });
+
+  test("uses the bounded fallback for opaque objects", () => {
+    expect(validationErrorsFromError({})).toEqual({
+      fieldErrors: {},
+      formErrors: ["Could not save record."],
+    });
+    expect(validationErrorsFromError({ message: undefined })).toEqual({
       fieldErrors: {},
       formErrors: ["Could not save record."],
     });

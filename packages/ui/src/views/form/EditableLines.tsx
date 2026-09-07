@@ -18,7 +18,6 @@ import {
 } from "@dnd-kit/sortable";
 import {
   defaultWidgetForModelField,
-  lineChildModelMetadata,
   useSchemaFieldMetadata,
   type DataResourceLinesMetadata,
   type ModelFieldMetadata,
@@ -42,8 +41,8 @@ import {
 import { FieldDescriptorControl } from "./field-descriptor-control";
 import {
   enumOptions,
-  relationFieldInfo,
-  relationListFieldInfo,
+  relationFieldInfoForField,
+  relationListFieldInfoForField,
   type RelationFieldInfo,
 } from "../resource/model-metadata-defaults";
 import type {
@@ -73,7 +72,7 @@ export interface EditableLinesProps {
   /**
    * Declared column overrides (a form's `Lines` children): their order is the
    * render order and each may override the metadata-derived header, widget,
-   * width, and read-only state, or attach a `resolve` hook. Empty/omitted
+   * width, and read-only state, or attach a `resolveDefaults` hook. Empty/omitted
    * renders every metadata column in metadata order.
    */
   columns?: readonly ColumnDescriptor[];
@@ -86,8 +85,8 @@ export interface EditableLinesProps {
   /** Server validation messages per line row, indexed by row position. */
   rowErrors?: readonly (ValidationErrors | undefined)[];
   /**
-   * The composing form's `setValue`, required for column `resolve` hooks to
-   * seed sibling cells. Without it, `resolve` declarations are inert.
+   * The composing form's `setValue`, required for column `resolveDefaults` hooks to
+   * seed sibling cells. Without it, `resolveDefaults` declarations are inert.
    */
   setValue?: (
     name: string,
@@ -104,7 +103,7 @@ interface LineColumn {
   header: string;
   width?: string;
   readOnly?: boolean;
-  resolve?: LineCellResolve;
+  resolveDefaults?: LineCellResolve;
 }
 
 const CELL_CLASS = "min-w-0";
@@ -161,7 +160,7 @@ export function EditableLines({
     if (from >= 0 && to >= 0) move(from, to);
   };
 
-  // The computed-default law for line cells (mirrors the form's field.resolve):
+  // The computed-default law for line cells (mirrors the form's field.resolveDefaults):
   // a user's direct edit marks that cell of that row (keyed by the row's stable
   // rhf key, so reorders don't cross rows); a column resolver's result seeds
   // only unmarked sibling cells; only the latest in-flight resolve per cell
@@ -177,7 +176,7 @@ export function EditableLines({
         userEditedCellsRef.current.get(rowKey) ?? new Set<string>();
       edited.add(column.field.name);
       userEditedCellsRef.current.set(rowKey, edited);
-      const resolve = column.resolve;
+      const resolve = column.resolveDefaults;
       if (!resolve || !setValueRef.current) return;
       const tokenKey = `${rowKey}:${column.field.name}`;
       const token = (resolveTokensRef.current.get(tokenKey) ?? 0) + 1;
@@ -418,7 +417,7 @@ function LineRow({
 /**
  * Resolve each editable child column: its widget descriptor and relation target.
  * Declared overrides pick the columns and their order; each override merges its
- * header, widget, options, width, read-only state, and `resolve` hook over the
+ * header, widget, options, width, read-only state, and `resolveDefaults` hook over the
  * metadata-derived column. An override naming a field that is not an editable
  * child column fails fast — the declaration is out of sync with the contract.
  */
@@ -428,7 +427,7 @@ function lineColumns(
   schemaMetadata: ReturnType<typeof useSchemaFieldMetadata>,
   overrides?: readonly ColumnDescriptor[],
 ): LineColumn[] {
-  const childMetadata = lineChildModelMetadata(lines);
+  const fields = lines.fields ?? [];
   const build = (
     field: ModelFieldMetadata,
     override: ColumnDescriptor | undefined,
@@ -441,21 +440,21 @@ function lineColumns(
       ...(options.length > 0 ? { options } : {}),
       ...(field.currencyField ? { currencyField: field.currencyField } : {}),
     };
-    const header = override?.header ?? field.label ?? titleCase(field.name);
+    const header = override?.header ?? titleCase(field.name);
     return {
       field,
       descriptor,
-      relation: relationFieldInfo(field.name, childMetadata, schemaMetadata),
-      relationMulti: relationListFieldInfo(field.name, childMetadata, schemaMetadata),
+      relation: relationFieldInfoForField(field, schemaMetadata),
+      relationMulti: relationListFieldInfoForField(field, schemaMetadata),
       header: typeof header === "string" ? header : String(header),
       ...(override?.width !== undefined ? { width: override.width } : {}),
       ...(override?.readOnly !== undefined ? { readOnly: override.readOnly } : {}),
-      ...(override?.resolve !== undefined ? { resolve: override.resolve } : {}),
+      ...(override?.resolveDefaults !== undefined ? { resolveDefaults: override.resolveDefaults } : {}),
     };
   };
   if (overrides && overrides.length > 0) {
     return overrides.map((override) => {
-      const field = childMetadata.fields[override.field];
+      const field = fields.find((candidate) => candidate.name === override.field);
       if (!field || field.name === config.positionField) {
         throw new Error(
           `Lines column "${override.field}" is not an editable child column of `
@@ -465,7 +464,7 @@ function lineColumns(
       return build(field, override);
     });
   }
-  return Object.values(childMetadata.fields)
+  return fields
     .filter((field) => field.name !== config.positionField)
     .map((field) => build(field, undefined));
 }

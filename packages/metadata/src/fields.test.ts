@@ -1,56 +1,77 @@
+import { testDataResource, testResourceQuery } from "./testing";
+import { resourceOrderFieldForPath } from "./fields";
 import { describe, expect, test } from "vitest";
 
 import {
   defaultWidgetForModelField,
   fieldUpdatable,
   filterFieldType,
+  isScalarIdRelation,
 } from "./fields";
-import type { ModelFieldMetadata, ModelMetadata } from "./artifact";
+import type {
+  DataResourceFieldMetadata,
+  ModelMetadata,
+} from "./artifact";
+import { schemaFieldMetadataFromDataResources } from "./artifact";
 
 describe("field metadata helpers", () => {
   test("treats Decimal as a number field with the numeric widget", () => {
-    const field: ModelFieldMetadata = {
+    const field = resourceField({
       name: "amount",
       kind: "scalar",
       scalar: "Decimal",
-    };
+    });
 
     expect(defaultWidgetForModelField(field)).toBe("float");
     expect(filterFieldType("amount", field)).toBe("number");
   });
 
   test("resolves a money field to the money widget, filtering as a number", () => {
-    const field: ModelFieldMetadata = {
+    const field = resourceField({
       name: "amount",
       kind: "scalar",
       scalar: "Decimal",
       widget: "money",
       currencyField: "currency",
-    };
+    });
 
     expect(defaultWidgetForModelField(field)).toBe("money");
     expect(filterFieldType("amount", field)).toBe("number");
   });
 
   test("uses date-name inference only when field metadata is absent", () => {
-    const stringField: ModelFieldMetadata = {
+    const stringField = resourceField({
       name: "published_at",
       kind: "scalar",
       scalar: "String",
-    };
+    });
 
     expect(filterFieldType("published_at", undefined)).toBe("datetime");
     expect(filterFieldType("published_at", stringField)).toBe("text");
   });
 
+  test("recognizes finalized scalar-ID relation projections", () => {
+    expect(isScalarIdRelation(resourceField({
+      name: "owner",
+      kind: "relation",
+      relationModelLabel: "accounts.User",
+      relationObject: false,
+    }))).toBe(true);
+    expect(isScalarIdRelation(resourceField({
+      name: "owner",
+      kind: "relation",
+      relationModelLabel: "accounts.User",
+      relationObject: true,
+    }))).toBe(false);
+  });
+
   test("answers field update capability from one metadata owner", () => {
     const metadata = modelMetadata({
-      rootFields: { update: "updateLead", updateFields: ["stage"] },
-      resource: { updateFields: ["name"] },
+      resource: { roots: { update: "updateLead" }, updateFields: ["stage"] },
       fields: {
-        stage: { name: "stage", kind: "relation", updatable: true },
-        name: { name: "name", kind: "scalar", updatable: true },
-        code: { name: "code", kind: "scalar", updatable: false },
+        stage: resourceField({ name: "stage", kind: "relation", updatable: true }),
+        name: resourceField({ name: "name", kind: "scalar", updatable: true }),
+        code: resourceField({ name: "code", kind: "scalar", updatable: false }),
       },
     });
 
@@ -58,55 +79,64 @@ describe("field metadata helpers", () => {
     expect(fieldUpdatable(metadata, "name")).toBe(false);
     expect(fieldUpdatable(metadata, "code")).toBe(false);
     expect(fieldUpdatable(modelMetadata({
-      rootFields: { update: "updateLead" },
-      resource: { updateFields: ["name"] },
-      fields: { name: { name: "name", kind: "scalar", updatable: true } },
+      resource: { roots: { update: "updateLead" }, updateFields: ["name"] },
+      fields: { name: resourceField({ name: "name", kind: "scalar", updatable: true }) },
     }), "name")).toBe(true);
     expect(fieldUpdatable(modelMetadata({
       resource: { roots: { update: "updateLead" }, updateFields: ["name"] },
-      fields: { name: { name: "name", kind: "scalar", updatable: true } },
+      fields: { name: resourceField({ name: "name", kind: "scalar", updatable: true }) },
     }), "name")).toBe(true);
     expect(fieldUpdatable(modelMetadata({
-      rootFields: { update: "updateLead" },
+      resource: { roots: { update: "updateLead" } },
       fields: {},
     }), "declaredOnly")).toBe(true);
     expect(fieldUpdatable(modelMetadata({
-      rootFields: {},
-      resource: { updateFields: ["name"] },
-      fields: { name: { name: "name", kind: "scalar", updatable: true } },
+      resource: { roots: { update: null }, updateFields: ["name"] },
+      fields: { name: resourceField({ name: "name", kind: "scalar", updatable: true }) },
     }), "name")).toBe(false);
   });
 });
 
 function modelMetadata({
-  rootFields,
   resource,
   fields,
 }: {
-  rootFields?: ModelMetadata["rootFields"];
-  resource?: Partial<NonNullable<ModelMetadata["resource"]>>;
-  fields: Record<string, ModelFieldMetadata>;
+  resource?: Parameters<typeof testDataResource>[1];
+  fields: Record<string, DataResourceFieldMetadata>;
 }): ModelMetadata {
+  const value = testDataResource("crm.Lead", {
+    roots: {},
+    ...resource,
+    fields: Object.values(fields),
+  });
+  return schemaFieldMetadataFromDataResources([value]).labels["crm.Lead"]!;
+}
+
+function resourceField(
+  overrides: Pick<DataResourceFieldMetadata, "name" | "kind">
+    & Partial<DataResourceFieldMetadata>,
+): DataResourceFieldMetadata {
   return {
-    typeName: "LeadType",
-    fields,
-    rootFields,
-    resource: {
-      schemaName: "console",
-      modelLabel: "crm.Lead",
-      appLabel: "crm",
-      modelName: "lead",
-      publicIdField: "sqid",
-      roots: {},
-      typeNames: {},
-      capabilities: [],
-      fields: [],
-      filterFields: [],
-      orderFields: [],
-      aggregateFields: [],
-      groupByFields: [],
-      relationAxes: [],
-      ...resource,
-    },
+    readable: true,
+    aggregatable: false,
+    creatable: false,
+    updatable: false,
+    requiredOnCreate: false,
+    ...overrides,
   };
 }
+
+
+test("server order fields map display paths only to declared wire keys", () => {
+  const resource = testDataResource("messaging.Message", { query: testResourceQuery({ fields: {
+    sent_at: { kind: "scalar", scalar: "DateTime", values: [], nullable: true, sort: { field: "sent_at" } },
+    "thread.title.text": { kind: "scalar", scalar: "String", values: [], nullable: true, sort: { field: "thread__title__text" } },
+  } }) });
+  expect(resourceOrderFieldForPath("sent_at", resource)).toBe("sent_at");
+  expect(resourceOrderFieldForPath("sentAt", resource)).toBeNull();
+  expect(resourceOrderFieldForPath("thread.title.text", resource)).toBe("thread__title__text");
+  expect(resourceOrderFieldForPath("sender.party.display_name", resource)).toBeNull();
+  expect(resourceOrderFieldForPath("thread.title.unknown", resource)).toBeNull();
+  expect(resourceOrderFieldForPath("title", { ...resource, rowModel: "client" })).toBeNull();
+  expect(resourceOrderFieldForPath("title", undefined)).toBe("title");
+});

@@ -1099,12 +1099,14 @@ class Directory(Bridge):
 
     runtime = True
     extends = "integrate.Integration"
+    integration_create_mode = "CONNECT"
     integration_kind_label = "Directory"
 
     backend_class = ImplClassField(
         base_class=DirectoryBackend,
         registry_setting="ANGEE_DIRECTORY_BACKEND_CLASSES",
         default="manual",
+        create_only=True,
     )
     """Registry key for the directory backend bound to this directory."""
 

@@ -3,10 +3,6 @@ import { defineBaseAddon, resourcePageRoutes, type BaseAddonRoute } from "@angee
 import { lazyRouteComponent } from "@tanstack/react-router";
 import {
   Cable,
-  FolderGit2,
-  GitBranch,
-  GitFork,
-  LayoutTemplate,
   Link2,
   Store,
   Webhook,
@@ -37,15 +33,16 @@ const oauthConnectCallback = lazyRouteComponent(
 );
 
 const integrateRoutes: readonly BaseAddonRoute[] = [
+  {
+    name: "integrate.add",
+    path: "/integrate/add",
+    component: lazyRouteComponent(() => import("./views/AddIntegrationPage"), "AddIntegrationPage"),
+  },
   // List/detail pairs: the list route owns the component/model, and the `$id`
   // child carries only the nested record URL.
   ...resourcePageRoutes("integrate.integrations", "/integrate", lazyRouteComponent(() => import("./views/IntegrationsPage"), "IntegrationsPage"), "integrate.Integration", { detailName: "integrate.integration" }),
   ...resourcePageRoutes("integrate.vendors", "/integrate/vendors", lazyRouteComponent(() => import("./views/VendorsPage"), "VendorsPage"), "integrate.Vendor", { detailName: "integrate.vendor" }),
   ...resourcePageRoutes("integrate.webhooks", "/integrate/webhooks", lazyRouteComponent(() => import("./views/WebhooksPage"), "WebhooksPage"), "integrate.WebhookSubscription", { detailName: "integrate.webhook" }),
-  ...resourcePageRoutes("integrate.vcs", "/integrate/vcs", lazyRouteComponent(() => import("./views/VcsBridgesPage"), "VcsBridgesPage"), "integrate.VcsBridge", { detailName: "integrate.vcsBridge" }),
-  ...resourcePageRoutes("integrate.repositories", "/integrate/repositories", lazyRouteComponent(() => import("./views/RepositoriesPage"), "RepositoriesPage"), "integrate.Repository", { detailName: "integrate.repository" }),
-  ...resourcePageRoutes("integrate.sources", "/integrate/sources", lazyRouteComponent(() => import("./views/SourcesPage"), "SourcesPage"), "integrate.Source", { detailName: "integrate.source" }),
-  ...resourcePageRoutes("integrate.templates", "/integrate/templates", lazyRouteComponent(() => import("./views/TemplatesPage"), "TemplatesPage"), "integrate.Template", { detailName: "integrate.template" }),
 
   // --- Connect surface (outbound OAuth) -----------------------------------
   // The account-connect callback: the provider redirects back here after the user
@@ -89,18 +86,6 @@ const integrateMenu: readonly BaseMenuItem[] = [
           { id: "integrate.integrations", label: "Integrations", icon: "integration", route: "integrate.integrations" },
           { id: "integrate.vendors", label: "Vendors", icon: "vendor", route: "integrate.vendors" },
           { id: "integrate.webhooks", label: "Webhooks", icon: "webhook", route: "integrate.webhooks" },
-        ],
-      },
-      {
-        // Repository/source inventory hangs off VCS-capable integrations.
-        id: "integrate.sources.group",
-        label: "Sources",
-        icon: "source",
-        children: [
-          { id: "integrate.sources", label: "Sources", icon: "source", route: "integrate.sources" },
-          { id: "integrate.templates", label: "Templates", icon: "integrate-template", route: "integrate.templates" },
-          { id: "integrate.repositories", label: "Repositories", icon: "repository", route: "integrate.repositories" },
-          { id: "integrate.vcs", label: "VCS Bridges", icon: "vcs", route: "integrate.vcs" },
         ],
       },
       {
@@ -157,10 +142,6 @@ const integrate = defineBaseAddon({
     integration: Link2,
     vendor: Store,
     webhook: Webhook,
-    vcs: GitFork,
-    repository: FolderGit2,
-    source: GitBranch,
-    "integrate-template": LayoutTemplate,
   },
 });
 
@@ -195,11 +176,5 @@ export {
   connectCallbackRedirectUri,
   currentConnectCallbackRedirectUri,
 } from "./connect/redirects";
-export {
-  RepositoryPicker,
-  type RepositoryPickerProps,
-} from "./views/RepositoryPicker";
-export { type RepoCandidate } from "./documents";
 
 export default integrate;
-export { VCS_BRIDGE_MODEL, VCS_BRIDGE_RELATION } from "./data/vcs-bridge";

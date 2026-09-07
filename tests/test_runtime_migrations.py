@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,13 +15,200 @@ from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.state import ModelState, ProjectState
 
 from angee.base.fields import StateField
+from angee.base.impl import ImplClassField
 from angee.compose.migrations import RuntimeMigrations
+from angee.integrate_vcs.runtime_migrations.adopt_vcs_permission_schema import (
+    NEW_PACKAGE,
+    OLD_PACKAGE,
+    adopt_vcs_permission_schema,
+)
+from angee.integrate_vcs.runtime_migrations.delete_integrate_vcs_state import applies as vcs_delete_applies
 from tests.conftest import make_addon, write_addon_manifest
 
 
 def _write_module(path: Path, text: str = "") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def test_vcs_state_delete_waits_for_non_moved_integrate_consumer() -> None:
+    """A generic integrate model can retain the old state just like another app."""
+
+    state = ProjectState()
+    for app_label in ("integrate", "integrate_vcs"):
+        for name in ("VcsBridge", "Repository", "Source", "Template"):
+            state.add_model(
+                ModelState(
+                    app_label=app_label,
+                    name=name,
+                    fields={"id": models.AutoField(primary_key=True)},
+                )
+            )
+    state.add_model(
+        ModelState(
+            app_label="integrate",
+            name="Consumer",
+            fields={
+                "id": models.AutoField(primary_key=True),
+                "source": models.ForeignKey("integrate.Source", on_delete=models.CASCADE),
+            },
+        )
+    )
+
+    assert vcs_delete_applies(state) is False
+
+
+@pytest.mark.django_db
+def test_vcs_permission_schema_adoption_preserves_provenance_target() -> None:
+    """The append-only adoption changes only the package ledger identity."""
+
+    from django.apps import apps
+    from django.contrib.contenttypes.models import ContentType
+    from django.utils import timezone
+    from rebac.models import PackageManagedRecord, SchemaDefinition
+
+    definition = SchemaDefinition.objects.create(resource_type="integrate_vcs/source")
+    target_type = ContentType.objects.get_for_model(SchemaDefinition)
+    record = PackageManagedRecord.objects.create(
+        package=OLD_PACKAGE,
+        external_id="definition:integrate/source",
+        schema_revision=7,
+        target_ct=target_type,
+        target_pk=definition.pk,
+        content_hash="historical-content-hash",
+        no_update=True,
+        last_synced_at=timezone.now(),
+    )
+
+    adopt_vcs_permission_schema(apps, SimpleNamespace(connection=connection))
+
+    record.refresh_from_db()
+    assert (record.package, record.external_id) == (NEW_PACKAGE, "definition:integrate_vcs/source")
+    assert record.target_pk == definition.pk
+    assert record.target_ct_id == target_type.pk
+    assert record.schema_revision == 7
+    assert record.content_hash == "historical-content-hash"
+    assert record.no_update is True
+
+
+@pytest.mark.django_db
+def test_vcs_permission_schema_adoption_rejects_destination_collision() -> None:
+    """A pre-existing destination owner fails before any source record moves."""
+
+    from django.apps import apps
+    from django.contrib.contenttypes.models import ContentType
+    from django.utils import timezone
+    from rebac.models import PackageManagedRecord, SchemaDefinition
+
+    target_type = ContentType.objects.get_for_model(SchemaDefinition)
+    source = SchemaDefinition.objects.create(resource_type="integrate/source")
+    destination = SchemaDefinition.objects.create(resource_type="integrate_vcs/source")
+    common = {
+        "schema_revision": 1,
+        "target_ct": target_type,
+        "content_hash": "hash",
+        "no_update": True,
+        "last_synced_at": timezone.now(),
+    }
+    old_record = PackageManagedRecord.objects.create(
+        package=OLD_PACKAGE,
+        external_id="definition:integrate/source",
+        target_pk=source.pk,
+        **common,
+    )
+    PackageManagedRecord.objects.create(
+        package=NEW_PACKAGE,
+        external_id="definition:integrate_vcs/source",
+        target_pk=destination.pk,
+        **common,
+    )
+
+    with pytest.raises(ImproperlyConfigured, match="destination package records"):
+        adopt_vcs_permission_schema(apps, SimpleNamespace(connection=connection))
+
+    old_record.refresh_from_db()
+    assert (old_record.package, old_record.external_id) == (OLD_PACKAGE, "definition:integrate/source")
+
+
+@pytest.mark.django_db(transaction=True)
+def test_vcs_permission_schema_adoption_survives_reconcile_and_sync() -> None:
+    """The next native reconcile/sync retains schema identities and live grants."""
+
+    from django.apps import apps
+    from django.core.management import call_command
+    from rebac.models import PackageManagedRecord, SchemaDefinition, active_relationship_model
+
+    call_command("rebac", "sync", verbosity=0)
+    definition = SchemaDefinition.objects.get(resource_type="integrate_vcs/source")
+    records = list(
+        PackageManagedRecord.objects.filter(
+            package=NEW_PACKAGE,
+            external_id__startswith="definition:integrate_vcs/source",
+        )
+    ) + list(
+        PackageManagedRecord.objects.filter(
+            package=NEW_PACKAGE,
+            external_id__startswith="relation:integrate_vcs/source#",
+        )
+    ) + list(
+        PackageManagedRecord.objects.filter(
+            package=NEW_PACKAGE,
+            external_id__startswith="permission:integrate_vcs/source#",
+        )
+    )
+    before = {
+        record.external_id: (
+            record.pk,
+            record.target_ct_id,
+            record.target_pk,
+            record.schema_revision,
+            record.no_update,
+        )
+        for record in records
+    }
+    assert before
+    for record in records:
+        record.package = OLD_PACKAGE
+        record.external_id = record.external_id.replace("integrate_vcs/source", "integrate/source", 1)
+        record.save(update_fields=["package", "external_id"])
+
+    active_relationship_model().objects.create(
+        resource_type="integrate_vcs/source",
+        resource_id="source-proof",
+        relation="proof",
+        subject_type="angee/role",
+        subject_id="admin",
+        optional_subject_relation="",
+    )
+
+    adopt_vcs_permission_schema(apps, SimpleNamespace(connection=connection))
+    call_command("reconcile_permissions", verbosity=0)
+    call_command("rebac", "sync", verbosity=0)
+    call_command("rebac", "sync", verbosity=0)
+
+    definition.refresh_from_db()
+    assert definition.resource_type == "integrate_vcs/source"
+    after_records = PackageManagedRecord.objects.filter(
+        package=NEW_PACKAGE,
+        external_id__in=before,
+    )
+    assert {
+        record.external_id: (
+            record.pk,
+            record.target_ct_id,
+            record.target_pk,
+            record.schema_revision,
+            record.no_update,
+        )
+        for record in after_records
+    } == before
+    assert active_relationship_model().objects.filter(
+        resource_type="integrate_vcs/source",
+        resource_id="source-proof",
+        relation="proof",
+        subject_type="angee/role",
+        subject_id="admin",
+    ).exists()
 
 
 @pytest.fixture
@@ -125,7 +313,7 @@ def test_materialize_copies_complete_source_and_attaches_current_leaf(runtime_mi
     assert "old_name" not in state.models["resources", "legacy"].fields
 
 
-def test_applies_false_writes_nothing(runtime_migration_probe) -> None:
+def test_applies_false_writes_nothing(runtime_migration_probe, caplog) -> None:
     materializer, _, source_path, runtime_dir, _ = runtime_migration_probe
     source_path.write_text(
         source_path.read_text(encoding="utf-8").replace(
@@ -135,8 +323,123 @@ def test_applies_false_writes_nothing(runtime_migration_probe) -> None:
     )
     importlib.invalidate_caches()
 
-    assert materializer.materialize() == ()
+    current_apps = MigrationLoader(None, ignore_no_migrations=True).project_state().apps
+    with caplog.at_level(logging.WARNING, logger="angee.compose.migrations"):
+        assert materializer.materialize(apps=current_apps) == ()
     assert not (runtime_dir / "resources" / "migrations" / "0002_rename_legacy.py").exists()
+    assert caplog.record_tuples == [
+        (
+            "angee.compose.migrations",
+            logging.WARNING,
+            "example.demo:rename_legacy (app label resources): runtime migration never became applicable; skipped",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("consumer_cutover", [False, True])
+def test_adopted_table_drop_requires_consumer_cutover(
+    runtime_migration_probe, monkeypatch, settings, caplog, consumer_cutover: bool
+) -> None:
+    """Source FK changes cannot replace the migration that releases old state."""
+
+    _, addon, _, runtime_dir, source_root = runtime_migration_probe
+    _write_module(runtime_dir / "integrate_vcs" / "__init__.py")
+    _write_module(runtime_dir / "integrate_vcs" / "migrations" / "__init__.py")
+    monkeypatch.setitem(settings.MIGRATION_MODULES, "integrate_vcs", f"{runtime_dir.name}.integrate_vcs.migrations")
+    _write_module(
+        runtime_dir / "resources" / "migrations" / "0002_consumer.py",
+        """from django.db import migrations, models
+class Migration(migrations.Migration):
+    dependencies = [("resources", "0001_legacy")]
+    operations = [migrations.CreateModel(name="Consumer", fields=[
+        ("id", models.AutoField(primary_key=True)),
+        ("legacy", models.ForeignKey("resources.Legacy", on_delete=models.CASCADE)),
+    ])]
+""",
+    )
+    _write_module(
+        source_root / "adopt_legacy.py",
+        """from django.db import migrations, models
+def applies(state):
+    return ("integrate_vcs", "legacy") not in state.models
+class Migration(migrations.Migration):
+    dependencies = [("resources", "__latest__")]
+    operations = [migrations.SeparateDatabaseAndState(state_operations=[
+        migrations.CreateModel(name="Legacy", fields=[
+            ("id", models.AutoField(primary_key=True)),
+            ("old_name", models.CharField(max_length=100)),
+        ], options={"db_table": "resources_legacy"}),
+    ])]
+""",
+    )
+    _write_module(
+        source_root / "delete_legacy.py",
+        """from django.db import migrations
+def applies(state):
+    return (
+        ("resources", "legacy") in state.models
+        and ("integrate_vcs", "legacy") in state.models
+        and state.models["resources", "consumer"].fields["legacy"].remote_field.model.lower() == "integrate_vcs.legacy"
+    )
+class Migration(migrations.Migration):
+    dependencies = [("integrate_vcs", "__latest__")]
+    operations = [migrations.SeparateDatabaseAndState(state_operations=[migrations.DeleteModel(name="Legacy")])]
+""",
+    )
+    declarations = [
+        dict(name="delete_legacy", app_label="resources", module="delete_legacy"),
+        dict(name="adopt_legacy", app_label="integrate_vcs", module="adopt_legacy"),
+    ]
+    if consumer_cutover:
+        _write_module(
+            source_root / "consumer_cutover.py",
+            """from django.db import migrations, models
+def applies(state):
+    return (
+        ("integrate_vcs", "legacy") in state.models
+        and state.models["resources", "consumer"].fields["legacy"].remote_field.model.lower() == "resources.legacy"
+    )
+class Migration(migrations.Migration):
+    dependencies = [("integrate_vcs", "__latest__")]
+    operations = [migrations.SeparateDatabaseAndState(state_operations=[migrations.AlterField(
+        model_name="consumer", name="legacy",
+        field=models.ForeignKey("integrate_vcs.Legacy", on_delete=models.CASCADE),
+    )])]
+""",
+        )
+        declarations.append(dict(name="consumer_cutover", app_label="resources", module="consumer_cutover"))
+    write_addon_manifest(addon, migrations=tuple(declarations))
+    importlib.invalidate_caches()
+    materializer = RuntimeMigrations((addon,), runtime_dir=runtime_dir, labels=("resources", "integrate_vcs"))
+
+    current = MigrationLoader(None, ignore_no_migrations=True).project_state()
+    adopted = current.models["resources", "legacy"].clone()
+    adopted.app_label = "integrate_vcs"
+    adopted.options["db_table"] = "resources_legacy"
+    current.add_model(adopted)
+    current.alter_field(
+        "resources", "consumer", "legacy",
+        models.ForeignKey("integrate_vcs.Legacy", on_delete=models.CASCADE),
+        preserve_default=True,
+    )
+    current.remove_model("resources", "legacy")
+
+    if consumer_cutover:
+        written = materializer.materialize(apps=current.apps)
+        assert [path.name for path in written] == [
+            "0001_adopt_legacy.py", "0003_consumer_cutover.py", "0004_delete_legacy.py",
+        ]
+        assert materializer.materialize(apps=current.apps) == ()
+        materializer.check()
+        assert not caplog.records
+    else:
+        with pytest.raises(RuntimeError) as error:
+            materializer.materialize(apps=current.apps)
+        assert "resources.legacy: DeleteModel" in str(error.value)
+        assert "table 'resources_legacy', still owned by integrate_vcs.legacy" in str(error.value)
+        assert "Never-applicable runtime migration declarations: example.demo:delete_legacy" in str(error.value)
+        assert "cutover migration" in str(error.value)
+        assert not (runtime_dir / "integrate_vcs" / "migrations" / "0001_adopt_legacy.py").exists()
 
 
 def test_applicable_declarations_are_planned_sequentially(runtime_migration_probe) -> None:
@@ -177,6 +480,94 @@ class Migration(migrations.Migration):
     assert [path.name for path in written] == ["0002_rename_legacy.py", "0003_add_marker.py"]
     second = (runtime_dir / "resources" / "migrations" / "0003_add_marker.py").read_text(encoding="utf-8")
     assert 'Migration.dependencies.append(("resources", "0002_rename_legacy"))' in second
+
+
+def test_deferred_declaration_is_retried_in_same_materialization(runtime_migration_probe) -> None:
+    """A guard enabled by a later declaration does not require another build."""
+
+    materializer, addon, _, runtime_dir, source_root = runtime_migration_probe
+    _write_module(
+        source_root / "runtime_migrations" / "add_marker.py",
+        """\
+from django.db import migrations, models
+
+
+def applies(project_state):
+    model = project_state.models.get(("resources", "legacy"))
+    return model is not None and "new_name" in model.fields and "marker" not in model.fields
+
+
+class Migration(migrations.Migration):
+    dependencies = []
+    operations = [
+        migrations.AddField(
+            model_name="legacy",
+            name="marker",
+            field=models.BooleanField(default=False),
+        ),
+    ]
+""",
+    )
+    write_addon_manifest(
+        addon,
+        migrations=(
+            dict(name="add_marker", app_label="resources", module="runtime_migrations.add_marker"),
+            dict(name="rename_legacy", app_label="resources", module="runtime_migrations.rename_legacy"),
+        ),
+    )
+    importlib.invalidate_caches()
+
+    written = materializer.materialize()
+
+    assert [path.name for path in written] == ["0002_rename_legacy.py", "0003_add_marker.py"]
+    assert materializer.materialize() == ()
+    state = MigrationLoader(None, ignore_no_migrations=True).project_state()
+    assert "marker" in state.models["resources", "legacy"].fields
+
+
+@pytest.mark.parametrize("dependent_first", [True, False])
+def test_deferred_cross_app_declaration_depends_on_present_planned_leaf(
+    runtime_migration_probe, monkeypatch, settings, dependent_first: bool
+) -> None:
+    """A later-round declaration receives a concrete native cross-app dependency."""
+
+    materializer, addon, _, runtime_dir, source_root = runtime_migration_probe
+    iam_migrations = runtime_dir / "iam" / "migrations"
+    _write_module(runtime_dir / "iam" / "__init__.py")
+    _write_module(iam_migrations / "__init__.py")
+    _write_module(
+        source_root / "runtime_migrations" / "after_flag.py",
+        """from django.db import migrations
+def applies(project_state):
+    return ("iam", "flag") in project_state.models
+class Migration(migrations.Migration):
+    dependencies = []
+    operations = []
+""",
+    )
+    _write_module(
+        source_root / "runtime_migrations" / "add_flag.py",
+        """from django.db import migrations, models
+def applies(project_state):
+    return ("iam", "flag") not in project_state.models
+class Migration(migrations.Migration):
+    dependencies = []
+    operations = [migrations.CreateModel(name="Flag", fields=[("id", models.AutoField(primary_key=True))])]
+""",
+    )
+    dependent = dict(name="after_flag", app_label="resources", module="runtime_migrations.after_flag")
+    enabling = dict(name="add_flag", app_label="iam", module="runtime_migrations.add_flag")
+    write_addon_manifest(addon, migrations=(dependent, enabling) if dependent_first else (enabling, dependent))
+    monkeypatch.setitem(settings.MIGRATION_MODULES, "iam", f"{runtime_dir.name}.iam.migrations")
+    importlib.invalidate_caches()
+    materializer = RuntimeMigrations((addon,), runtime_dir=runtime_dir, labels=("resources", "iam"))
+
+    written = materializer.materialize()
+
+    assert [path.name for path in written] == ["0001_add_flag.py", "0002_after_flag.py"]
+    deferred = (runtime_dir / "resources" / "migrations" / "0002_after_flag.py").read_text()
+    assert 'Migration.dependencies.append(("iam", "0001_add_flag"))' in deferred
+    assert materializer.materialize() == ()
 
 
 def test_latest_dependency_resolves_to_other_runtime_leaf(runtime_migration_probe, monkeypatch, settings) -> None:
@@ -1197,3 +1588,70 @@ def test_validated_plan_render_uses_the_hashed_source_snapshot(runtime_migration
     rendered = materializer._render(plan)
     assert rendered.startswith(expected)
     assert not rendered.startswith("changed after planning")
+
+
+def test_integration_parent_impl_axis_migration_recognizes_exact_state() -> None:
+    """The S4 migration is append-only over exact old/new shapes."""
+
+    from tests.conftest import Integration
+
+    module = importlib.import_module("angee.integrate.runtime_migrations.integration_parent_impl_axis")
+    old = ProjectState()
+    old.add_model(ModelState.from_model(Integration))
+    old.models["integrate", "integration"].fields["impl_class"] = ImplClassField(
+        registry_setting="ANGEE_INTEGRATION_IMPLS",
+        default="none",
+    )
+    old.models["integrate", "integration"].options["constraints"] = [
+        models.UniqueConstraint(
+            fields=("owner", "vendor", "impl_class"),
+            condition=models.Q(kind="Integration"),
+            name=module.CONSTRAINT_NAME,
+        )
+    ]
+
+    assert module.applies(old) is True
+    migrated = module.Migration("probe", "integrate").mutate_state(old)
+    assert module.applies(migrated) is False
+    assert "impl_class" not in migrated.models["integrate", "integration"].fields
+    assert module.CONSTRAINT_NAME not in {
+        constraint.name for constraint in migrated.models["integrate", "integration"].options["constraints"]
+    }
+    assert module.applies(ProjectState()) is False
+
+
+def test_integration_parent_impl_axis_migration_rejects_partial_shapes() -> None:
+    """Field-only, constraint-only, and altered old constraints fail closed."""
+
+    from tests.conftest import Integration
+
+    module = importlib.import_module("angee.integrate.runtime_migrations.integration_parent_impl_axis")
+    old = ProjectState()
+    old.add_model(ModelState.from_model(Integration))
+    old.models["integrate", "integration"].fields["impl_class"] = ImplClassField(
+        registry_setting="ANGEE_INTEGRATION_IMPLS",
+        default="none",
+    )
+    old.models["integrate", "integration"].options["constraints"] = [
+        models.UniqueConstraint(
+            fields=("owner", "vendor", "impl_class"),
+            condition=models.Q(kind="Integration"),
+            name=module.CONSTRAINT_NAME,
+        )
+    ]
+    field_only = old.clone()
+    field_only.models["integrate", "integration"].options["constraints"] = []
+    constraint_only = old.clone()
+    constraint_only.models["integrate", "integration"].fields.pop("impl_class")
+    altered = old.clone()
+    altered.models["integrate", "integration"].options["constraints"] = [
+        models.UniqueConstraint(
+            fields=("owner", "vendor"),
+            condition=models.Q(kind="Integration"),
+            name=module.CONSTRAINT_NAME,
+        )
+    ]
+
+    for state in (field_only, constraint_only, altered):
+        with pytest.raises(ImproperlyConfigured, match="partial Integration transition"):
+            module.applies(state)

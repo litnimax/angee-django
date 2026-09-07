@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { defineAngeeSchemaMetadata } from "./artifact";
+import { defineAngeeSchemaMetadata, resourceOperationTarget } from "./artifact";
 import { testDataResource } from "./testing";
 
 describe("generated subtitle metadata", () => {
@@ -62,8 +62,7 @@ describe("generated resource wire contract", () => {
       roots: { list: "notes", customRoot: "notes_custom" },
       fields: [{
         name: "status", kind: "enum", values: [{ value: "OPEN", description: null }],
-        readable: true, filterable: true, sortable: true, aggregatable: false,
-        groupable: true, creatable: true, updatable: true, requiredOnCreate: false,
+        readable: true, aggregatable: false, creatable: true, updatable: true, requiredOnCreate: false,
         relationModelLabel: null, widget: null,
       }],
       futureResourceFact: { enabled: true },
@@ -73,7 +72,7 @@ describe("generated resource wire contract", () => {
   });
 
   test.each([
-    { relationAxes: [{ field: "owner", modelLabel: 42, publicIdField: "id" }] },
+    { query: { identity: { field: 42 } } },
     { aggregateMeasures: [{ op: 42 }] },
     { linesResource: { field: "lines", modelLabel: "notes.Line", fields: [{ name: "body", kind: "scalar", readable: "yes" }] } },
   ])("rejects malformed nested resource facts: %j", (patch) => {
@@ -85,5 +84,13 @@ describe("generated resource wire contract", () => {
     expect(defineAngeeSchemaMetadata({})).toEqual({});
     expect(defineAngeeSchemaMetadata({ angee: {} })).toEqual({ angee: {} });
     expect(defineAngeeSchemaMetadata({ angee: null })).toEqual({ angee: null });
+  });
+});
+
+
+test("resource operation targets retain the canonical live model identity", () => {
+  const resource = testDataResource("messaging.Message", { roots: { groups: "messages_groups" } });
+  expect(resourceOperationTarget(resource, "groups")).toEqual({
+    dataProviderName: "console", root: "messages_groups", modelLabel: "messaging.Message",
   });
 });

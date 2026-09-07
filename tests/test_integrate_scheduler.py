@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 from django.db import connection, transaction
+from django.test import override_settings
 from django.utils import timezone
 from rebac import system_context
 
@@ -19,7 +20,7 @@ from angee.integrate import tasks as integrate_tasks
 from angee.integrate.locks import bridge_advisory_lock
 from angee.integrate.models import Bridge, IntegrationLifecycle, IntegrationRuntimeStatus
 from angee.integrate.registry import bridge_models
-from angee.integrate.scheduler import enqueue_due_bridges, run_due_bridges
+from angee.integrate.scheduler import enqueue_due_bridges
 from angee.integrate.sync import BridgeProgressReporter, current_bridge_progress
 from tests.conftest import (
     IAM_CONNECTION_TEST_MODELS,
@@ -79,6 +80,39 @@ class SchedulerBridge(Bridge, Integration):
         """Stop the fixture live subscription."""
 
 
+def _enqueue_and_run_due(*, now: datetime) -> dict[str, int]:
+    """Drive the production enqueue path with an in-process test worker."""
+
+    ran = 0
+    errors = 0
+    original = integrate_scheduler.queue_bridge_sync
+
+    def run_queued(bridge: SchedulerBridge, *, now: datetime | None = None, persist: bool = True) -> None:
+        nonlocal ran, errors
+        assert persist is False
+        assert now is not None
+        try:
+            result = integrate_sync_runner.run_bridge_sync_job(
+                bridge._meta.label_lower,
+                bridge.pk,
+                now.isoformat(),
+                require_queue_token=True,
+            )
+        except Exception:
+            ran += 1
+            errors += 1
+        else:
+            if not result.get("skipped"):
+                ran += 1
+
+    integrate_scheduler.queue_bridge_sync = run_queued
+    try:
+        enqueue_due_bridges(now=now)
+    finally:
+        integrate_scheduler.queue_bridge_sync = original
+    return {"ran": ran, "errors": errors}
+
+
 @pytest.fixture(autouse=True)
 def _scan_only_the_fixture_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     """Scope the scheduler's model scan to this module's fixture bridge.
@@ -119,7 +153,7 @@ def scheduler_tables(transactional_db: Any) -> Iterator[None]:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_run_due_bridges_runs_only_due_rows(scheduler_tables: None) -> None:
+def test_enqueued_due_bridges_run_only_due_rows(scheduler_tables: None) -> None:
     """The scheduler runs due rows and skips future or unscheduled rows."""
 
     del scheduler_tables
@@ -144,7 +178,7 @@ def test_run_due_bridges_runs_only_due_rows(scheduler_tables: None) -> None:
             next_sync_at=None,
         )
 
-    result = run_due_bridges(now=now)
+    result = _enqueue_and_run_due(now=now)
 
     assert result == {"ran": 1, "errors": 0}
     due.refresh_from_db()
@@ -156,7 +190,7 @@ def test_run_due_bridges_runs_only_due_rows(scheduler_tables: None) -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_run_due_bridges_persists_success_telemetry(scheduler_tables: None) -> None:
+def test_enqueued_due_bridge_persists_success_telemetry(scheduler_tables: None) -> None:
     """Successful syncs persist scheduler telemetry, cursor, count, and next run."""
 
     del scheduler_tables
@@ -171,7 +205,7 @@ def test_run_due_bridges_persists_success_telemetry(scheduler_tables: None) -> N
         )
         integration = Integration.objects.get(pk=bridge.pk)
 
-    result = run_due_bridges(now=now)
+    result = _enqueue_and_run_due(now=now)
 
     assert result == {"ran": 1, "errors": 0}
     bridge.refresh_from_db()
@@ -193,7 +227,7 @@ def test_run_due_bridges_persists_success_telemetry(scheduler_tables: None) -> N
 
 
 @pytest.mark.django_db(transaction=True)
-def test_run_due_bridges_records_errors_on_integration_runtime_status(scheduler_tables: None) -> None:
+def test_enqueued_due_bridge_records_errors_on_integration_runtime_status(scheduler_tables: None) -> None:
     """Failing syncs record bridge errors, reschedule, and push integration runtime status."""
 
     del scheduler_tables
@@ -208,7 +242,7 @@ def test_run_due_bridges_records_errors_on_integration_runtime_status(scheduler_
         )
         integration = Integration.objects.get(pk=bridge.pk)
 
-    result = run_due_bridges(now=now)
+    result = _enqueue_and_run_due(now=now)
 
     assert result == {"ran": 1, "errors": 1}
     bridge.refresh_from_db()
@@ -216,20 +250,20 @@ def test_run_due_bridges_records_errors_on_integration_runtime_status(scheduler_
     assert bridge.last_sync_started_at == now
     assert bridge.last_sync_status == "error"
     assert bridge.sync_stage == Bridge.SyncStage.FAILED
-    assert bridge.sync_error == "RuntimeError: vendor unavailable"
+    assert bridge.sync_error == "Integration operation failed."
     assert bridge.sync_progress["stage"] == Bridge.SyncStage.FAILED
-    assert bridge.sync_progress["error"] == "RuntimeError: vendor unavailable"
+    assert bridge.sync_progress["error"] == "Integration operation failed."
     assert bridge.next_sync_at == now + timedelta(seconds=17)
     assert integration.lifecycle == IntegrationLifecycle.CONNECTED
     assert integration.runtime_status == IntegrationRuntimeStatus.ERROR
     assert integration.last_used_status == "error"
-    assert integration.last_error == "RuntimeError: vendor unavailable"
+    assert integration.last_error == "Integration operation failed."
     assert integration.last_error_at is not None
     assert integration.last_used_at is not None
 
 
 @pytest.mark.django_db(transaction=True)
-def test_run_due_bridges_success_recovers_bridge_and_integration_runtime_status(scheduler_tables: None) -> None:
+def test_enqueued_due_bridge_success_recovers_bridge_and_integration_runtime_status(scheduler_tables: None) -> None:
     """A healthy sync after an error clears the integration runtime status."""
 
     del scheduler_tables
@@ -244,7 +278,7 @@ def test_run_due_bridges_success_recovers_bridge_and_integration_runtime_status(
         )
         integration = Integration.objects.get(pk=bridge.pk)
 
-    error_result = run_due_bridges(now=first_now)
+    error_result = _enqueue_and_run_due(now=first_now)
 
     assert error_result == {"ran": 1, "errors": 1}
     bridge.refresh_from_db()
@@ -257,7 +291,7 @@ def test_run_due_bridges_success_recovers_bridge_and_integration_runtime_status(
         bridge.next_sync_at = second_now
         bridge.save(update_fields=["config", "next_sync_at", "updated_at"])
 
-    success_result = run_due_bridges(now=second_now)
+    success_result = _enqueue_and_run_due(now=second_now)
 
     assert success_result == {"ran": 1, "errors": 0}
     bridge.refresh_from_db()
@@ -286,7 +320,7 @@ def test_bridge_progress_reporter_persists_progress_payload(scheduler_tables: No
             next_sync_at=now,
         )
 
-    result = run_due_bridges(now=now)
+    result = _enqueue_and_run_due(now=now)
 
     assert result == {"ran": 1, "errors": 0}
     bridge.refresh_from_db()
@@ -297,6 +331,7 @@ def test_bridge_progress_reporter_persists_progress_payload(scheduler_tables: No
 
 
 @pytest.mark.django_db(transaction=True)
+@override_settings(ANGEE_TASK_LOCK_BACKEND="angee.jobs.locks.LocalLockBackend")
 def test_declined_sync_run_releases_its_queue_claim(scheduler_tables: None) -> None:
     """A run that cannot take the lock clears its own claim, so recovery stops.
 
@@ -313,9 +348,7 @@ def test_declined_sync_run_releases_its_queue_claim(scheduler_tables: None) -> N
 
     # Hold the lock the way a live session does, then let a sync run decline.
     with bridge_advisory_lock(bridge):
-        result = integrate_sync_runner.run_bridge_sync_job(
-            bridge._meta.label_lower, bridge.pk, now.isoformat()
-        )
+        result = integrate_sync_runner.run_bridge_sync_job(bridge._meta.label_lower, bridge.pk, now.isoformat())
 
     assert result == {"ok": True, "items": 0, "skipped": True}
     with system_context(reason="test integrate scheduler verify"):
@@ -408,6 +441,7 @@ def test_progress_report_during_queued_stage_keeps_the_queue_marker(scheduler_ta
 
 
 @pytest.mark.django_db(transaction=True)
+@override_settings(ANGEE_TASK_LOCK_BACKEND="angee.jobs.locks.LocalLockBackend")
 def test_bridge_is_syncing_uses_live_lock_state(scheduler_tables: None) -> None:
     """The live lock is separate from durable stage telemetry."""
 
@@ -446,6 +480,7 @@ def _cross_process_locks() -> Iterator[None]:
 
 
 @pytest.mark.django_db(transaction=True)
+@override_settings(ANGEE_TASK_LOCK_BACKEND="angee.jobs.locks.LocalLockBackend")
 def test_effective_sync_stage_reconciles_stale_records_against_the_lock(scheduler_tables: None) -> None:
     """A live-ish persisted stage without the live lock reads as FAILED.
 
@@ -757,7 +792,7 @@ def test_scheduler_claims_a_row_before_running_it(
         )
     monkeypatch.setattr(SchedulerBridge, "sync", observing_sync)
 
-    counters = run_due_bridges(now=now)
+    counters = _enqueue_and_run_due(now=now)
 
     assert counters == {"ran": 1, "errors": 0}
     assert observed == [now + timedelta(seconds=120)]

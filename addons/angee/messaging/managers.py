@@ -494,7 +494,7 @@ class ThreadQuerySet(AngeeQuerySet[Any]):
         owner-scoped generic ``threads`` list, aggregate, or by-pk lookup.
         """
 
-        return cast(ThreadQuerySet, self.filter(attachments__isnull=True))
+        return cast(ThreadQuerySet, self.exclude(attachments__isnull=False))
 
     def for_channel(self, channel: Any) -> ThreadQuerySet:
         """Return the threads that belong to ``channel`` — the purge-scope predicate.
@@ -696,7 +696,7 @@ class ThreadManager(AngeeManager.from_queryset(ThreadQuerySet)):  # type: ignore
             return
         message_model = apps.get_model("messaging", "Message")
         # FOLLOW-UP: give messaging/thread + messaging/message a channel/integration-derived
-        # REBAC `delete` arm (mirror integrate/vcs_bridge) so this elevated cascade is
+        # REBAC `delete` arm (mirror integrate_vcs/vcs_bridge) so this elevated cascade is
         # authorized by schema, not the sync co-ownership invariant. Non-exploitable today
         # (the teardown runs under system_context behind the channel `delete` preflight).
         with system_context(reason="messaging.channel.teardown"), mute_changes(), transaction.atomic():
@@ -1867,6 +1867,68 @@ class MessageQuerySet(AngeeQuerySet[Any]):
                 )
             ),
         )
+
+    def sender_name_expression(self) -> models.Expression:
+        """Correlate the actor-readable sender identity without multiplying rows."""
+
+        handle_model = apps.get_model("parties", "Handle")
+        actor = self.actor() or current_actor()
+        handles = handle_model.objects.with_actor(actor) if actor is not None else handle_model.objects.all()
+        sender_name = handles.with_sender_name().filter(pk=models.OuterRef("sender_id")).values("_sender_name")[:1]
+        return Coalesce(models.Subquery(sender_name), models.Value(""), output_field=models.TextField())
+
+    def with_sender_name(self) -> MessageQuerySet:
+        """Prepare the actor-visible sender alias for explicit inbox ordering."""
+
+        return self.alias(_sender_name=self.sender_name_expression())
+
+    def thread_title_expression(self) -> models.Expression:
+        """Correlate the title from the actor-readable thread queryset."""
+
+        thread_model = apps.get_model("messaging", "Thread")
+        actor = self.actor() or current_actor()
+        threads = thread_model.objects.with_actor(actor).scoped() if actor is not None else thread_model.objects.none()
+        title = threads.filter(pk=models.OuterRef("thread_id")).values("title__text")[:1]
+        return Coalesce(
+            models.Subquery(title),
+            models.Value(""),
+            output_field=models.TextField(),
+        )
+
+    def with_thread_title(self) -> MessageQuerySet:
+        """Prepare the actor-visible thread title for explicit inbox ordering."""
+
+        return self.alias(_thread_title=self.thread_title_expression())
+
+    def channel_vendor_name_expression(self) -> models.Expression:
+        """Correlate the vendor label through readable Integration and Vendor sets.
+
+        Keep scalar projection inside the scoped subquery: the outer message
+        may also materialize its channel through ``rebac_select_related``.
+        """
+
+        integration_model = apps.get_model("integrate", "Integration")
+        vendor_model = apps.get_model("integrate", "Vendor")
+        actor = self.actor() or current_actor()
+        integrations = (
+            integration_model.objects.with_actor(actor).scoped()
+            if actor is not None
+            else integration_model.objects.none()
+        )
+        vendors = vendor_model.objects.with_actor(actor).scoped() if actor is not None else vendor_model.objects.none()
+        vendor_name = integrations.filter(
+            pk=models.OuterRef("channel_id"), vendor_id__in=vendors.values("pk")
+        ).values("vendor__display_name")[:1]
+        return Coalesce(
+            models.Subquery(vendor_name),
+            models.Value(""),
+            output_field=models.TextField(),
+        )
+
+    def with_channel_vendor_name(self) -> MessageQuerySet:
+        """Prepare the actor-visible channel vendor for explicit inbox ordering."""
+
+        return self.alias(_channel_vendor_name=self.channel_vendor_name_expression())
 
     def with_external_ids(self, external_ids: tuple[str, ...] | list[str]) -> MessageQuerySet:
         """Filter to exact external ids through the ``MD5(external_id)`` identity index.

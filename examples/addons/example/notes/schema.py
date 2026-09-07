@@ -5,14 +5,13 @@ from __future__ import annotations
 import strawberry
 import strawberry_django
 from django.apps import apps
-from django.db import models
 from strawberry import auto
 
 from angee.data.metadata import DataResourceSubtitleMetadata
 from angee.graphql.data import hasura_model_resource
 from angee.graphql.deletion import DeletePreview, attach_delete_preview_metadata, delete_by_public_id
 from angee.graphql.ids import PublicID
-from angee.graphql.node import AngeeNode
+from angee.graphql.node import NODE_DISPLAY_NAME_DESCRIPTION, AngeeNode
 from angee.graphql.revisions import revisions
 from angee.graphql.subscriptions import changes
 from angee.graphql.writes import write_queryset
@@ -25,6 +24,9 @@ Note = apps.get_model("notes", "Note")
 class NoteType(AuthoredRefMixin, AngeeNode):
     """GraphQL projection of a note."""
 
+    display_name: str = strawberry_django.field(
+        resolver=AngeeNode.display_name, only=["title"], description=NODE_DISPLAY_NAME_DESCRIPTION
+    )
     title: auto
     body: auto
     status: auto
@@ -34,20 +36,6 @@ class NoteType(AuthoredRefMixin, AngeeNode):
     created_at: auto
     updated_at: auto
     word_count: auto
-
-
-def _note_queryset(info: strawberry.Info) -> models.QuerySet[Note]:
-    """Return the actor-scoped note queryset for row reads."""
-
-    del info
-    return Note.objects.all()
-
-
-def _note_aggregate_queryset(info: strawberry.Info) -> models.QuerySet[Note]:
-    """Return the row-scoped queryset safe for aggregate/group math."""
-
-    del info
-    return Note.objects.all().scoped_for_aggregate()
 
 
 @strawberry.type
@@ -83,8 +71,6 @@ _NOTE_RESOURCE = hasura_model_resource(
     aggregatable=["id", "word_count"],
     groupable=["status", "tags", "updated_at"],
     writable=["title", "body", "status", "tags", "is_starred", "reminder_at"],
-    get_queryset=_note_queryset,
-    get_aggregate_queryset=_note_aggregate_queryset,
     id_column="sqid",
     subtitle=DataResourceSubtitleMetadata(word_count="word_count"),
 )

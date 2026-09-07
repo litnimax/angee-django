@@ -5,16 +5,20 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import logging
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 
 from django.apps import AppConfig
+from django.apps.registry import Apps
 from django.db.migrations import Migration
 from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.loader import MigrationLoader
+from django.db.migrations.operations.models import DeleteModel
+from django.db.migrations.state import ProjectState
 
 from angee.addons import addon_manifest
 from angee.fs import write_atomic
@@ -22,6 +26,7 @@ from angee.fs import write_atomic
 MATERIALIZED_FOOTER = "# ANGEE MATERIALIZED MIGRATION - DO NOT EDIT"
 ORIGIN_ATTR = "angee_origin"
 SOURCE_SHA256_ATTR = "angee_source_sha256"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,8 +59,12 @@ class RuntimeMigrations:
         self.runtime_dir = runtime_dir
         self.labels = frozenset(labels)
 
-    def plan(self) -> tuple[RuntimeMigrationPlan, ...]:
-        """Return every applicable write after validating the complete graph."""
+    def plan(self, *, apps: Apps | None = None) -> tuple[RuntimeMigrationPlan, ...]:
+        """Plan applicable writes, guarding adopted tables against the supplied apps.
+
+        Never-applicable declarations warn after the fixed point. With a current
+        model registry, also reject autodetected drops of tables it still owns.
+        """
 
         loader = MigrationLoader(None, ignore_no_migrations=True)
         existing = self._existing_migrations(loader)
@@ -65,6 +74,7 @@ class RuntimeMigrations:
         leaves: dict[str, tuple[str, str] | None] = {}
         declared_origins: set[str] = set()
 
+        declarations: list[tuple[AppConfig, Mapping[str, Any]]] = []
         for addon in self.addons:
             for declaration in self._declarations(addon):
                 origin = f"{addon.name}:{declaration['name']}"
@@ -72,6 +82,16 @@ class RuntimeMigrations:
                     raise RuntimeError(f"duplicate addon runtime migration origin {origin}")
                 declared_origins.add(origin)
                 self._validate_declaration(declaration, origin)
+                declarations.append((addon, declaration))
+
+        pending = declarations
+        round_number = 0
+        while pending:
+            remaining: list[tuple[AppConfig, Mapping[str, Any]]] = []
+            progressed = False
+            evaluation_state = state.clone()
+            for addon, declaration in pending:
+                origin = f"{addon.name}:{declaration['name']}"
                 module = self._source_module(addon, declaration, origin)
                 migration_class = self._migration_class(module, origin)
                 if migration_class.replaces:
@@ -95,12 +115,13 @@ class RuntimeMigrations:
                 if not callable(applies):
                     raise RuntimeError(f"{origin}: source module must define applies(project_state)")
                 try:
-                    applicable = applies(state.clone())
+                    applicable = applies(evaluation_state.clone())
                 except Exception as error:
                     raise RuntimeError(f"{origin}: applies(project_state) failed") from error
                 if not isinstance(applicable, bool):
                     raise RuntimeError(f"{origin}: applies(project_state) must return bool")
                 if not applicable:
+                    remaining.append((addon, declaration))
                     continue
 
                 if declaration["app_label"] not in next_numbers:
@@ -121,6 +142,13 @@ class RuntimeMigrations:
                     current_app=declaration["app_label"],
                     origin=origin,
                 )
+                if round_number:
+                    deferred_dependencies = tuple(
+                        node
+                        for label, node in leaves.items()
+                        if label != declaration["app_label"] and node is not None and node not in dependencies
+                    )
+                    dependencies += deferred_dependencies
                 if target_leaf is not None and target_leaf not in dependencies:
                     dependencies += (target_leaf,)
                 output_path = self.runtime_dir / declaration["app_label"] / "migrations" / f"{name}.py"
@@ -161,6 +189,24 @@ class RuntimeMigrations:
                     raise RuntimeError(f"{origin}: migration state transition is invalid") from error
                 leaves[declaration["app_label"]] = node
                 plans.append(plan)
+                progressed = True
+
+            pending = remaining
+            if not progressed:
+                break
+            round_number += 1
+
+        skipped_origins = []
+        for addon, declaration in pending:
+            origin = f"{addon.name}:{declaration['name']}"
+            skipped_origins.append(origin)
+            logger.warning(
+                "%s (app label %s): runtime migration never became applicable; skipped",
+                origin,
+                declaration["app_label"],
+            )
+        if apps is not None:
+            self._check_autodetected_drops(loader, state, ProjectState.from_apps(apps), skipped_origins)
 
         return tuple(plans)
 
@@ -172,10 +218,10 @@ class RuntimeMigrations:
             origins = ", ".join(plan.origin for plan in plans)
             raise RuntimeError(f"pending addon runtime migration {origins}")
 
-    def materialize(self) -> tuple[Path, ...]:
-        """Copy every applicable source migration after the plan validates."""
+    def materialize(self, *, apps: Apps | None = None) -> tuple[Path, ...]:
+        """Copy applicable sources after planning and optional current-app drop checks."""
 
-        plans = self.plan()
+        plans = self.plan(apps=apps)
         rendered = tuple((plan, self._render(plan)) for plan in plans)
         for plan, source in rendered:
             write_atomic(plan.output_path, source)
@@ -183,6 +229,43 @@ class RuntimeMigrations:
         if plans:
             MigrationLoader(None, ignore_no_migrations=True)
         return tuple(plan.output_path for plan in plans)
+
+    @staticmethod
+    def _check_autodetected_drops(
+        loader: MigrationLoader,
+        from_state: ProjectState,
+        to_state: ProjectState,
+        skipped_origins: list[str],
+    ) -> None:
+        """Refuse Django model deletions whose physical tables still have owners."""
+
+        changes = MigrationAutodetector(from_state, to_state).changes(graph=loader.graph)
+        table_owners: dict[str, list[str]] = {}
+        for model in to_state.apps.get_models(include_swapped=True):
+            table_owners.setdefault(model._meta.db_table, []).append(model._meta.label_lower)
+        drops = []
+        for app_label, migrations in sorted(changes.items()):
+            for migration in migrations:
+                for operation in migration.operations:
+                    if not isinstance(operation, DeleteModel):
+                        continue
+                    model = from_state.apps.get_model(app_label, operation.name)
+                    if model._meta.proxy or not model._meta.managed or model._meta.swapped:
+                        continue
+                    table = model._meta.db_table
+                    owners = sorted(owner for owner in table_owners.get(table, ()) if owner != model._meta.label_lower)
+                    if owners:
+                        drops.append(
+                            f"{model._meta.label_lower}: DeleteModel would drop table {table!r}, "
+                            f"still owned by {', '.join(owners)}"
+                        )
+        if drops:
+            skipped = ", ".join(skipped_origins) or "none"
+            raise RuntimeError(
+                "unsafe autodetected model deletion: " + "; ".join(drops)
+                + f". Never-applicable runtime migration declarations: {skipped}. "
+                "Declare the missing consumer cutover migration before running makemigrations."
+            )
 
     @staticmethod
     def _next_number(loader: MigrationLoader, app_label: str) -> int:
@@ -292,13 +375,15 @@ class RuntimeMigrations:
 
         if isinstance(raw, str | bytes | Mapping | set | frozenset):
             raise RuntimeError(f"{origin}: invalid Django {kind} {raw!r}")
+        if not isinstance(raw, Iterable):
+            raise RuntimeError(f"{origin}: invalid Django {kind} {raw!r}")
         try:
-            node = tuple(raw)
+            node: tuple[object, ...] = tuple(raw)
         except TypeError as error:
             raise RuntimeError(f"{origin}: invalid Django {kind} {raw!r}") from error
         if len(node) != 2 or not all(isinstance(value, str) for value in node):
             raise RuntimeError(f"{origin}: invalid Django {kind} {raw!r}")
-        return node[0], node[1]
+        return cast("tuple[str, str]", node)
 
     @staticmethod
     def _declarations(addon: AppConfig) -> Iterator[Mapping[str, Any]]:

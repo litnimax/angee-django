@@ -1,12 +1,17 @@
 import { describe, expect, test } from "vitest";
 import type {
+  DataResourceFieldMetadata,
   DataResourceMetadata,
+  ModelFieldMetadata,
   ModelMetadata,
   Row,
-  SchemaFieldMetadata,
 } from "@angee/metadata";
-import { RelationRepresentationError, rowValueAtPath } from "@angee/metadata";
-import { testDataResource } from "@angee/metadata/testing";
+import {
+  RelationRepresentationError,
+  rowValueAtPath,
+  schemaFieldMetadataFromDataResources,
+} from "@angee/metadata";
+import { testDataResource, testResourceQuery, testQueryField, testQueryAxis } from "@angee/metadata/testing";
 import { refineFieldsFromPaths } from "@angee/refine";
 
 import {
@@ -22,125 +27,52 @@ import {
   relationFieldInfo,
   relationListFieldInfo,
 } from "./model-metadata-defaults";
-import { RESOURCE_VIEW_GROUP_GRANULARITIES } from "./resource-view-model";
+const DATE_EXTRACTIONS = ["day", "week", "month", "quarter", "year"];
 import { requestedFieldPaths } from "./resource-view-codecs";
 import type { ColumnDescriptor, FieldDescriptor } from "../page";
 
-const NOTE_METADATA: ModelMetadata = {
-  typeName: "NoteType",
-  recordRepresentation: "title",
+const STATUS_VALUES = [{ value: "DRAFT", description: "Draft" }, { value: "IN_REVIEW" }, { value: "ACTIVE" }];
+const dateAxis = (field: string) => testQueryAxis(field, {
+  kind: "date", server: { input: field.toUpperCase(), key: field },
+  extractions: DATE_EXTRACTIONS.map((name) => ({ name, input: name.toUpperCase(), key: `${field}_${name}` })),
+});
+const NOTE_METADATA = canonicalModel({
+  title: { name: "title", kind: "scalar", scalar: "String" },
+  status: { name: "status", kind: "enum", values: STATUS_VALUES },
+  isStarred: { name: "isStarred", kind: "scalar", scalar: "Boolean" },
+  createdAt: { name: "createdAt", kind: "scalar", scalar: "DateTime" },
+  updatedAt: { name: "updatedAt", kind: "scalar", scalar: "DateTime" },
+  wordCount: { name: "wordCount", kind: "scalar", scalar: "Int" },
+}, testDataResource("notes.Note", {
+  schemaName: "public", recordRepresentation: "title",
+  query: testResourceQuery({ fields: {
+    title: testQueryField("title", { filter: { field: "title", scalar: "String", values: [], operators: ["contains", "iContains", "isNull"] }, sort: { field: "title" } }),
+    status: testQueryField("status", { kind: "enum", values: STATUS_VALUES, filter: { field: "status", scalar: "Enum", values: STATUS_VALUES, operators: ["exact", "inList", "isNull"] } }),
+    isStarred: testQueryField("isStarred", { scalar: "Boolean", filter: { field: "isStarred", scalar: "Boolean", values: [], operators: ["exact", "isNull"] } }),
+    updatedAt: testQueryField("updatedAt", { scalar: "DateTime", filter: { field: "updatedAt", scalar: "DateTime", values: [], operators: ["gte", "lt", "isNull"] }, sort: { field: "updatedAt" } }),
+    createdAt: testQueryField("createdAt", { scalar: "DateTime", filter: null, sort: { field: "createdAt" } }),
+    wordCount: testQueryField("wordCount", { scalar: "Int", filter: null, sort: { field: "wordCount" } }),
+  }, axes: {
+    status: testQueryAxis("status", { server: { input: "STATUS", key: "status" } }),
+    updatedAt: dateAxis("updatedAt"), createdAt: dateAxis("createdAt"),
+  } }),
+}));
+const MESSAGE_METADATA = canonicalModel({
+  sender: { name: "sender", kind: "relation", relationModelLabel: "messaging.Handle", relationObject: true },
+  status: { name: "status", kind: "enum", values: [{ value: "SENT" }] },
+}, testDataResource("messaging.Message", { query: testResourceQuery({
   fields: {
-    title: { name: "title", kind: "scalar", scalar: "String", label: "Title" },
-    status: {
-      name: "status",
-      kind: "enum",
-      enumName: "NoteStatus",
-      label: "Status",
-      values: [
-        { value: "DRAFT", description: "Draft" },
-        { value: "IN_REVIEW" },
-        { value: "ACTIVE" },
-      ],
-    },
-    isStarred: { name: "isStarred", kind: "scalar", scalar: "Boolean" },
-    createdAt: { name: "createdAt", kind: "scalar", scalar: "DateTime" },
-    updatedAt: { name: "updatedAt", kind: "scalar", scalar: "DateTime" },
-    wordCount: { name: "wordCount", kind: "scalar", scalar: "Int" },
+    sender: testQueryField("sender", { kind: "relation", scalar: "ID", relation: { model: "messaging.Handle", identityPath: "sender.id", labelPath: "sender.display_name" } }),
+    status: testQueryField("status"),
+  }, axes: {
+    sender: testQueryAxis("sender", {
+      kind: "relation", identityPath: "sender.id", labelPath: "sender.display_name", paths: ["sender.id", "sender.display_name"],
+      server: { input: "SENDER", key: "sender_id", labelInput: "SENDER__DISPLAY_NAME", labelKey: "sender__display_name" },
+      drill: { kind: "identity", field: "sender", valueKey: "sender_id", nullMode: "isNull", valueMap: [] },
+    }),
+    status: testQueryAxis("status", { server: { input: "STATUS", key: "status" } }),
   },
-  resource: {
-    schemaName: "public",
-    modelLabel: "notes.Note",
-    appLabel: "notes",
-    modelName: "note",
-    publicIdField: "sqid",
-    roots: {},
-    typeNames: {
-      node: "NoteType",
-    },
-    capabilities: ["list", "filter", "order", "aggregate", "groups"],
-    filterFields: ["status", "isStarred", "title", "updatedAt"],
-    orderFields: ["title", "status", "updatedAt", "createdAt", "wordCount"],
-    aggregateFields: ["id", "wordCount"],
-    groupByFields: ["status", "updatedAt", "createdAt"],
-    relationAxes: [],
-  },
-};
-
-// A resource that groups by a relation and carries the related row's name along
-// as that relation's label axis — the shape every `x`/`x__display_name` groupable
-// pair emits.
-const MESSAGE_METADATA: ModelMetadata = {
-  typeName: "MessageType",
-  fields: {
-    sender: {
-      name: "sender",
-      kind: "relation",
-      label: "Sender",
-      relationFilter: {
-        field: "sender",
-        mode: "lookup",
-        lookup: "sqid",
-        aggregateKey: "sender_id",
-        labelKey: "sender__display_name",
-      },
-    },
-    status: { name: "status", kind: "enum", values: [{ value: "SENT" }] },
-  },
-  resource: {
-    schemaName: "public",
-    modelLabel: "messaging.Message",
-    appLabel: "messaging",
-    modelName: "message",
-    publicIdField: "sqid",
-    roots: {},
-    typeNames: { node: "MessageType" },
-    capabilities: ["list", "aggregate", "groups"],
-    filterFields: ["sender", "status"],
-    orderFields: ["sentAt"],
-    aggregateFields: ["id"],
-    groupByFields: ["sender", "sender__display_name", "status"],
-    groupDimensions: [
-      {
-        field: "sender",
-        input: "SENDER",
-        key: "sender_id",
-        kind: "relation",
-        scalar: "ID",
-        filter: {
-          kind: "equality",
-          field: "sender",
-          valueKey: "sender_id",
-          lookup: "sqid",
-        },
-      },
-      // The backend declares no bucket filter for a label axis: it is not a
-      // dimension a caller may group by on its own.
-      {
-        field: "sender__display_name",
-        input: "SENDER__DISPLAY_NAME",
-        key: "sender__display_name",
-        kind: "column",
-        scalar: "String",
-      },
-      {
-        field: "status",
-        input: "STATUS",
-        key: "status",
-        kind: "column",
-        scalar: "String",
-        filter: { kind: "equality", field: "status", valueKey: "status" },
-      },
-    ],
-    relationAxes: [
-      {
-        field: "sender",
-        modelLabel: "messaging.Handle",
-        publicIdField: "sqid",
-        labelAxis: "sender__display_name",
-      },
-    ],
-  },
-};
+}) }));
 
 // The widget options enumOptions derives: SDL description, else humanized value.
 const STATUS_OPTIONS = [
@@ -202,21 +134,17 @@ describe("resource metadata defaults", () => {
   });
 
   test("resolves the default widget for a bare field from its SDL kind/scalar", () => {
-    const policyMetadata: ModelMetadata = {
-      typeName: "OAuthClientType",
-      fields: {
+    const policyMetadata = canonicalModel({
         isEnabled: { name: "isEnabled", kind: "scalar", scalar: "Boolean" },
         environment: { name: "environment", kind: "scalar", scalar: "String" },
         status: {
           name: "status",
           kind: "enum",
-          enumName: "ConfigState",
           values: [{ value: "READY" }],
         },
         defaultScopes: { name: "defaultScopes", kind: "list", scalar: "String" },
-        vendor: { name: "vendor", kind: "relation", relationTarget: "VendorType" },
-      },
-    };
+        vendor: { name: "vendor", kind: "relation", relationModelLabel: "Vendor" },
+      }, testDataResource("policies.Policy"));
     const resolved = fieldsWithMetadataDefaults(
       [
         { name: "isEnabled" },
@@ -241,7 +169,7 @@ describe("resource metadata defaults", () => {
     const resolvedColumns = columnsWithMetadataDefaults(columns, NOTE_METADATA);
     const filterFields = buildFilterFields(resolvedColumns, [], NOTE_METADATA);
 
-    expect(filterFields).toEqual([
+    expect(filterFields).toMatchObject([
       {
         id: "title",
         field: "title",
@@ -268,6 +196,9 @@ describe("resource metadata defaults", () => {
         type: "boolean",
       },
     ]);
+
+    expect(filterFields.find((field) => field.id === "title")?.operators).toEqual(["contains", "iContains", "isNull", "isNotNull"]);
+    expect(filterFields.find((field) => field.id === "status")?.operators).toEqual(["exact", "inList", "isNull", "isNotNull"]);
 
     expect(buildFilterOptions(resolvedColumns, [], filterFields)).toEqual([
       {
@@ -299,49 +230,24 @@ describe("resource metadata defaults", () => {
       },
       {
         id: "updatedAt",
-        label: "Updated",
+        label: "Updated At",
         group: { field: "updatedAt", granularity: "day" },
         type: "date",
-        granularities: RESOURCE_VIEW_GROUP_GRANULARITIES,
+        granularities: DATE_EXTRACTIONS,
       },
       {
         id: "createdAt",
         label: "Created",
         group: { field: "createdAt", granularity: "day" },
         type: "date",
-        granularities: RESOURCE_VIEW_GROUP_GRANULARITIES,
+        granularities: DATE_EXTRACTIONS,
       },
     ]);
   });
 
   test("does not derive server selection filters from the current page rows", () => {
-    const metadata: ModelMetadata = {
-      typeName: "TicketType",
-      fields: {
-        status: {
-          name: "status",
-          kind: "enum",
-          enumName: "TicketStatus",
-          label: "Status",
-          values: [],
-        },
-      },
-      resource: {
-        schemaName: "public",
-        modelLabel: "support.Ticket",
-        appLabel: "support",
-        modelName: "ticket",
-        publicIdField: "sqid",
-        roots: {},
-        typeNames: { node: "TicketType" },
-        capabilities: ["list", "filter"],
-        filterFields: ["status"],
-        orderFields: [],
-        aggregateFields: ["id"],
-        groupByFields: [],
-        relationAxes: [],
-      },
-    };
+    const metadata = canonicalModel({ status: { name: "status", kind: "enum", values: [] } },
+      testDataResource("support.Ticket", { query: testResourceQuery({ fields: { status: testQueryField("status") } }) }));
     const rows = [
       { id: "one", status: "OPEN" },
       { id: "two", status: "CLOSED" },
@@ -349,7 +255,7 @@ describe("resource metadata defaults", () => {
 
     const filterFields = buildFilterFields([{ field: "status" }], rows, metadata);
 
-    expect(filterFields).toEqual([{
+    expect(filterFields).toMatchObject([{
       id: "status",
       field: "status",
       label: "Status",
@@ -366,7 +272,7 @@ describe("resource metadata defaults", () => {
     ];
     const filterFields = buildFilterFields([{ field: "status" }], rows, null);
 
-    expect(filterFields).toEqual([{
+    expect(filterFields).toMatchObject([{
       id: "status",
       field: "status",
       label: "Status",
@@ -392,236 +298,84 @@ describe("resource metadata defaults", () => {
     ]);
   });
 
-  test("derives relation label group options from data-query relation metadata", () => {
-    const handleMetadata: ModelMetadata = {
-      typeName: "HandleType",
-      fields: {
-        party: {
-          name: "party",
-          kind: "relation",
-          label: "Contact",
-          relationTarget: "PartyType",
-          relationFilter: {
-            field: "party",
-            mode: "lookup",
-            aggregateKey: "partyId",
-            labelKey: "party_DisplayName",
-          },
-        },
-      },
-      resource: {
-        schemaName: "public",
-        modelLabel: "parties.Handle",
-        appLabel: "parties",
-        modelName: "handle",
-        publicIdField: "sqid",
-        roots: {},
-        typeNames: { node: "HandleType" },
-        capabilities: ["list", "groups"],
-        filterFields: ["party"],
-        orderFields: [],
-        aggregateFields: ["id"],
-        groupByFields: ["party", "party_DisplayName"],
-        relationAxes: [],
-      },
-    };
-
-    expect(
-      buildGroupOptions(
-        [{ field: "party.displayName", header: "Contact" }],
-        handleMetadata,
-        null,
-      ),
-    ).toEqual([
-      {
-        id: "party.displayName",
-        label: "Contact",
-        group: {
-          field: "party.displayName",
-          aggregateField: "party",
-          aggregateKey: "partyId",
-        },
-        type: "value",
-      },
-    ]);
-    expect(
-      resolveResourceViewGroup({ field: "party.displayName" }, handleMetadata),
-    ).toEqual({
-      field: "party.displayName",
-      aggregateField: "party",
-      aggregateKey: "partyId",
-    });
-    expect(
-      buildGroupOptions([], handleMetadata, { field: "party.displayName" }),
-    ).toEqual([
-      {
-        id: "party.displayName",
-        label: "Contact",
-        group: {
-          field: "party.displayName",
-          aggregateField: "party",
-          aggregateKey: "partyId",
-        },
-        type: "value",
-      },
-    ]);
+  test("uses the canonical relation identity while preserving an explicit menu label", () => {
+    const options = buildGroupOptions([{ field: "sender", header: "Contact" }], MESSAGE_METADATA, null);
+    expect(options).toContainEqual({ id: "sender", label: "Contact", group: { field: "sender" }, type: "value" });
+    expect(resolveResourceViewGroup({ field: "sender" }, MESSAGE_METADATA)).toEqual({ field: "sender" });
   });
 
-  test("derives scalar group alias options from resource metadata", () => {
-    const integrationMetadata: ModelMetadata = {
-      typeName: "IntegrationType",
-      fields: {
-        implCategory: {
-          name: "implCategory",
-          kind: "scalar",
-          scalar: "String",
-          label: "Implementation",
-        },
-        implClass: {
-          name: "implClass",
-          kind: "enum",
-          enumName: "IntegrationImplsImpl",
-          label: "Impl Class",
-          values: [{ value: "NONE", description: "None" }],
-        },
-        status: { name: "status", kind: "scalar", scalar: "String", label: "Status" },
-      },
-      resource: {
-        schemaName: "console",
-        modelLabel: "integrate.Integration",
-        appLabel: "integrate",
-        modelName: "integration",
-        publicIdField: "sqid",
-        roots: {},
-        typeNames: { node: "IntegrationType" },
-        capabilities: ["list", "groups"],
-        filterFields: [],
-        orderFields: [],
-        aggregateFields: ["id"],
-        groupByFields: ["implClass", "status"],
-        relationAxes: [],
-        groupAliases: [
-          {
-            field: "implCategory",
-            aggregateField: "implClass",
-            aggregateKey: "implClass",
-          },
-        ],
-      },
-    };
-
-    expect(buildGroupOptions([], integrationMetadata, null)).toEqual([
-      {
-        id: "implCategory",
-        label: "Implementation",
-        group: {
-          field: "implCategory",
-          aggregateField: "implClass",
-          aggregateKey: "implClass",
-        },
-        type: "value",
-      },
-      {
-        id: "status",
-        label: "Status",
-        group: { field: "status" },
-        type: "value",
-      },
-    ]);
-    expect(resolveResourceViewGroup({ field: "implCategory" }, integrationMetadata)).toEqual({
-      field: "implCategory",
-      aggregateField: "implClass",
-      aggregateKey: "implClass",
-    });
+  test("a display-only derived column cannot introduce an undeclared group", () => {
+    const metadata = canonicalModel({ implCategory: { name: "implCategory", kind: "scalar", scalar: "String" } },
+      testDataResource("integrate.Integration", { query: testResourceQuery({ axes: {
+        implClass: testQueryAxis("implClass", { server: { input: "IMPL_CLASS", key: "impl_class" } }),
+      } }) }));
+    expect(buildGroupOptions([{ field: "implCategory" }], metadata, null).map((option) => option.group)).toEqual([{ field: "implClass" }]);
+    expect(() => resolveResourceViewGroup({ field: "implCategory" }, metadata)).toThrow(/unknown group axis/);
   });
 
-  test("derives group options from JSON path dimensions", () => {
-    const messageMetadata: ModelMetadata = {
-      typeName: "MessageType",
-      fields: {},
-      resource: {
-        schemaName: "console",
-        modelLabel: "messaging.Message",
-        appLabel: "messaging",
-        modelName: "message",
-        publicIdField: "sqid",
-        roots: {},
-        typeNames: { node: "MessageType" },
-        capabilities: ["list", "groups"],
-        filterFields: [],
-        orderFields: [],
-        aggregateFields: ["id"],
-        groupByFields: ["metadata.mailbox"],
-        relationAxes: [],
-        groupDimensions: [
-          {
-            field: "metadata.mailbox",
-            input: "METADATA__MAILBOX",
-            key: "metadata__mailbox",
-            kind: "json",
-          },
-        ],
-      },
-    };
-
-    expect(buildGroupOptions([], messageMetadata, null)).toEqual([
-      {
-        id: "metadata.mailbox",
-        label: "Metadata Mailbox",
-        group: { field: "metadata.mailbox" },
-        type: "value",
-      },
-    ]);
+  test("offers declared JSON axes without exposing their wire names", () => {
+    const metadata = canonicalModel({}, testDataResource("messaging.Message", { query: testResourceQuery({ axes: {
+      "metadata.mailbox": testQueryAxis("metadata.mailbox", { kind: "json", paths: ["metadata"], server: { input: "METADATA__MAILBOX", key: "metadata__mailbox" } }),
+    } }) }));
+    expect(buildGroupOptions([], metadata, null)).toEqual([{ id: "metadata.mailbox", label: "Metadata Mailbox", group: { field: "metadata.mailbox" }, type: "value" }]);
   });
 });
 
 describe("relationFieldInfo / relationListFieldInfo", () => {
-  const schema: SchemaFieldMetadata = {
-    types: {
-      TaxType: {
-        typeName: "TaxType",
-        recordRepresentation: "name",
-        fields: {},
-        rootFields: { list: "taxes", create: "insert_taxes_one" },
-        resource: relationResource("taxes.Tax", "taxes"),
+  const tax = canonicalModel({}, {
+    ...relationResource("taxes.Tax", "taxes"),
+    recordRepresentation: "name",
+    roots: { list: "taxes", create: "insert_taxes_one" },
+  });
+  const productVariant = canonicalModel({}, {
+    ...relationResource("catalog.ProductVariant", "product_variants"),
+    recordRepresentation: "displayName",
+  });
+  const unlistable = canonicalModel({}, testDataResource("misc.Unlistable", {
+    roots: { list: null },
+    capabilities: [],
+  }));
+  const scope = canonicalModel({}, {
+    ...relationResource("accounting.Scope", "scopes"),
+    recordRepresentation: "name",
+  });
+  const schema = schemaFieldMetadataFromDataResources([
+    tax.resource,
+    productVariant.resource,
+    unlistable.resource,
+    scope.resource,
+  ]);
+  const model = canonicalModel({
+      product: {
+        name: "product",
+        kind: "relation",
+        relationModelLabel: "catalog.ProductVariant",
       },
-      ProductVariantType: {
-        typeName: "ProductVariantType",
-        recordRepresentation: "displayName",
-        fields: {},
-        rootFields: { list: "product_variants" },
-        resource: relationResource("catalog.ProductVariant", "product_variants"),
+      taxes: {
+        name: "taxes",
+        kind: "list",
+        scalar: "ID",
+        relationModelLabel: "taxes.Tax",
       },
-      UnlistableType: { typeName: "UnlistableType", fields: {}, rootFields: {} },
-      ScopeType: {
-        typeName: "ScopeType",
-        recordRepresentation: "name",
-        fields: {},
-        rootFields: { list: "scopes" },
-        resource: relationResource("accounting.Scope", "scopes"),
-      },
-    },
-  };
-  const model: ModelMetadata = {
-    typeName: "JournalItemType",
-    fields: {
-      product: { name: "product", kind: "relation", relationTarget: "ProductVariantType" },
-      taxes: { name: "taxes", kind: "list", scalar: "ID", relationTarget: "TaxType" },
       labels: { name: "labels", kind: "list", scalar: "String" },
-      orphan: { name: "orphan", kind: "list", relationTarget: "UnlistableType" },
+      orphan: {
+        name: "orphan",
+        kind: "list",
+        relationModelLabel: "misc.Unlistable",
+      },
       // A to-one FK the node projects as a bare `ID!` scalar: a scalar leaf that
       // still carries a relation target + the scalar-id `select` widget.
       scope: {
         name: "scope",
-        kind: "scalar",
+        kind: "relation",
+        relationObject: false,
         scalar: "ID",
         widget: "select",
-        relationTarget: "ScopeType",
+        relationModelLabel: "accounting.Scope",
       },
       // The record's own opaque id — a bare `ID` scalar with no relation target.
       id: { name: "id", kind: "scalar", scalar: "ID" },
-    },
-  };
+    }, testDataResource("orders.Line"));
 
   test("resolves a to-one relation, but not a to-many, for relationFieldInfo", () => {
     expect(relationFieldInfo("product", model, schema)?.resource).toBe(
@@ -665,19 +419,15 @@ describe("relationFieldInfo / relationListFieldInfo", () => {
 });
 
 describe("money currencyField plumbing", () => {
-  const metadata: ModelMetadata = {
-    typeName: "InvoiceType",
-    fields: {
+  const metadata = canonicalModel({
       amountTotal: {
         name: "amountTotal",
         kind: "scalar",
         scalar: "Decimal",
         widget: "money",
         currencyField: "currency",
-        label: "Total",
       },
-    },
-  };
+    }, testDataResource("orders.Order"));
 
   test("a bare column inherits the backend widget and currencyField from metadata", () => {
     const [column] = columnsWithMetadataDefaults<Row>([{ field: "amountTotal" }], metadata);
@@ -720,16 +470,13 @@ describe("money currencyField plumbing", () => {
 });
 
 describe("relation column read expansion", () => {
-  const metadata: ModelMetadata = {
-    typeName: "StockLevelType",
-    fields: {
+  const metadata = canonicalModel({
       product: {
         name: "product",
         kind: "relation",
         widget: "many2one",
-        relationTarget: "ProductVariantType",
+        relationModelLabel: "catalog.ProductVariant",
         relationObject: true,
-        label: "Product",
       },
       // A to-one FK projected as a public-id scalar: `relation` semantics
       // (many2one widget, relation axis) but NOT a nested object — must stay a leaf.
@@ -737,56 +484,58 @@ describe("relation column read expansion", () => {
         name: "location",
         kind: "relation",
         widget: "many2one",
-        relationTarget: "LocationType",
-        label: "Location",
+        relationModelLabel: "stock.Location",
+        relationObject: false,
       },
       quantity: { name: "quantity", kind: "scalar", scalar: "Decimal" },
       project: {
         name: "project",
         kind: "relation",
-        relationTarget: "ProjectType",
+        relationModelLabel: "projects.Project",
         relationObject: true,
       },
-    },
-  };
-  const schema: SchemaFieldMetadata = {
-    types: {
-      ProductVariantType: {
-        typeName: "ProductVariantType",
-        recordRepresentation: "display_name",
-        fields: {
+    }, testDataResource("orders.Line", {
+      query: testResourceQuery({ fields: {
+        product: testQueryField("product", { relation: { model: "catalog.ProductVariant", identityPath: "product.id", labelPath: "product.display_name" } }),
+        project: testQueryField("project", { relation: { model: "projects.Project", identityPath: "project.id", labelPath: "project.title" } }),
+      } }),
+    }));
+  const productVariant = canonicalModel(
+    {
           display_name: {
             name: "display_name",
             kind: "scalar",
             scalar: "String",
           },
-        },
-      },
-      LocationType: {
-        typeName: "LocationType",
-        recordRepresentation: "name",
-        fields: {},
-      },
-      ProjectType: {
-        typeName: "ProjectType",
-        recordRepresentation: "title",
-        fields: {
+    },
+    testDataResource("catalog.ProductVariant", {
+      recordRepresentation: "display_name",
+    }),
+  );
+  const location = canonicalModel(
+    {},
+    testDataResource("stock.Location", { recordRepresentation: "name" }),
+  );
+  const project = canonicalModel(
+    {
           title: { name: "title", kind: "scalar", scalar: "String" },
           product: {
             name: "product",
             kind: "relation",
-            relationTarget: "ProductVariantType",
-            relationObject: false,
-            relationFilter: {
-              field: "product",
-              mode: "lookup",
-              lookup: "sqid",
-            },
+            relationModelLabel: "catalog.ProductVariant",
+            relationObject: true,
           },
-        },
-      },
     },
-  };
+    testDataResource("projects.Project", {
+      query: testResourceQuery({ fields: { product: testQueryField("product", { relation: { model: "catalog.ProductVariant", identityPath: "product.id", labelPath: "product.display_name" } }) } }),
+      recordRepresentation: "title",
+    }),
+  );
+  const schema = schemaFieldMetadataFromDataResources([
+    productVariant.resource,
+    location.resource,
+    project.resource,
+  ]);
 
   test("a bare relation column reads its related type's label path, not a leaf object", () => {
     const [column] = columnsWithMetadataDefaults<Row>(
@@ -804,18 +553,15 @@ describe("relation column read expansion", () => {
     expect(column?.header).toBe("Product");
   });
 
-  test("a relation column falls back to the related id when the type declares no representation", () => {
-    const bare: SchemaFieldMetadata = {
-      types: { ProductVariantType: { typeName: "ProductVariantType", fields: {} } },
-    };
-    const [column] = columnsWithMetadataDefaults<Row>([{ field: "product" }], metadata, bare);
-    expect(column?.field).toBe("product.id");
+  test("finalized relation paths work without target resource metadata", () => {
+    const [column] = columnsWithMetadataDefaults<Row>([{ field: "product" }], metadata);
+    expect(column?.field).toBe("product.display_name");
+    expect(column?.selectionPaths).toEqual(["product.id", "product.display_name"]);
   });
 
-  test("without target metadata a relation column fails with a named error", () => {
-    expect(() =>
-      columnsWithMetadataDefaults<Row>([{ field: "product" }], metadata)
-    ).toThrow(RelationRepresentationError);
+  test("a relation without finalized selectable paths fails with a named error", () => {
+    const broken = { ...metadata, resource: { ...metadata.resource, query: testResourceQuery() } };
+    expect(() => columnsWithMetadataDefaults<Row>([{ field: "product" }], broken)).toThrow(RelationRepresentationError);
   });
 
   test("a to-one FK projected as a public-id scalar stays a leaf (not sub-selected)", () => {
@@ -846,32 +592,28 @@ describe("relation column read expansion", () => {
   });
 
   test("keeps an explicit scalar path structural when an intermediate relation target has no metadata", () => {
-    const message: ModelMetadata = {
-      typeName: "MessageType",
-      fields: {
+    const message = canonicalModel({
         thread: {
           name: "thread",
           kind: "relation",
-          relationTarget: "ThreadType",
+          relationModelLabel: "messaging.Thread",
           relationObject: true,
         },
-      },
-    };
-    const messagingSchema: SchemaFieldMetadata = {
-      types: {
-        ThreadType: {
-          typeName: "ThreadType",
-          fields: {
+      }, testDataResource("messaging.Message"));
+    const thread = canonicalModel(
+      {
             title: {
               name: "title",
               kind: "relation",
-              relationTarget: "FragmentType",
+              relationModelLabel: "messaging.Fragment",
               relationObject: true,
             },
-          },
-        },
       },
-    };
+      testDataResource("messaging.Thread"),
+    );
+    const messagingSchema = schemaFieldMetadataFromDataResources([
+      thread.resource,
+    ]);
     const resolved = columnsWithMetadataDefaults<Row>(
       [{ field: "thread.title.text" }],
       message,
@@ -907,78 +649,16 @@ describe("relation column read expansion", () => {
   });
 });
 
-describe("relation label axes are not groups of their own", () => {
-  // The inbox reaches the sender's name through `sender.party.display_name`, so
-  // no column names the relation's own label path.
-  const columns: readonly ColumnDescriptor<Row>[] = [
-    { field: "sender.party.display_name" },
-    { field: "status" },
-  ];
-
-  test("the picker offers the relation group, never its label axis", () => {
-    const options = buildGroupOptions(columns, MESSAGE_METADATA, null);
-
-    expect(options.map((option) => option.id)).not.toContain(
-      "sender__display_name",
-    );
-    // The relation group carries the label axis, so its buckets still read
-    // "Alice" — and drill down through the relation's own bucket filter.
-    expect(options).toContainEqual({
-      id: "sender",
-      label: "Sender",
-      group: {
-        field: "sender",
-        aggregateField: "sender",
-        aggregateKey: "sender_id",
-      },
-      type: "value",
-    });
+describe("canonical relation grouping", () => {
+  test("offers one relation axis and never its label or backend key", () => {
+    const options = buildGroupOptions([{ field: "sender.party.display_name" }, { field: "status" }], MESSAGE_METADATA, null);
+    expect(options.map((option) => option.id)).toEqual(["sender", "status"]);
+    expect(options).toContainEqual({ id: "sender", label: "Sender", group: { field: "sender" }, type: "value" });
   });
-
-  test("a column naming the relation's label path still owns the option", () => {
-    const options = buildGroupOptions(
-      [{ field: "sender.displayName", header: "From" }],
-      MESSAGE_METADATA,
-      null,
-    );
-    const ids = options.map((option) => option.id);
-    expect(ids).toContain("sender.displayName");
-    expect(ids).not.toContain("sender");
-  });
-
-  test("a stale ?group= naming the label axis is dropped, not rendered", () => {
-    expect(
-      validResourceViewGroupStack(
-        [{ field: "sender__display_name" }],
-        MESSAGE_METADATA,
-      ),
-    ).toEqual([]);
-    expect(
-      validResourceViewGroupStack([{ field: "status" }], MESSAGE_METADATA),
-    ).toEqual([{ field: "status" }]);
-  });
-
-  test("the relation group itself stays valid", () => {
-    expect(
-      validResourceViewGroupStack(
-        [{ field: "sender.displayName" }],
-        MESSAGE_METADATA,
-      ),
-    ).toEqual([
-      {
-        field: "sender.displayName",
-        aggregateField: "sender",
-        aggregateKey: "sender_id",
-      },
-    ]);
-  });
-
-  test("a bare relation default resolves to its id axis plus label axis", () => {
-    expect(resolveResourceViewGroup({ field: "sender" }, MESSAGE_METADATA)).toEqual({
-      field: "sender",
-      aggregateField: "sender",
-      aggregateKey: "sender_id",
-    });
+  test("reports stale label groups instead of silently dropping query state", () => {
+    expect(() => validResourceViewGroupStack([{ field: "sender__display_name" }], MESSAGE_METADATA)).toThrow(/unknown group axis/);
+    expect(() => validResourceViewGroupStack([{ field: "sender.display_name" }], MESSAGE_METADATA)).toThrow(/unknown group axis/);
+    expect(validResourceViewGroupStack([{ field: "sender" }, { field: "status" }], MESSAGE_METADATA)).toEqual([{ field: "sender" }, { field: "status" }]);
   });
 });
 
@@ -991,4 +671,26 @@ function relationResource(
     typeNames: {},
     capabilities: ["list"],
   });
+}
+
+function canonicalModel(
+  fields: Readonly<Record<string, ModelFieldMetadata>>,
+  resource: DataResourceMetadata,
+): ModelMetadata {
+  const resourceFields: DataResourceFieldMetadata[] = Object.values(fields).map(
+    (field) => ({
+      readable: true,
+      aggregatable: false,
+      creatable: false,
+      updatable: false,
+      requiredOnCreate: false,
+      ...field,
+    }),
+  );
+  const schema = schemaFieldMetadataFromDataResources([
+    { ...resource, fields: resourceFields },
+  ]);
+  const model = schema.labels[resource.modelLabel];
+  if (!model) throw new Error(`Missing test resource ${resource.modelLabel}.`);
+  return model;
 }

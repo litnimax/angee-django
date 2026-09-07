@@ -48,6 +48,8 @@ import { parseFlatSearch,
   stringifyFlatSearch } from "../create-app";
 import { ResourceList,
   DrawerResourceList } from "@angee/ui/views/ResourceList";
+import { ResourceViewProvider } from "@angee/ui/views/resource-view-context";
+import { RowsListView } from "@angee/ui/views/RowsListView";
 import { Form } from "@angee/ui/views/Form";
 import type { FormField } from "@angee/ui/views/FormView";
 import {
@@ -87,10 +89,7 @@ import {
   type Row,
   type SchemaFieldMetadata,
 } from "@angee/metadata";
-import {
-  testDataResource,
-  withTestResourceInventory,
-} from "@angee/metadata/testing";
+import { testDataResource, withTestResourceInventory, testResourceQuery, testQueryField, testQueryAxis } from "@angee/metadata/testing";
 import { installTestLocalStorage } from "../testing";
 import {
   AppRuntimeProvider,
@@ -107,18 +106,6 @@ interface ResourceListOptions {
   order?: unknown;
   enabled?: boolean;
 }
-
-type RefineFilter =
-  | {
-      field: string;
-      operator: string;
-      value: unknown;
-    }
-  | {
-      field?: never;
-      operator: "and" | "or";
-      value: RefineFilter[];
-    };
 
 const sdkMocks = vi.hoisted(() => ({
   rows: [
@@ -210,19 +197,14 @@ vi.mock("@refinedev/core", async (importOriginal) => {
     }),
     useList: (options?: {
       pagination?: { currentPage?: number; pageSize?: number };
-      filters?: RefineFilter[];
-      sorters?:
-        | Array<{ field: string; order: "asc" | "desc" }>
-        | { initial?: Array<{ field: string; order: "asc" | "desc" }> };
+      meta?: { gqlVariables?: { where?: Record<string, unknown>; order_by?: unknown } };
       queryOptions?: { enabled?: boolean };
     }) => {
       const pageSize = options?.pagination?.pageSize ?? 50;
       const requestedPage = options?.pagination?.currentPage ?? 1;
       const active = options?.queryOptions?.enabled !== false;
-      const filters = whereFromRefineFilters(options?.filters);
-      const order = angeeOrderFromSorters(
-        Array.isArray(options?.sorters) ? options.sorters : options?.sorters?.initial,
-      );
+      const filters = options?.meta?.gqlVariables?.where;
+      const order = options?.meta?.gqlVariables?.order_by;
       sdkMocks.listCalls.push({
         page: requestedPage,
         pageSize,
@@ -240,6 +222,8 @@ vi.mock("@refinedev/core", async (importOriginal) => {
         result: { data: rows, total: active ? matchingRows.length : undefined },
         query: {
           isFetching: sdkMocks.fetching,
+          isSuccess: active,
+          isError: false,
           error: null,
           refetch: vi.fn(),
         },
@@ -248,66 +232,6 @@ vi.mock("@refinedev/core", async (importOriginal) => {
     useInvalidate: () => vi.fn(async () => undefined),
   };
 });
-
-
-
-function angeeOrderFromSorters(
-  sorters: Array<{ field: string; order: "asc" | "desc" }> | undefined,
-): Record<string, "ASC" | "DESC"> | undefined {
-  if (!sorters || sorters.length === 0) return undefined;
-  return Object.fromEntries(
-    sorters.map((sorter) => [
-      sorter.field,
-      sorter.order === "desc" ? "DESC" : "ASC",
-    ]),
-  );
-}
-
-function whereFromRefineFilters(
-  filters: RefineFilter[] | undefined,
-): Record<string, unknown> | undefined {
-  if (!filters || filters.length === 0) return undefined;
-  if (filters.length === 1) return whereFromRefineFilter(filters[0]!);
-  return { _and: filters.map(whereFromRefineFilter) };
-}
-
-function whereFromRefineFilter(filter: RefineFilter): Record<string, unknown> {
-  if (typeof filter.field !== "string") {
-    return {
-      [filter.operator === "or" ? "_or" : "_and"]:
-        filter.value.map(whereFromRefineFilter),
-    };
-  }
-  return {
-    [filter.field]: {
-      [hasuraOperatorForRefineOperator(filter.operator)]: filter.value,
-    },
-  };
-}
-
-function hasuraOperatorForRefineOperator(operator: string): string {
-  switch (operator) {
-    case "ne":
-      return "_neq";
-    case "in":
-      return "_in";
-    case "nin":
-      return "_nin";
-    case "contains":
-      return "_ilike";
-    case "gte":
-      return "_gte";
-    case "gt":
-      return "_gt";
-    case "lte":
-      return "_lte";
-    case "lt":
-      return "_lt";
-    case "eq":
-    default:
-      return "_eq";
-  }
-}
 
 function refineRowsForWhere(
   rows: readonly Row[],
@@ -399,8 +323,6 @@ function refineSnakeToCamel(field: string): string {
     .toLowerCase()
     .replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase());
 }
-
-
 
 vi.mock("@angee/refine", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@angee/refine")>();
@@ -638,11 +560,11 @@ vi.mock("@angee/refine", async (importOriginal) => {
     sdkMocks.listCalls.push({
       page: scope.page,
       pageSize: scope.pageSize,
-      filter: scope.filter,
-      order: scope.order,
+      filter: scope.where,
+      order: scope.orderBy,
       enabled: true,
     });
-    const matchingRows = refineRowsForWhere(sdkMocks.rows, scope.filter);
+    const matchingRows = refineRowsForWhere(sdkMocks.rows, scope.where);
     const pageCount = Math.max(1, Math.ceil(matchingRows.length / scope.pageSize));
     const page = Math.min(pageCount, Math.max(1, scope.page));
     return {
@@ -726,20 +648,11 @@ const formFields = [
 const TEST_SCHEMA_METADATA: SchemaFieldMetadata = withTestResourceInventory({
   types: {
     NoteType: {
-      typeName: "NoteType",
-      recordRepresentation: "title",
-      rootFields: {
-        detail: "note",
-        list: "notes",
-        aggregate: "noteAggregate",
-        delete: "deleteNote",
-      },
       fields: {
         title: { name: "title", kind: "scalar", scalar: "String" },
         status: {
           name: "status",
           kind: "enum",
-          enumName: "NoteStatus",
           values: [
             { value: "DRAFT", description: "Draft" },
             { value: "ACTIVE", description: "Active" },
@@ -751,11 +664,27 @@ const TEST_SCHEMA_METADATA: SchemaFieldMetadata = withTestResourceInventory({
         updatedAt: { name: "updatedAt", kind: "scalar", scalar: "DateTime" },
       },
       resource: {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "title": testQueryField("title", { scalar: "String", kind: "scalar", filter: { field: "title", scalar: "String", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "contains", "iContains", "startsWith", "iStartsWith", "endsWith", "iEndsWith", "gt", "gte", "lt", "lte"] }, sort: { field: "title" } }),
+                "status": testQueryField("status", { scalar: "String", kind: "enum", values: [
+                        { value: "DRAFT", description: "Draft" },
+                        { value: "ACTIVE", description: "Active" },
+                        { value: "ARCHIVED", description: "Archived" },
+                    ], filter: { field: "status", scalar: "String", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "contains", "iContains", "startsWith", "iStartsWith", "endsWith", "iEndsWith", "gt", "gte", "lt", "lte"] }, sort: { field: "status" } }),
+                "priority": testQueryField("priority", { scalar: "String", kind: "scalar", filter: { field: "priority", scalar: "String", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "contains", "iContains", "startsWith", "iStartsWith", "endsWith", "iEndsWith", "gt", "gte", "lt", "lte"] }, sort: { field: "priority" } }),
+                "wordCount": testQueryField("wordCount", { scalar: "Int", kind: "scalar", filter: null }),
+                "updatedAt": testQueryField("updatedAt", { scalar: "DateTime", kind: "scalar", filter: { field: "updatedAt", scalar: "DateTime", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "gt", "gte", "lt", "lte"] }, sort: { field: "updatedAt" } }),
+                "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: { "status": testQueryAxis("status", { kind: "column", identityPath: "status", paths: ["status"], server: { input: "STATUS", key: "status" }, extractions: [], drill: { kind: "value", field: "status", valueKey: "status", nullMode: "isNull", valueMap: [] } }),
+                "updatedAt": testQueryAxis("updatedAt", { kind: "date", identityPath: "updatedAt", paths: ["updatedAt"], server: { input: "UPDATED_AT", key: "updatedAt" }, extractions: [{ name: "year", input: "YEAR", key: "updatedAtYear", rangeKey: "updatedAtYearRange", drill: { kind: "range", field: "updatedAt", valueKey: "updatedAtYear", rangeKey: "updatedAtYearRange", nullMode: "isNull", valueMap: [] } }, { name: "month", input: "MONTH", key: "updatedAtMonth", rangeKey: "updatedAtMonthRange", drill: { kind: "range", field: "updatedAt", valueKey: "updatedAtMonth", rangeKey: "updatedAtMonthRange", nullMode: "isNull", valueMap: [] } }, { name: "day", input: "DAY", key: "updatedAtDay", rangeKey: "updatedAtDayRange", drill: { kind: "range", field: "updatedAt", valueKey: "updatedAtDay", rangeKey: "updatedAtDayRange", nullMode: "isNull", valueMap: [] } }], drill: { kind: "value", field: "updatedAt", valueKey: "updatedAt", nullMode: "isNull", valueMap: [] } }) }, sort: { default: [
+                    { field: "updatedAt", direction: "DESC" },
+                    { field: "title", direction: "ASC" },
+                ] } }),
+
         schemaName: "public",
         modelLabel: "notes.Note",
         appLabel: "notes",
         modelName: "note",
-        publicIdField: "sqid",
+
+        recordRepresentation: "title",
         roots: {
           list: "notes",
           detail: "note",
@@ -774,88 +703,17 @@ const TEST_SCHEMA_METADATA: SchemaFieldMetadata = withTestResourceInventory({
           having: "NoteHaving",
         },
         capabilities: ["list", "groups", "aggregate"],
-        filterFields: ["title", "status", "priority", "updatedAt"],
-        orderFields: ["title", "status", "priority", "updatedAt"],
-        defaultSort: [
-          { field: "updatedAt", direction: "DESC" },
-          { field: "title", direction: "ASC" },
-        ],
+
         aggregateFields: ["id", "wordCount"],
-        groupByFields: ["status", "updatedAt"],
-        groupDimensions: [
-          {
-            field: "status",
-            input: "STATUS",
-            key: "status",
-            kind: "column",
-            scalar: "String",
-            filter: {
-              kind: "equality",
-              field: "status",
-              valueKey: "status",
-            },
-          },
-          {
-            field: "updatedAt",
-            input: "UPDATED_AT",
-            key: "updatedAt",
-            kind: "column",
-            scalar: "DateTime",
-            filter: {
-              kind: "equality",
-              field: "updatedAt",
-              valueKey: "updatedAt",
-            },
-            extractions: [
-              {
-                name: "year",
-                input: "YEAR",
-                key: "updatedAtYear",
-                rangeKey: "updatedAtYearRange",
-                filter: {
-                  kind: "range",
-                  field: "updatedAt",
-                  valueKey: "updatedAtYear",
-                  rangeKey: "updatedAtYearRange",
-                },
-              },
-              {
-                name: "month",
-                input: "MONTH",
-                key: "updatedAtMonth",
-                rangeKey: "updatedAtMonthRange",
-                filter: {
-                  kind: "range",
-                  field: "updatedAt",
-                  valueKey: "updatedAtMonth",
-                  rangeKey: "updatedAtMonthRange",
-                },
-              },
-              {
-                name: "day",
-                input: "DAY",
-                key: "updatedAtDay",
-                rangeKey: "updatedAtDayRange",
-                filter: {
-                  kind: "range",
-                  field: "updatedAt",
-                  valueKey: "updatedAtDay",
-                  rangeKey: "updatedAtDayRange",
-                },
-              },
-            ],
-          },
-        ],
-        relationAxes: [],
+
       },
     },
     SaleType: {
-      typeName: "SaleType",
       fields: {},
-      rootFields: {
-        detail: "sale",
-        list: "sales",
-      },
+      resource: testDataResource("sales.Sale", {
+        roots: { detail: "sale", list: "sales" },
+        typeNames: { node: "SaleType" },
+      }),
     },
   },
 });
@@ -863,13 +721,6 @@ const TEST_SCHEMA_METADATA: SchemaFieldMetadata = withTestResourceInventory({
 const SNAKE_NOTE_SCHEMA_METADATA: SchemaFieldMetadata = withTestResourceInventory({
   types: {
     NoteType: {
-      typeName: "NoteType",
-      recordRepresentation: "title",
-      rootFields: {
-        detail: "notes_by_pk",
-        list: "notes",
-        aggregate: "notes_aggregate",
-      },
       fields: {
         title: { name: "title", kind: "scalar", scalar: "String" },
         status: { name: "status", kind: "scalar", scalar: "String" },
@@ -880,11 +731,21 @@ const SNAKE_NOTE_SCHEMA_METADATA: SchemaFieldMetadata = withTestResourceInventor
         },
       },
       resource: {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "title": testQueryField("title", { scalar: "String", kind: "scalar", filter: { field: "title", scalar: "String", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "contains", "iContains", "startsWith", "iStartsWith", "endsWith", "iEndsWith", "gt", "gte", "lt", "lte"] }, sort: { field: "title" } }),
+                "status": testQueryField("status", { scalar: "String", kind: "scalar", filter: { field: "status", scalar: "String", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "contains", "iContains", "startsWith", "iStartsWith", "endsWith", "iEndsWith", "gt", "gte", "lt", "lte"] }, sort: { field: "status" } }),
+                "updated_at": testQueryField("updated_at", { scalar: "DateTime", kind: "scalar", filter: { field: "updated_at", scalar: "DateTime", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "gt", "gte", "lt", "lte"] }, sort: { field: "updated_at" } }),
+                "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: { "status": testQueryAxis("status", { kind: "column", identityPath: "status", paths: ["status"], server: { input: "STATUS", key: "status" }, extractions: [], drill: { kind: "value", field: "status", valueKey: "status", nullMode: "isNull", valueMap: [] } }),
+                "updated_at": testQueryAxis("updated_at", { kind: "date", identityPath: "updated_at", paths: ["updated_at"], server: { input: "UPDATED_AT", key: "updated_at" }, extractions: [{ name: "day", input: "DAY", key: "updated_at_day", rangeKey: "updated_at_day_range", drill: { kind: "range", field: "updated_at", valueKey: "updated_at_day", rangeKey: "updated_at_day_range", nullMode: "isNull", valueMap: [] } }], drill: { kind: "value", field: "updated_at", valueKey: "updated_at", nullMode: "isNull", valueMap: [] } }) }, sort: { default: [
+                    { field: "updated_at", direction: "DESC" },
+                    { field: "title", direction: "ASC" },
+                ] } }),
+
         schemaName: "public",
         modelLabel: "notes.Note",
         appLabel: "notes",
         modelName: "note",
-        publicIdField: "sqid",
+
+        recordRepresentation: "title",
         roots: {
           list: "notes",
           detail: "notes_by_pk",
@@ -902,55 +763,9 @@ const SNAKE_NOTE_SCHEMA_METADATA: SchemaFieldMetadata = withTestResourceInventor
           having: "NoteTypeHaving",
         },
         capabilities: ["list", "groups", "aggregate"],
-        filterFields: ["title", "status", "updated_at"],
-        orderFields: ["title", "status", "updated_at"],
-        defaultSort: [
-          { field: "updated_at", direction: "DESC" },
-          { field: "title", direction: "ASC" },
-        ],
+
         aggregateFields: ["id"],
-        groupByFields: ["status", "updated_at"],
-        groupDimensions: [
-          {
-            field: "status",
-            input: "STATUS",
-            key: "status",
-            kind: "column",
-            scalar: "String",
-            filter: {
-              kind: "equality",
-              field: "status",
-              valueKey: "status",
-            },
-          },
-          {
-            field: "updated_at",
-            input: "UPDATED_AT",
-            key: "updated_at",
-            kind: "column",
-            scalar: "DateTime",
-            filter: {
-              kind: "equality",
-              field: "updated_at",
-              valueKey: "updated_at",
-            },
-            extractions: [
-              {
-                name: "day",
-                input: "DAY",
-                key: "updated_at_day",
-                rangeKey: "updated_at_day_range",
-                filter: {
-                  kind: "range",
-                  field: "updated_at",
-                  valueKey: "updated_at_day",
-                  rangeKey: "updated_at_day_range",
-                },
-              },
-            ],
-          },
-        ],
-        relationAxes: [],
+
       },
     },
   },
@@ -967,6 +782,10 @@ function groupedListResource(
 ): DataResourceMetadata {
   const modelName = modelLabel.split(".").at(-1)?.toLowerCase() ?? "roadmap";
   return testDataResource(modelLabel, {
+    query: testResourceQuery({ identity: { field: "id" }, fields: { "title": testQueryField("title", { scalar: "String", filter: { field: "title", scalar: "String", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull", "contains", "iContains", "startsWith", "iStartsWith", "endsWith", "iEndsWith", "gt", "gte", "lt", "lte"] }, sort: { field: "title" } }),
+            [groupField]: testQueryField(groupField, { scalar: "ID", kind: "relation", filter: { field: groupField, scalar: "ID", values: [], operators: ["exact", "ne", "inList", "notInList", "isNull"] }, relation: { model: `portfolio.${groupField[0]?.toUpperCase()}${groupField.slice(1)}`, identityPath: `${groupField}.id` }, row: { path: `${groupField}.id`, paths: [`${groupField}.id`] } }),
+            "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: { [groupField]: testQueryAxis(groupField, { kind: "relation", identityPath: `${groupField}.id`, paths: [`${groupField}.id`], server: { input: groupField.toUpperCase(), key: `${groupField}_id` }, extractions: [], drill: { kind: "identity", field: groupField, valueKey: `${groupField}_id`, nullMode: "isNull", valueMap: [] } }) }, sort: { default: [] } }),
+
     recordRepresentation: "title",
     roots: {
       aggregate: `${modelName}_aggregate`,
@@ -975,6 +794,7 @@ function groupedListResource(
     },
     typeNames: {
       filter: `${modelName}_bool_exp`,
+      order: `${modelName}_order_by`,
       aggregate: `${modelName}_aggregate_fields`,
       groupBySpec: `${modelName}_group_by`,
       groupKey: `${modelName}_group_key`,
@@ -983,32 +803,9 @@ function groupedListResource(
     },
     capabilities: ["list", "aggregate", "groups"],
     fields: [resourceField("title"), relationResourceField(groupField)],
-    filterFields: ["title", groupField],
-    orderFields: ["title"],
+
     aggregateFields: ["id"],
-    groupByFields: [groupField],
-    groupDimensions: [
-      {
-        field: groupField,
-        input: groupField.toUpperCase(),
-        key: `${groupField}_id`,
-        kind: "relation",
-        scalar: "ID",
-        filter: {
-          kind: "equality",
-          field: groupField,
-          valueKey: `${groupField}_id`,
-          lookup: "sqid",
-        },
-      },
-    ],
-    relationAxes: [
-      {
-        field: groupField,
-        modelLabel: `portfolio.${groupField[0]?.toUpperCase()}${groupField.slice(1)}`,
-        publicIdField: "sqid",
-      },
-    ],
+
   });
 }
 
@@ -1018,10 +815,9 @@ function resourceField(name: string): DataResourceFieldMetadata {
     kind: "scalar",
     scalar: "String",
     readable: true,
-    filterable: true,
-    sortable: true,
+
     aggregatable: false,
-    groupable: true,
+
     creatable: true,
     updatable: true,
     requiredOnCreate: false,
@@ -1114,7 +910,7 @@ describe("ResourceList", () => {
             emptyContent="No matching notes."
             filterOptions={[{ id: "active", label: "Active", filter: {} }]}
           >
-            <Facet field="author" label="Author" labelField="displayName" />
+            <Facet field="author" label="Author" />
             <Column field="title" header="Title" />
             <Column
               field="wordCount"
@@ -1142,7 +938,7 @@ describe("ResourceList", () => {
       { id: "active", label: "Active", filter: {} },
     ]);
     expect(captured.current?.facets).toEqual([
-      { field: "author", label: "Author", labelField: "displayName" },
+      { field: "author", label: "Author" },
     ]);
     expect(captured.current?.createLabel).toBe("Add note");
     expect(captured.current?.emptyContent).toBe("No matching notes.");
@@ -1431,7 +1227,7 @@ describe("ResourceList", () => {
     expect(screen.getByText("Status")).toBeTruthy();
   });
 
-  test("uses resource metadata default sort as the list order fallback", async () => {
+  test("initializes the full metadata sort order, including its secondary field", async () => {
     render(
       <TestUrlState>
         <ResourceList
@@ -1444,9 +1240,7 @@ describe("ResourceList", () => {
 
     expect(await screen.findByText("First")).toBeTruthy();
     await waitFor(() =>
-      expect(lastActiveListCall()?.order).toEqual({
-        updatedAt: "DESC",
-      }),
+      expect(lastActiveListCall()?.order).toEqual({ updatedAt: "desc", title: "asc" }),
     );
   });
 
@@ -1464,7 +1258,7 @@ describe("ResourceList", () => {
 
     expect(await screen.findByText("First")).toBeTruthy();
     await waitFor(() =>
-      expect(lastActiveListCall()?.order).toEqual({ title: "ASC" }),
+      expect(lastActiveListCall()?.order).toEqual({ title: "asc" }),
     );
   });
 
@@ -1482,7 +1276,7 @@ describe("ResourceList", () => {
 
     expect(await screen.findByText("First")).toBeTruthy();
     await waitFor(() =>
-      expect(lastActiveListCall()?.order).toEqual({ priority: "DESC" }),
+      expect(lastActiveListCall()?.order).toEqual({ priority: "desc" }),
     );
   });
 
@@ -1601,7 +1395,30 @@ describe("ResourceList", () => {
     expect(
       screen.queryByRole("navigation", { name: "Record navigation" }),
     ).toBeNull();
-    expect(sdkMocks.listCalls).toHaveLength(0);
+    expect(sdkMocks.listCalls.filter((call) => call.enabled !== false)).toHaveLength(0);
+  });
+
+  test("inline local rows keep one native Table owner through record page edges", async () => {
+    let mounts = 0;
+    const selected = vi.fn();
+    const LocalList: ListComponent<Row> = ({ columns: localColumns, onListStateChange, onRowClick }) => {
+      useEffect(() => { mounts += 1; }, []);
+      return <RowsListView rows={sdkMocks.rows} columns={localColumns} onListStateChange={onListStateChange} onRowClick={onRowClick} />;
+    };
+    function Harness(): ReactElement {
+      const [recordId, setRecordId] = useState<string | null>(null);
+      return <ResourceList resource="notes.Note" columns={columns} formFields={formFields} recordId={recordId} onSelect={(id) => { selected(id); setRecordId(id); }} list={LocalList} pageSize={1} placement="inline" />;
+    }
+    render(<TestUrlState><ResourceViewProvider scope="local" initialState={{ pageSize: 1, sort: null }}><Harness /></ResourceViewProvider></TestUrlState>);
+    fireEvent.click(await screen.findByRole("button", { name: "Open First" }));
+    const pager = await screen.findByRole("navigation", { name: "Record navigation" });
+    expect(pager.textContent?.replace(/\s+/g, " ")).toContain("1 / 4");
+    expect(screen.queryByRole("button", { name: "Open First" })).toBeNull();
+    fireEvent.click(within(pager).getByRole("button", { name: "Next record" }));
+    await waitFor(() => expect(screen.getByRole("navigation", { name: "Record navigation" }).textContent?.replace(/\s+/g, " ")).toContain("2 / 4"));
+    expect(selected).toHaveBeenLastCalledWith("note-2");
+    expect(mounts).toBe(1);
+    expect(sdkMocks.listCalls.filter((call) => call.enabled !== false)).toHaveLength(0);
   });
 
   test("keeps record navigation during a live list refetch", async () => {
@@ -1975,7 +1792,7 @@ describe("ResourceList", () => {
     });
   });
 
-  test("two grouped lists tolerate the sibling's bare group param without ping-pong", async () => {
+  test("two grouped lists reject a legacy group encoding without rewriting sibling state", async () => {
     const onUrlUpdate = vi.fn();
     sdkMocks.groupByCalls.length = 0;
     render(
@@ -1998,18 +1815,8 @@ describe("ResourceList", () => {
       </TestUrlState>,
     );
 
-    await waitFor(() => {
-      const requestedDimensions = new Set(
-        sdkMocks.groupByCalls.flatMap((call) =>
-          call.dimensions.map((dimension) => dimension.input),
-        ),
-      );
-      expect(requestedDimensions).toEqual(new Set(["PRODUCT", "INITIATIVE"]));
-    });
-    await act(async () => {
-      await nextTask();
-      await nextTask();
-    });
+    expect(await screen.findAllByRole("button", { name: "Reset filters, sorting and grouping" })).toHaveLength(2);
+    expect(sdkMocks.groupByCalls).toHaveLength(0);
 
     expect(
       onUrlUpdate.mock.calls.map(([url]) => url.searchParams.get("group")),
@@ -2162,6 +1969,39 @@ describe("ResourceList", () => {
     expect(await screen.findByDisplayValue("First")).toBeTruthy();
   });
 
+  test("navigates inside Notes-style declared monthly defaults without replaying grouped controls", async () => {
+    const onSelect = vi.fn();
+    const previousDate = sdkMocks.rows[1]!.updatedAt;
+    sdkMocks.rows[1]!.updatedAt = "2026-01-04T10:00:00.000Z";
+    function Harness(): ReactElement {
+      const [recordId, setRecordId] = useState<string | null>(null);
+      return <ResourceList resource="notes.Note" formFields={formFields} recordId={recordId} onSelect={(id) => { onSelect(id); setRecordId(id); }}>
+        <List pageSize={2} order={{ updatedAt: "DESC" }} defaultGroups={{ list: { field: "updatedAt", granularity: "month" }, board: { field: "status" } }}>
+          <Column field="title" header="Title" />
+          <Column field="updatedAt" header="Updated" />
+        </List>
+      </ResourceList>;
+    }
+    try {
+      render(<TestUrlState><Harness /></TestUrlState>);
+      await screen.findByRole("button", { name: /Groups/ });
+      await nextTask();
+      fireEvent.click(await screen.findByRole("button", { name: "Open Second" }));
+      expect(onSelect).toHaveBeenCalledWith("note-2");
+      const pager = await screen.findByRole("navigation", { name: "Record navigation" });
+      expect(pager.textContent?.replace(/\s+/g, " ")).toContain("2 / 2");
+      expect(screen.queryByRole("button", { name: "Filter and group", hidden: true })).toBeNull();
+      const request = sdkMocks.listCalls.findLast((call) => call.enabled !== false);
+      expect(JSON.stringify(request?.filter)).toContain("2026-01-01");
+      expect(JSON.stringify(request?.filter)).toContain("2026-02-01");
+      fireEvent.click(within(pager).getByRole("button", { name: "Previous record" }));
+      await waitFor(() => expect(screen.getByRole("navigation", { name: "Record navigation" }).textContent?.replace(/\s+/g, " ")).toContain("1 / 2"));
+      expect(await screen.findByDisplayValue("First")).toBeTruthy();
+    } finally {
+      sdkMocks.rows[1]!.updatedAt = previousDate;
+    }
+  });
+
   test("renders grouped list aggregate measures and a grand total footer", async () => {
     sdkMocks.groupByCalls.length = 0;
     sdkMocks.aggregateCalls.length = 0;
@@ -2245,8 +2085,9 @@ describe("ResourceList", () => {
     });
   });
 
-  test("repairs stale camel-case group search against snake resource metadata", async () => {
+  test("reports stale camel-case group search without inventing a snake alias", async () => {
     const onUrlUpdate = vi.fn();
+    sdkMocks.groupByCalls.length = 0;
     render(
       <TestUrlState
         searchParams="?group=updatedAt:day"
@@ -2264,14 +2105,10 @@ describe("ResourceList", () => {
       </TestUrlState>,
     );
 
-    await screen.findByRole("button", {
-      name: /Groups 1-\d+ \/ \d+ groups/,
-    });
-    await waitFor(() => {
-      const latest = onUrlUpdate.mock.calls.at(-1)?.[0];
-      expect(latest?.searchParams.get("group")).toBe("updated_at:day");
-    });
-    expect(screen.queryByText("Something went wrong")).toBeNull();
+    expect(await screen.findByRole("button", { name: "Reset filters, sorting and grouping" })).toBeTruthy();
+    expect(sdkMocks.groupByCalls).toHaveLength(0);
+    expect(onUrlUpdate.mock.calls.at(-1)?.[0]?.searchParams.get("group")).toBe("updatedAt:day");
+
   });
 
   test("selects page size from the pager range popover", async () => {
@@ -2481,8 +2318,8 @@ describe("ResourceList", () => {
     );
     const branchWhere = branchCall?.where as Record<string, unknown>;
     expect(branchWhere).toMatchObject({
-      updatedAt: { _gte: "2026-01-01T00:00:00.000Z" },
       _and: [
+        { updatedAt: { _gte: "2026-01-01T00:00:00.000Z" } },
         {
           updatedAt: {
             _gte: "2026-01-01T00:00:00.000Z",
@@ -2632,19 +2469,15 @@ function NoDeleteMetadata({ children }: { children: ReactNode }): ReactElement {
       metadata={withTestResourceInventory({
         types: {
           SaleType: {
-            typeName: "SaleType",
             fields: {},
-            rootFields: {
-              detail: "sale",
-              list: "sales",
-              aggregate: "saleAggregate",
-            },
             resource: {
+              query: testResourceQuery({ identity: { field: "id" }, fields: { "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: {}, sort: { default: [] } }),
+
               schemaName: "public",
               modelLabel: "sales.Sale",
               appLabel: "sales",
               modelName: "sale",
-              publicIdField: "id",
+
               roots: {
                 list: "sales",
                 detail: "sale",
@@ -2658,11 +2491,9 @@ function NoDeleteMetadata({ children }: { children: ReactNode }): ReactElement {
               },
               capabilities: ["list", "aggregate", "detail"],
               fields: [],
-              filterFields: [],
-              orderFields: [],
+
               aggregateFields: ["id"],
-              groupByFields: [],
-              relationAxes: [],
+
             },
           },
         },

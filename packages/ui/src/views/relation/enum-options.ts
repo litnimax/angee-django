@@ -5,8 +5,13 @@ import {
 } from "@angee/metadata";
 
 import type { WidgetOption } from "../../widgets";
+import { useAppRuntime } from "../../runtime";
+import { deserializeFormSpec, type FormSpecFieldDescriptor } from "../form/form-spec";
+import type { FieldDescriptor } from "../page";
 import { BaseImplChoices, type ImplChoice } from "../resource/documents";
 import { enumValueLabel } from "../resource/resource-view-list-body";
+
+const EMPTY_IMPL_PREFILL_RESET: Readonly<Record<string, unknown>> = {};
 
 /**
  * SDL-derived `<select>` options for an enum field, with lower-cased values.
@@ -38,6 +43,55 @@ export function useImplChoices(resource: string, field: string): readonly ImplCh
   return data?.impl_choices ?? [];
 }
 
+export interface ImplConfigFields {
+  fields: readonly (FormSpecFieldDescriptor & Pick<FieldDescriptor, "showWhen" | "resolve">)[];
+  hasSchema: (value: unknown) => boolean;
+}
+
+/**
+ * Project backend-owned implementation config specs into ordinary dotted form
+ * fields. The existing FormSpec parser/widget registry remain the only schema
+ * engine; choices without a declaration continue to use their native raw JSON
+ * field.
+ */
+export function useImplConfigFields(resource: string, field: string): ImplConfigFields {
+  const choices = useImplChoices(resource, field);
+  const { widgets } = useAppRuntime();
+  return React.useMemo(() => {
+    const parsed = choices.flatMap((choice) => choice.config_schema == null
+      ? []
+      : [{ choice, fields: deserializeFormSpec(choice.config_schema, widgets) }]);
+    const schemaKeys = new Set(parsed.map(({ choice }) => choice.key));
+    const byName = new Map<string, { descriptor: FieldDescriptor; variants: Map<string, FieldDescriptor> }>();
+    for (const { choice, fields } of parsed) {
+      for (const descriptor of fields) {
+        const current = byName.get(descriptor.name);
+        if (current) current.variants.set(choice.key, descriptor);
+        else byName.set(descriptor.name, {
+          descriptor,
+          variants: new Map([[choice.key, descriptor]]),
+        });
+      }
+    }
+    return {
+      fields: [...byName.values()].map(({ descriptor, variants }) => ({
+        ...descriptor,
+        name: `config.${descriptor.name}`,
+        showWhen: (values) => variants.has(String(values[field])),
+        resolve: (values) => {
+          const selected = variants.get(String(values[field])) ?? descriptor;
+          return {
+            ...selected,
+            name: `config.${selected.name}`,
+            showWhen: (current) => variants.has(String(current[field])),
+          };
+        },
+      })),
+      hasSchema: (value: unknown) => schemaKeys.has(String(value)),
+    };
+  }, [choices, field, widgets]);
+}
+
 export function useImplCategory(resource: string, field: string): (value: unknown) => string {
   const choices = useImplChoices(resource, field);
   return React.useMemo(() => {
@@ -56,6 +110,7 @@ export function useImplCategory(resource: string, field: string): (value: unknow
 export function useImplPrefill(
   resource: string,
   field: string,
+  reset: Readonly<Record<string, unknown>> = EMPTY_IMPL_PREFILL_RESET,
 ): (value: unknown) => Record<string, unknown> | undefined {
   const choices = useImplChoices(resource, field);
   return React.useMemo(() => {
@@ -65,7 +120,7 @@ export function useImplPrefill(
     return (value: unknown) => {
       const defaults = byKey.get(String(value));
       if (!defaults) return undefined;
-      return defaults as Record<string, unknown>;
+      return { ...reset, ...defaults } as Record<string, unknown>;
     };
-  }, [choices]);
+  }, [choices, reset]);
 }

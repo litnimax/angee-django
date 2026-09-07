@@ -18,7 +18,9 @@ import hmac
 from typing import Any
 from urllib.parse import quote
 
-from angee.integrate.vcs.backend import RepoDescriptor, TreeEntry, VCSBackend
+from pydantic import BaseModel, ConfigDict, Field
+
+from angee.integrate_vcs.backend import RepoDescriptor, TreeEntry, VCSBackend
 
 HTTP_TIMEOUT_SECONDS = 15
 DEFAULT_API_BASE = "https://api.github.com"
@@ -47,12 +49,17 @@ class GitHubBackend(VCSBackend):
     label = "GitHub"
     icon = "github"
     repository_search_scope_config_key = "github_org"
-    defaults = {
-        "vendor": "github",
-        "config": {
-            "github_api_base": DEFAULT_API_BASE,
-        },
-    }
+    defaults = {"vendor": "github"}
+
+    class Config(BaseModel):
+        """Supported non-secret GitHub API configuration."""
+
+        model_config = ConfigDict(extra="forbid")
+
+        github_api_base: str = Field(default=DEFAULT_API_BASE, description="GitHub API base URL.")
+        github_org: str = Field(default="", description="Organization used to scope repository search.")
+
+    config_model = Config
 
     @property
     def api_base(self) -> str:
@@ -167,10 +174,13 @@ class GitHubBackend(VCSBackend):
             allow_private=allow_private,
             timeout=HTTP_TIMEOUT_SECONDS,
         )
-        if response.status == 404:
+        if response.status_code == 404:
             raise FileNotFoundError(path)
-        if not response.ok:
-            raise GitHubApiError(f"GitHub API GET {path} returned HTTP {response.status}", status=response.status)
+        if not response.is_success:
+            raise GitHubApiError(
+                f"GitHub API GET {path} returned HTTP {response.status_code}",
+                status=response.status_code,
+            )
         return response.json()
 
     @staticmethod

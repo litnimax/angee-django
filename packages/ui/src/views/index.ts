@@ -20,6 +20,7 @@ export {
   type UseListRecordNavigationOptions,
   type UseListRecordNavigationResult,
 } from "./resource/use-list-record-navigation";
+export { parseRecordNavigationScope, recordNavigationSearch, recordNavigationHref } from "./resource/record-navigation-context";
 export { RowsListView, type RowsListViewProps } from "./resource/RowsListView";
 export {
   defineRowAction,
@@ -83,7 +84,9 @@ export {
 export {
   useEnumOptions,
   useImplCategory,
+  useImplConfigFields,
   useImplChoices,
+  type ImplConfigFields,
   useImplPrefill,
 } from "./relation/enum-options";
 export {
@@ -144,6 +147,7 @@ export {
 } from "../ui/tree";
 export { Metric, type MetricProps } from "./dashboard/Metric";
 export { Form, type FormProps } from "./form/Form";
+export { RegisteredFormView, registerForm, useRegisteredForm, type RegisteredForm, type RegisteredFormProps } from "./form/registered-form";
 export {
   FormView,
   FORM_VIEW_RECORD_ACTIONS_SLOT,

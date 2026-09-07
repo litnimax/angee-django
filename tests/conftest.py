@@ -28,15 +28,14 @@ from angee.iam_integrate_oidc.models import OAuthClientOidc as AbstractOAuthClie
 from angee.integrate.credentials import CredentialKind
 from angee.integrate.models import Credential as AbstractCredential
 from angee.integrate.models import ExternalAccount as AbstractExternalAccount
-from angee.integrate.models import Integration as AbstractIntegration
 from angee.integrate.models import OAuthClient as AbstractOAuthClient
-from angee.integrate.models import Repository as AbstractRepository
-from angee.integrate.models import Source as AbstractSource
-from angee.integrate.models import Template as AbstractTemplate
-from angee.integrate.models import VcsBridge as AbstractVcsBridge
 from angee.integrate.models import Vendor as AbstractVendor
 from angee.integrate.models import WebhookSubscription as AbstractWebhookSubscription
-from angee.integrate.vcs.backend import RepoDescriptor, TreeEntry, VCSBackend
+from angee.integrate_vcs.backend import RepoDescriptor, TreeEntry, VCSBackend
+from angee.integrate_vcs.models import Repository as AbstractRepository
+from angee.integrate_vcs.models import Source as AbstractSource
+from angee.integrate_vcs.models import Template as AbstractTemplate
+from angee.integrate_vcs.models import VcsBridge as AbstractVcsBridge
 from angee.knowledge.models import Link as AbstractLink
 from angee.knowledge.models import MarkdownPage as AbstractMarkdownPage
 from angee.knowledge.models import Page as AbstractPage
@@ -60,6 +59,8 @@ from angee.storage.models import MimeType as AbstractMimeType
 from angee.storage.models import StorageRole as AbstractStorageRole
 from angee.storage_integrate.models import Mount as AbstractMount
 from angee.storage_integrate.models import MountMode
+from tests import messaging_models  # noqa: F401 -- register the managed posts FK targets before database setup
+from tests.integrate_models import Integration
 
 
 class OAuthClient(AbstractOAuthClientOidc, AbstractOAuthClient):
@@ -116,19 +117,6 @@ class Vendor(AbstractVendor):
         app_label = "integrate"
         db_table = "test_integrate_vendor"
         rebac_resource_type = "integrate/vendor"
-        rebac_id_attr = "sqid"
-
-
-class Integration(AbstractIntegration):
-    """Concrete integration used by source-addon tests."""
-
-    class Meta(AbstractIntegration.Meta):
-        """Django model options for the canonical test integration."""
-
-        abstract = False
-        app_label = "integrate"
-        db_table = "test_integrate_integration"
-        rebac_resource_type = "integrate/integration"
         rebac_id_attr = "sqid"
 
 
@@ -199,7 +187,7 @@ INTEGRATE_TEST_MODELS = (Vendor, Integration)
 class VcsBridge(AbstractVcsBridge, Integration):
     """Concrete VCS bridge used by source-addon tests.
 
-    ``angee.integrate.schema`` binds the VCS console types at import time via
+    ``angee.integrate_vcs.schema`` binds the VCS console types at import time via
     ``apps.get_model``, so the concrete models live here (imported before any test
     module) rather than in a single test file — otherwise importing the schema from
     one test depends on another test having been collected first.
@@ -209,9 +197,9 @@ class VcsBridge(AbstractVcsBridge, Integration):
         """Django model options for the canonical test VCS bridge."""
 
         abstract = False
-        app_label = "integrate"
+        app_label = "integrate_vcs"
         db_table = "test_integrate_vcs_bridge"
-        rebac_resource_type = "integrate/vcs_bridge"
+        rebac_resource_type = "integrate_vcs/vcs_bridge"
         rebac_id_attr = "sqid"
 
 
@@ -241,9 +229,9 @@ class Repository(AbstractRepository):
         """Django model options for the canonical test repository."""
 
         abstract = False
-        app_label = "integrate"
+        app_label = "integrate_vcs"
         db_table = "test_integrate_repository"
-        rebac_resource_type = "integrate/repository"
+        rebac_resource_type = "integrate_vcs/repository"
         rebac_id_attr = "sqid"
 
 
@@ -254,9 +242,9 @@ class Source(AbstractSource):
         """Django model options for the canonical test source."""
 
         abstract = False
-        app_label = "integrate"
+        app_label = "integrate_vcs"
         db_table = "test_integrate_source"
-        rebac_resource_type = "integrate/source"
+        rebac_resource_type = "integrate_vcs/source"
         rebac_id_attr = "sqid"
 
 
@@ -269,9 +257,9 @@ class Template(AbstractTemplate):
         """Django model options for the canonical test template."""
 
         abstract = False
-        app_label = "integrate"
+        app_label = "integrate_vcs"
         db_table = "test_integrate_template"
-        rebac_resource_type = "integrate/template"
+        rebac_resource_type = "integrate_vcs/template"
         rebac_id_attr = "sqid"
 
 
@@ -287,7 +275,6 @@ def make_integration(
     *,
     kind: Any = CredentialKind.STATIC_TOKEN,
     material: dict[str, Any] | None = None,
-    impl_class: str = "none",
     backend_class: str | None = None,
     model: type[Any] = Integration,
     **attrs: Any,
@@ -298,7 +285,7 @@ def make_integration(
     ``material`` pick the credential kind (default a static token); pass
     ``kind=CredentialKind.OAUTH`` for an OAuth-backed integration. ``model`` may
     be a concrete MTI child such as ``VcsBridge``; VCS child rows choose
-    ``backend_class`` while parent-only integrations choose ``impl_class``.
+    ``backend_class`` while parent-only integrations have no selector.
     """
 
     if material is None:
@@ -322,9 +309,7 @@ def make_integration(
         }
         field_names = {field.name for field in model._meta.fields}
         if "backend_class" in field_names:
-            values["backend_class"] = backend_class or ("local" if impl_class == "none" else impl_class)
-        else:
-            values["impl_class"] = impl_class
+            values["backend_class"] = backend_class or "local"
         return model.objects.create(**values)
 
 

@@ -15,18 +15,10 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
-from angee.base.identity import (
-    instance_from_public_id,
-    public_data_id_field,
-    public_id_for,
-    public_id_of,
-)
-from angee.data.field_classification import resource_field_kind, resource_field_widget
 from django.apps import apps
 from django.contrib.auth import BACKEND_SESSION_KEY, SESSION_KEY, get_user_model
 from django.contrib.auth.hashers import PBKDF2PasswordHasher
 from django.contrib.auth.models import AnonymousUser
-from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.db import connection
 from django.test import RequestFactory
@@ -35,8 +27,15 @@ from rebac import actor_context, app_settings, system_context, to_object_ref, to
 from rebac.backends import backend
 from rebac.roles import grant
 
+from angee.base.identity import (
+    instance_from_public_id,
+    public_data_id_field,
+    public_id_for,
+    public_id_of,
+)
+from angee.data.field_classification import resource_field_kind, resource_field_widget
 from angee.graphql import subscriptions
-from angee.graphql.data.metadata import model_resource_fields, readable_model_field_names
+from angee.graphql.data.metadata import readable_model_field_names
 from angee.graphql.events import ChangePayload
 from angee.integrate.credentials import CredentialKind
 from angee.integrate.oauth import state
@@ -164,7 +163,7 @@ def test_login_start_rejects_non_oidc_or_disabled_oauth_client(
         data = _data(_execute(public_schema, query, {"oauthClientSqid": oauth_client.sqid}))
 
         assert data["login_start"]["state"] == ""
-        assert "enabled for OIDC" in data["login_start"]["error"]
+        assert data["login_start"]["error"] == "This connection is not configured."
         assert data["login_start"]["error_code"] == "client_not_configured"
 
 
@@ -205,7 +204,7 @@ def test_login_start_returns_oidc_flow_error_payload(
     assert data["login_start"] == {
         "authorize_url": "",
         "state": "",
-        "error": "missing_endpoint",
+        "error": "The provider does not expose the required endpoint.",
         "error_code": "missing_endpoint",
     }
 
@@ -371,7 +370,7 @@ def test_login_complete_returns_oidc_flow_error_payload(
         "intent": "login",
         "next": "/",
         "claims": None,
-        "error": "bad token",
+        "error": "The provider returned an invalid identity token.",
         "error_code": "invalid_id_token",
     }
 
@@ -563,11 +562,11 @@ def test_link_account_complete_returns_account_claims_intent_and_coerced_next(
     }
 
 
-def test_connect_account_complete_surfaces_provider_error_message(
+def test_connect_account_complete_uses_bounded_provider_error_message(
     iam_connection_tables: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Connect completion keeps the stable code but shows provider error text."""
+    """Connect completion keeps the stable code without exposing provider text."""
 
     user = User.objects.create_user(username="connect-rate-limited", email="connect@example.com")
     oauth_client = _oauth_client("connect-anthropic", is_oidc=False)
@@ -642,7 +641,7 @@ def test_connect_account_complete_surfaces_provider_error_message(
     assert completed["connect_account_complete"] == {
         "account": None,
         "credential": None,
-        "error": "Rate limited. Please try again later.",
+        "error": "The provider could not complete authorization.",
         "error_code": "token_exchange_failed",
     }
 
@@ -684,9 +683,7 @@ def test_oauth_client_crud_are_admin_only(
     denied = _execute(console_schema, create_oauth_client, user=user)
     assert denied.errors is not None
 
-    oauth_client = _data(
-        _execute(console_schema, create_oauth_client, user=admin)
-    )["insert_oauth_clients_one"]
+    oauth_client = _data(_execute(console_schema, create_oauth_client, user=admin))["insert_oauth_clients_one"]
     oauth_client_id = oauth_client["id"]
     assert oauth_client["slug"] == "console"
     assert oauth_client["icon"] == "console.svg"
@@ -742,12 +739,15 @@ def test_oauth_client_crud_are_admin_only(
     with system_context(reason="test.iam.external_account"):
         account = ExternalAccount.objects.get(external_id="admin-sub")
     assert ExternalAccount.objects.owner_for(account) == admin
-    assert _execute(
-        console_schema,
-        external_account_mutation,
-        {"oauthClient": oauth_client_id, "owner": _user_public_id(admin)},
-        user=user,
-    ).errors is not None
+    assert (
+        _execute(
+            console_schema,
+            external_account_mutation,
+            {"oauthClient": oauth_client_id, "owner": _user_public_id(admin)},
+            user=user,
+        ).errors
+        is not None
+    )
 
 
 def test_oauth_client_crud_sets_oidc_login_fields(
@@ -783,9 +783,7 @@ def test_oauth_client_crud_sets_oidc_login_fields(
 
     assert _execute(console_schema, update_oauth_client, variables, user=plain).errors is not None
 
-    updated = _data(
-        _execute(console_schema, update_oauth_client, variables, user=admin)
-    )["update_oauth_clients_by_pk"]
+    updated = _data(_execute(console_schema, update_oauth_client, variables, user=admin))["update_oauth_clients_by_pk"]
     assert updated == {
         "issuer": "https://issuer.example",
         "discovery_url": "https://issuer.example/.well-known/openid-configuration",
@@ -899,9 +897,10 @@ def test_user_crud_create_update_delete_are_admin_only(
         assert user.is_staff is False
         assert user.check_password("first-secret")
 
-    assert _execute(
-        console_schema,
-        """
+    assert (
+        _execute(
+            console_schema,
+            """
         mutation InvalidEmail($id: String!) {
           update_users_by_pk(
             pk_columns: {id: $id},
@@ -911,9 +910,11 @@ def test_user_crud_create_update_delete_are_admin_only(
           }
         }
         """,
-        {"id": user_id},
-        user=admin,
-    ).errors is not None
+            {"id": user_id},
+            user=admin,
+        ).errors
+        is not None
+    )
     with system_context(reason="test.iam.user_crud.invalid_email"):
         user.refresh_from_db()
         assert user.email == "console-user@example.com"
@@ -940,16 +941,19 @@ def test_user_crud_create_update_delete_are_admin_only(
         assert user.check_password("second-secret")
         assert not user.check_password("first-secret")
 
-    assert _execute(
-        console_schema,
-        """
+    assert (
+        _execute(
+            console_schema,
+            """
         mutation DeleteUser($id: ID!) {
           delete_user(id: $id, confirm: true) { total_deleted_count }
         }
         """,
-        {"id": user_id},
-        user=plain,
-    ).errors is not None
+            {"id": user_id},
+            user=plain,
+        ).errors
+        is not None
+    )
 
     deleted = _data(
         _execute(
@@ -1045,9 +1049,9 @@ def test_external_account_update_delete_are_admin_only(
 
     assert _execute(console_schema, update_account, {"id": account_id}, user=plain).errors is not None
 
-    updated = _data(
-        _execute(console_schema, update_account, {"id": account_id}, user=admin)
-    )["update_external_accounts_by_pk"]
+    updated = _data(_execute(console_schema, update_account, {"id": account_id}, user=admin))[
+        "update_external_accounts_by_pk"
+    ]
     # ``status`` is a choices field exposed as a GraphQL enum, so it renders as the
     # uppercase member name though the write input takes the raw ``"revoked"`` value.
     assert updated == {
@@ -1069,9 +1073,7 @@ def test_external_account_update_delete_are_admin_only(
 
     assert _execute(console_schema, delete_account, {"id": account_id}, user=plain).errors is not None
 
-    deleted = _data(
-        _execute(console_schema, delete_account, {"id": account_id}, user=admin)
-    )["delete_external_account"]
+    deleted = _data(_execute(console_schema, delete_account, {"id": account_id}, user=admin))["delete_external_account"]
     assert deleted["has_blockers"] is False
     assert deleted["total_deleted_count"] >= 1
     with system_context(reason="test.iam.external_account.after_delete"):
@@ -1108,9 +1110,7 @@ def test_credential_crud_create_delete_are_admin_only(
 
     assert _execute(console_schema, create_credential, variables, user=plain).errors is not None
 
-    created = _data(
-        _execute(console_schema, create_credential, variables, user=admin)
-    )["create_credential"]
+    created = _data(_execute(console_schema, create_credential, variables, user=admin))["create_credential"]
     assert created["name"] == "ci-token"
     # A provider-less static token reads its own name as the label.
     assert created["display_name"] == "ci-token"
@@ -1121,14 +1121,14 @@ def test_credential_crud_create_delete_are_admin_only(
         assert credential.kind == CredentialKind.STATIC_TOKEN
         assert credential.oauth_client_id is None
     credential_id = str(credential.sqid)
-    scheduled: list[Any] = []
+    scheduled: list[tuple[Any, bool]] = []
     revoked: list[Any] = []
-    monkeypatch.setattr(integrate_schema.transaction, "on_commit", lambda callback: scheduled.append(callback))
     monkeypatch.setattr(
-        integrate_schema,
-        "_revoke_remote_oauth_token",
-        lambda credential: revoked.append(credential.pk),
+        integrate_schema.transaction,
+        "on_commit",
+        lambda callback, robust=False: scheduled.append((callback, robust)),
     )
+    monkeypatch.setattr(Credential, "revoke_remote", lambda credential: revoked.append(credential.pk))
 
     delete_credential = """
         mutation DeleteCredential($id: ID!) {
@@ -1141,14 +1141,14 @@ def test_credential_crud_create_delete_are_admin_only(
 
     assert _execute(console_schema, delete_credential, {"id": credential_id}, user=plain).errors is not None
 
-    deleted = _data(
-        _execute(console_schema, delete_credential, {"id": credential_id}, user=admin)
-    )["delete_credential"]
+    deleted = _data(_execute(console_schema, delete_credential, {"id": credential_id}, user=admin))["delete_credential"]
     assert deleted["has_blockers"] is False
     assert deleted["total_deleted_count"] >= 1
     assert revoked == []
     assert len(scheduled) == 1
-    scheduled.pop()()
+    callback, robust = scheduled.pop()
+    assert robust is True
+    callback()
     assert revoked == [credential.pk]
     with system_context(reason="test.iam.credential_crud.delete"):
         assert not Credential.objects.filter(pk=credential.pk).exists()
@@ -1329,7 +1329,7 @@ def test_account_connect_schema_exposes_generic_flow_without_token_material(
 def test_oauth_client_resource_metadata_includes_oidc_extension_fields(
     iam_connection_tables: None,
 ) -> None:
-    """Same-row OIDC extension fields keep their model-owned resource metadata."""
+    """OIDC extension fields follow their executable GraphQL field shapes."""
 
     console_schema = _schema("console")
     metadata = {item.model_label: item for item in console_schema.angee_resources}
@@ -1351,33 +1351,34 @@ def test_oauth_client_resource_metadata_includes_oidc_extension_fields(
         assert fields[name].widget == "switch"
         assert fields[name].creatable is True
         assert fields[name].updatable is True
-    assert fields["allowed_email_domains"].scalar == "JSON"
-    assert fields["allowed_email_domains"].widget == "json"
+    assert fields["allowed_email_domains"].kind == "list"
+    assert fields["allowed_email_domains"].scalar == "String"
+    assert fields["allowed_email_domains"].widget == "tagInput"
 
 
-def test_model_resource_fields_rejects_enum_declared_field() -> None:
-    """A declared enum column fails fast: its values are owned by the node surface."""
+def test_external_account_final_metadata_owns_enum_and_relation_axis() -> None:
+    """The final node and relation surface own ExternalAccount metadata."""
 
-    with pytest.raises(ImproperlyConfigured, match="cannot reconstruct enum"):
-        model_resource_fields(ExternalAccount, ("status",))
+    resources = {item.model_label: item for item in _schema("console").angee_resources}
+    external_account = resources[ExternalAccount._meta.label]
+    fields = {field.name: field for field in external_account.fields}
+    axes = external_account.query.axes
+
+    assert fields["status"].kind == "enum"
+    assert [(value.value, value.description) for value in fields["status"].values] == [
+        ("ACTIVE", "Active"),
+        ("EXPIRED", "Expired"),
+        ("REVOKED", "Revoked"),
+    ]
+    assert external_account.query.fields["oauth_client"].relation.model == OAuthClient._meta.label
+    assert axes["oauth_client"].server.label_key == "oauth_client__display_name"
 
 
-def test_model_resource_fields_reconstructs_relation_target_label() -> None:
-    """A declared same-row relation keeps its target label, resolved from the model."""
+def test_scalar_id_to_one_relation_preserves_django_relation_semantics() -> None:
+    """An FK projected as a bare ``ID`` retains its native relation semantics.
 
-    (field,) = model_resource_fields(ExternalAccount, ("oauth_client",))
-    assert field.kind == "relation"
-    assert field.scalar is None
-    assert field.relation_model_label == OAuthClient._meta.label
-
-
-def test_scalar_id_to_one_relation_classifies_as_leaf() -> None:
-    """An FK a node projects as a bare ``ID`` scalar is a scalar leaf, not an object.
-
-    A to-one FK projected as an object stays a ``relation`` (an object selection, a
-    ``many2one`` picker). Projected as a bare ``ID`` scalar it must classify as a
-    ``scalar`` leaf so the detail/form query selects it without an invalid
-    sub-selection — while still resolving a scalar-id ``select`` picker widget.
+    ``relation_object`` separately tells consumers whether to sub-select the field;
+    kind and widget continue to describe the underlying Django foreign key.
     """
 
     oauth_client_fk = ExternalAccount._meta.get_field("oauth_client")
@@ -1386,25 +1387,24 @@ def test_scalar_id_to_one_relation_classifies_as_leaf() -> None:
     assert resource_field_kind(oauth_client_fk, is_object=True) == "relation"
     assert resource_field_widget(oauth_client_fk, "relation") == "many2one"
 
-    # Bare-ID-scalar projection: scalar leaf carrying the scalar-id select widget.
-    scalar_kind = resource_field_kind(oauth_client_fk, projected_as_scalar=True)
-    assert scalar_kind == "scalar"
-    assert resource_field_widget(oauth_client_fk, scalar_kind) == "select"
+    # Bare-ID projection: relation metadata with a leaf GraphQL projection.
+    scalar_kind = resource_field_kind(oauth_client_fk)
+    assert scalar_kind == "relation"
+    assert resource_field_widget(oauth_client_fk, scalar_kind) == "many2one"
 
 
-def test_scalar_id_relation_axis_classifies_as_leaf() -> None:
-    """A scalar-id FK stays a leaf even when it also contributes a group axis."""
+def test_scalar_id_relation_axis_preserves_django_relation_semantics() -> None:
+    """A grouped scalar-id FK remains a relation with a leaf projection."""
 
     oauth_client_fk = ExternalAccount._meta.get_field("oauth_client")
 
     kind = resource_field_kind(
         oauth_client_fk,
         has_relation_axis=True,
-        projected_as_scalar=True,
     )
 
-    assert kind == "scalar"
-    assert resource_field_widget(oauth_client_fk, kind) == "select"
+    assert kind == "relation"
+    assert resource_field_widget(oauth_client_fk, kind) == "many2one"
 
 
 def test_iam_schemas_expose_user_change_subscriptions(
@@ -1429,19 +1429,21 @@ def test_public_user_change_subscription_only_yields_the_actor(
     other = User.objects.create_user(username="preference-other")
     grant(actor=actor, role=app_settings.REBAC_UNIVERSAL_ADMIN_ROLE)
     actor_ref = to_subject_ref(actor)
-    assert backend().check_access(
-        subject=actor_ref,
-        action="read",
-        resource=to_object_ref(other),
-    ).allowed
+    assert (
+        backend()
+        .check_access(
+            subject=actor_ref,
+            action="read",
+            resource=to_object_ref(other),
+        )
+        .allowed
+    )
 
     actor.preferences = {"chrome.rail": {"expanded": False}}
     other.preferences = {"chrome.rail": {"expanded": True}}
     actor.set_password("reset-secret")
     user_resource = next(
-        resource
-        for resource in _schema("console").angee_resources
-        if resource.model_label == "iam.User"
+        resource for resource in _schema("console").angee_resources if resource.model_label == "iam.User"
     )
     readable_fields = readable_model_field_names(user_resource)
     assert "preferences" in readable_fields
@@ -1785,7 +1787,7 @@ def test_disconnect_account_blocks_last_oidc_sign_in_method_for_passwordless_use
 
     assert data["disconnect_account"] == {
         "ok": False,
-        "error": "only_sign_in_method",
+        "error": "This is your only sign-in method.",
         "error_code": "only_sign_in_method",
     }
     with system_context(reason="test assertions"):
@@ -1809,9 +1811,7 @@ def iam_connection_tables(transactional_db: Any) -> Iterator[None]:
     """
 
     del transactional_db
-    connection_models = tuple(
-        dict.fromkeys(MESSAGING_TEST_MODELS + POSTS_TEST_MODELS + AGENTS_GRAPHQL_MODELS)
-    )
+    connection_models = tuple(dict.fromkeys(MESSAGING_TEST_MODELS + POSTS_TEST_MODELS + AGENTS_GRAPHQL_MODELS))
     _create_connection_tables(connection_models)
     auth_models = tuple(_create_auth_app_tables())
     call_command("rebac", "sync", verbosity=0)
@@ -1825,9 +1825,7 @@ def _create_auth_app_tables() -> list[Any]:
     """Create missing tables for concrete managed models in the ``auth`` app."""
 
     auth_models = tuple(
-        model
-        for model in apps.get_app_config("auth").get_models()
-        if model._meta.managed and not model._meta.abstract
+        model for model in apps.get_app_config("auth").get_models() if model._meta.managed and not model._meta.abstract
     )
     return _create_connection_tables(auth_models)
 
@@ -1837,9 +1835,7 @@ def test_discover_oauth_endpoints_is_admin_gated_and_validates_discovery_url(
 ) -> None:
     """Discover is admin-gated and reports when no discovery URL is configured."""
 
-    plain = User.objects.create_user(
-        username="discover-plain", email="discover-plain@example.com"
-    )
+    plain = User.objects.create_user(username="discover-plain", email="discover-plain@example.com")
     admin = _platform_admin("discover-admin")
     client = _oauth_client("discoverable", discovery_url="")
     oauth_client_id = str(client.sqid)
@@ -1848,9 +1844,7 @@ def test_discover_oauth_endpoints_is_admin_gated_and_validates_discovery_url(
 
     assert _execute(console_schema, discover, {"id": oauth_client_id}, user=plain).errors is not None
 
-    result = _data(
-        _execute(console_schema, discover, {"id": oauth_client_id}, user=admin)
-    )["discover_oauth_endpoints"]
+    result = _data(_execute(console_schema, discover, {"id": oauth_client_id}, user=admin))["discover_oauth_endpoints"]
     assert result["ok"] is False
     assert "discovery url" in result["message"].lower()
 
