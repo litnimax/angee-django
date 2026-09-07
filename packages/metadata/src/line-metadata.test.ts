@@ -2,16 +2,16 @@ import { describe, expect, test } from "vitest";
 
 import {
   RelationRepresentationError,
-  lineChildModelMetadata,
   lineReadSelectionPaths,
   relationRepresentationForPath,
+  resourceReadSelectionPaths,
+  schemaFieldMetadataFromDataResources,
 } from "./artifact";
 import type {
   DataResourceFieldMetadata,
   DataResourceLinesMetadata,
-  ModelMetadata,
-  SchemaFieldMetadata,
 } from "./artifact";
+import { testDataResource, testResourceQuery, testQueryField } from "./testing";
 
 function field(
   name: string,
@@ -22,10 +22,7 @@ function field(
     name,
     kind,
     readable: true,
-    filterable: false,
-    sortable: false,
     aggregatable: false,
-    groupable: false,
     creatable: true,
     updatable: true,
     requiredOnCreate: false,
@@ -38,66 +35,50 @@ const LINES: DataResourceLinesMetadata = {
   modelLabel: "accounting.JournalItem",
   positionField: "position",
   fields: [
-    field("product", "relation", { relationModelLabel: "products.ProductVariant" }),
+    field("product", "relation", {
+      relationModelLabel: "products.ProductVariant",
+      relationObject: true,
+    }),
     field("priceUnit", "scalar", {
       scalar: "Decimal",
       widget: "money",
       currencyField: "entry.currency",
     }),
     field("role", "enum", { values: [{ value: "product" }, { value: "tax" }] }),
-    // An M2M child (F-b): a `kind: "list"` field carrying a relation target, read
-    // and written as a list of the related rows' public ids.
-    field("taxes", "list", { scalar: "ID", relationModelLabel: "accounting.Tax" }),
+    field("taxes", "list", {
+      scalar: "ID",
+      relationModelLabel: "accounting.Tax",
+    }),
+    field("ownerId", "relation", {
+      relationModelLabel: "accounts.User",
+      relationObject: false,
+    }),
   ],
 };
 
-describe("lineChildModelMetadata", () => {
-  const child = lineChildModelMetadata(LINES);
-
-  test("names the child model type from its label", () => {
-    expect(child.typeName).toBe("JournalItemType");
-  });
-
-  test("projects a relation column to its node type target", () => {
-    const product = child.fields.product;
-    expect(product?.kind).toBe("relation");
-    expect(product?.relationTarget).toBe("ProductVariantType");
-  });
-
-  test("carries the money widget and currency path so the cell resolves currency", () => {
-    const price = child.fields.priceUnit;
-    expect(price?.widget).toBe("money");
-    expect(price?.currencyField).toBe("entry.currency");
-    expect(price?.scalar).toBe("Decimal");
-  });
-
-  test("passes through enum values for a select cell", () => {
-    expect(child.fields.role?.values).toEqual([{ value: "product" }, { value: "tax" }]);
-  });
-
-  test("projects an M2M child to a list kind with its relation target", () => {
-    const taxes = child.fields.taxes;
-    expect(taxes?.kind).toBe("list");
-    expect(taxes?.relationTarget).toBe("TaxType");
+describe("line field references", () => {
+  test("uses the original wire fields without a synthetic child model", () => {
+    expect(LINES.fields?.[1]).toMatchObject({
+      name: "priceUnit",
+      widget: "money",
+      currencyField: "entry.currency",
+      scalar: "Decimal",
+    });
+    expect(LINES.fields?.[2]?.values).toEqual([
+      { value: "product" },
+      { value: "tax" },
+    ]);
   });
 });
 
 describe("lineReadSelectionPaths", () => {
-  const schema: SchemaFieldMetadata = {
-    types: {
-      ProductVariantType: {
-        typeName: "ProductVariantType",
-        fields: { name: { name: "name", kind: "scalar", scalar: "String" } },
-        recordRepresentation: "name",
-      },
-    },
-  };
+  const product = testDataResource("products.ProductVariant", {
+    recordRepresentation: "name",
+    fields: [field("name", "scalar", { scalar: "String" })],
+  });
+  const schema = schemaFieldMetadataFromDataResources([product]);
 
-  test("selects the child id, order column, scalars, enums, relation id + label, and the M2M id list", () => {
-    // The detail (`*_by_pk`) read must carry the lines' child columns so an
-    // existing document's lines seed the composer instead of reading as absent.
-    // An M2M child reads as a scalar list of public ids, so it is selected by
-    // name (no nested `.id`/`.label`), like the `list[ID]` node field it projects.
+  test("selects scalar, object relation, M2M id list, and ID-projected relation shapes", () => {
     expect(lineReadSelectionPaths(LINES, schema)).toEqual([
       "id",
       "position",
@@ -106,63 +87,53 @@ describe("lineReadSelectionPaths", () => {
       "priceUnit",
       "role",
       "taxes",
+      "ownerId",
     ]);
   });
 
-  test("fails by name when the relation representation target is unavailable", () => {
-    expect(() => lineReadSelectionPaths(LINES, { types: {} })).toThrow(
-      RelationRepresentationError,
-    );
+  test("fails by name when an object relation target is unavailable", () => {
+    expect(() =>
+      lineReadSelectionPaths(LINES, schemaFieldMetadataFromDataResources([]))
+    ).toThrow(RelationRepresentationError);
   });
 
   test("omits the order column when the child carries none", () => {
-    const withoutPosition: DataResourceLinesMetadata = {
-      ...LINES,
-      positionField: null,
-    };
-    expect(lineReadSelectionPaths(withoutPosition, schema)).not.toContain("position");
+    expect(lineReadSelectionPaths({ ...LINES, positionField: null }, schema))
+      .not.toContain("position");
   });
 });
 
 describe("relationRepresentationForPath", () => {
-  const model: ModelMetadata = {
-    typeName: "InitiativeProjectType",
-    fields: {
-      project: {
-        name: "project",
-        kind: "relation",
-        relationTarget: "ProjectType",
+  const product = testDataResource("catalog.Product", {
+    recordRepresentation: "name",
+    fields: [field("name", "scalar", { scalar: "String" })],
+  });
+  const project = testDataResource("projects.Project", {
+    query: testResourceQuery({ fields: { product: testQueryField("product", { relation: { model: "catalog.Product", identityPath: "product.id", labelPath: "product.name" } }) } }),
+    fields: [
+      field("product", "relation", {
+        relationModelLabel: "catalog.Product",
         relationObject: true,
-      },
-    },
-  };
-  const schema: SchemaFieldMetadata = {
-    types: {
-      ProjectType: {
-        typeName: "ProjectType",
-        fields: {
-          product: {
-            name: "product",
-            kind: "relation",
-            relationTarget: "ProductType",
-            relationObject: false,
-            relationFilter: {
-              field: "product",
-              mode: "lookup",
-              lookup: "sqid",
-            },
-          },
-        },
-      },
-      ProductType: {
-        typeName: "ProductType",
-        recordRepresentation: "name",
-        fields: { name: { name: "name", kind: "scalar", scalar: "String" } },
-      },
-    },
-  };
+      }),
+    ],
+  });
+  const initiative = testDataResource("projects.Initiative", {
+    query: testResourceQuery({ fields: { project: testQueryField("project", { relation: { model: "projects.Project", identityPath: "project.id", labelPath: null } }) } }),
+    fields: [
+      field("project", "relation", {
+        relationModelLabel: "projects.Project",
+        relationObject: true,
+      }),
+    ],
+  });
+  const schema = schemaFieldMetadataFromDataResources([
+    initiative,
+    project,
+    product,
+  ]);
+  const model = schema.labels["projects.Initiative"]!;
 
-  test("expands a nested relation-terminal path to id plus representation", () => {
+  test("expands a nested relation-terminal path using canonical model labels", () => {
     expect(relationRepresentationForPath("project.product", model, schema)).toEqual({
       selectionPaths: ["project.product.id", "project.product.name"],
       displayPath: "project.product.name",
@@ -174,62 +145,69 @@ describe("relationRepresentationForPath", () => {
       .toBeNull();
   });
 
-  test("leaves an explicit continuation structural when an intermediate target has no metadata type", () => {
-    const message: ModelMetadata = {
-      typeName: "MessageType",
-      fields: {
-        thread: {
-          name: "thread",
-          kind: "relation",
-          relationTarget: "ThreadType",
+  test("leaves an explicit dotted continuation structural without an indexed intermediate", () => {
+    const message = testDataResource("messaging.Message", {
+      fields: [
+        field("thread", "relation", {
+          relationModelLabel: "messaging.Thread",
           relationObject: true,
-        },
-      },
-    };
-    const messagingSchema: SchemaFieldMetadata = {
-      types: {
-        ThreadType: {
-          typeName: "ThreadType",
-          fields: {
-            title: {
-              name: "title",
-              kind: "relation",
-              relationTarget: "FragmentType",
-              relationObject: true,
-            },
-          },
-        },
-      },
-    };
-
+        }),
+      ],
+    });
+    const messaging = schemaFieldMetadataFromDataResources([message]);
     expect(
-      relationRepresentationForPath("thread.title.text", message, messagingSchema),
+      relationRepresentationForPath(
+        "thread.title.text",
+        messaging.labels["messaging.Message"]!,
+        messaging,
+      ),
     ).toBeNull();
   });
 
-  test("still fails by name when a relation-terminal target type is missing", () => {
-    expect(() =>
-      relationRepresentationForPath("project", model, { types: {} })
-    ).toThrow(
-      'Relation field "project" targets missing metadata type "ProjectType".',
-    );
+  test("uses finalized paths without requiring the target resource inventory", () => {
+    const missing = schemaFieldMetadataFromDataResources([initiative]);
+    expect(relationRepresentationForPath("project", missing.labels["projects.Initiative"]!, missing)).toEqual({
+      selectionPaths: ["project.id"], displayPath: "project.id",
+    });
   });
 
-  test("still fails by name when a relation-terminal representation is undeclared", () => {
-    const missingRepresentation: SchemaFieldMetadata = {
-      types: {
-        ProjectType: {
-          typeName: "ProjectType",
-          fields: {},
-          recordRepresentation: "title",
-        },
-      },
-    };
+  test("does not guess a public identity absent from the actual relation projection", () => {
+    const labelOnly = testDataResource("projects.Initiative", {
+      fields: initiative.fields,
+      query: testResourceQuery({ fields: { project: testQueryField("project", { relation: { model: "projects.Project", identityPath: null, labelPath: "project.title" } }) } }),
+    });
+    const schema = schemaFieldMetadataFromDataResources([labelOnly]);
+    expect(relationRepresentationForPath("project", schema.labels["projects.Initiative"]!, schema)).toEqual({ selectionPaths: ["project.title"], displayPath: "project.title" });
+  });
 
-    expect(() =>
-      relationRepresentationForPath("project", model, missingRepresentation)
-    ).toThrow(
-      'Record representation "title" is not declared on "ProjectType".',
-    );
+  test("fails when a relation has no finalized selectable representation", () => {
+    const broken = schemaFieldMetadataFromDataResources([{ ...initiative, query: testResourceQuery() }]);
+    expect(() => relationRepresentationForPath("project", broken.labels["projects.Initiative"]!, broken)).toThrow(/no finalized selectable representation/);
+  });
+
+});
+
+describe("resourceReadSelectionPaths", () => {
+  test("selects an explicitly ID-projected relation as a leaf", () => {
+    const account = testDataResource("accounts.Account", {
+      fields: [
+        field("ownerId", "relation", {
+          relationModelLabel: "accounts.User",
+          relationObject: false,
+        }),
+      ],
+    });
+    const schema = schemaFieldMetadataFromDataResources([account]);
+
+    expect(
+      resourceReadSelectionPaths(schema.labels["accounts.Account"]!, schema),
+    ).toEqual(["id", "ownerId"]);
+    expect(
+      relationRepresentationForPath(
+        "ownerId",
+        schema.labels["accounts.Account"]!,
+        schema,
+      ),
+    ).toBeNull();
   });
 });

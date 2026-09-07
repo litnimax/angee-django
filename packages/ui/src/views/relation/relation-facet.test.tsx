@@ -4,15 +4,12 @@ import {
   renderHook } from "@testing-library/react";
 import type { ResourceFacetOption } from "@angee/refine";
 import {
+  ResourceQuery,
+  schemaFieldMetadataFromDataResources,
   ModelMetadataProvider,
-} from "@angee/metadata";
-import type {
-  DataResourceMetadata,
-  SchemaFieldMetadata,
 } from "@angee/metadata";
 import {
   testDataResource,
-  withTestResourceInventory,
 } from "@angee/metadata/testing";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, test, vi } from "vitest";
@@ -42,6 +39,7 @@ vi.mock("@angee/refine", async (importOriginal) => {
 });
 
 const GROUPS_TARGET = {
+  modelLabel: "agents.InferenceModel",
   dataProviderName: "console",
   root: "inference_models_groups",
 };
@@ -50,7 +48,7 @@ beforeEach(() => {
   dataMocks.facets.mockReset();
   dataMocks.facets.mockReturnValue(resourceFacets({
     provider: facetOptions(),
-    publisher: facetOptions(),
+    publisher: facetOptions().map((option) => ({ ...option, key: { publisher: option.value } })),
   }));
 });
 
@@ -78,10 +76,15 @@ describe("useRelationFacets", () => {
             field: "provider_Name",
             direction: "ASC",
             nulls: "LAST",
+          }, {
+            field: "providerId",
+            direction: "ASC",
+            nulls: "LAST",
           }],
           valueKey: "providerId",
           labelKey: "provider_Name",
           pageSize: 200,
+          where: {},
         }],
         enabled: true,
       },
@@ -91,23 +94,21 @@ describe("useRelationFacets", () => {
         id: "provider:provider-anthropic",
         label: "Anthropic",
         chipLabel: "Anthropic",
-        filter: { provider: { sqid: "provider-anthropic" } },
+        filter: { provider: { exact: "provider-anthropic" } },
       },
       {
         id: "provider:provider-openai",
         label: "OpenAI",
         chipLabel: "OpenAI",
-        filter: { provider: { sqid: "provider-openai" } },
+        filter: { provider: { exact: "provider-openai" } },
       },
     ]);
-    expect(result.current.filterFields).toEqual([]);
+    expect(result.current.filterFields).toEqual(expect.arrayContaining([expect.objectContaining({ type: "selection" })]));
     expect(result.current.groupOptions).toEqual([{
-      id: "provider.name",
+      id: "provider",
       label: "Provider",
       group: {
-        field: "provider.name",
-        aggregateField: "provider",
-        aggregateKey: "providerId",
+        field: "provider",
       },
     }]);
   });
@@ -119,7 +120,7 @@ describe("useRelationFacets", () => {
           "agents.InferenceModel",
           [{ field: "provider", label: "Provider" }],
           {
-            provider: { sqid: "provider-openai" },
+            provider: { exact: "provider-openai" },
             name: { iContains: "launch" },
           },
         ),
@@ -138,6 +139,10 @@ describe("useRelationFacets", () => {
           ],
           orderBy: [{
             field: "provider_Name",
+            direction: "ASC",
+            nulls: "LAST",
+          }, {
+            field: "providerId",
             direction: "ASC",
             nulls: "LAST",
           }],
@@ -162,16 +167,14 @@ describe("useRelationFacets", () => {
 
     expect(result.current.filters[0]).toMatchObject({
       id: "publisher:provider-anthropic",
-      filter: { publisher: { sqid: "provider-anthropic" } },
+      filter: { publisher: { exact: "provider-anthropic" } },
     });
-    expect(result.current.filterFields).toEqual([]);
+    expect(result.current.filterFields).toEqual(expect.arrayContaining([expect.objectContaining({ type: "selection" })]));
     expect(result.current.groupOptions).toEqual([{
-      id: "publisher.name",
+      id: "publisher",
       label: "Publisher",
       group: {
-        field: "publisher.name",
-        aggregateField: "publisher",
-        aggregateKey: "publisher",
+        field: "publisher",
       },
     }]);
   });
@@ -180,7 +183,7 @@ describe("useRelationFacets", () => {
     const { result } = renderHook(
       () =>
         useRelationFacets("agents.InferenceModel", [
-          { field: "name", filterField: "name" },
+          { field: "name" },
         ]),
       { wrapper: Metadata },
     );
@@ -201,101 +204,25 @@ describe("useRelationFacets", () => {
   });
 });
 
-const METADATA: SchemaFieldMetadata = withTestResourceInventory({
-  types: {
-    InferenceModelType: {
-      typeName: "InferenceModelType",
-      fields: {
-        provider: {
-          name: "provider",
-          kind: "relation",
-          relationTarget: "InferenceProviderType",
-          relationFilter: {
-            field: "provider",
-            mode: "lookup",
-            lookup: "sqid",
-            aggregateKey: "providerId",
-            labelKey: "provider_Name",
-          },
-        },
-        publisher: {
-          name: "publisher",
-          kind: "relation",
-          relationTarget: "InferenceProviderType",
-          relationFilter: {
-            field: "publisher",
-            mode: "lookup",
-            lookup: "sqid",
-            aggregateKey: "publisher",
-          },
-        },
-        name: { name: "name", kind: "scalar", scalar: "String" },
-      },
-      resource: {
-        schemaName: "console",
-        modelLabel: "agents.InferenceModel",
-        appLabel: "agents",
-        modelName: "inferencemodel",
-        publicIdField: "sqid",
-        roots: { groups: "inference_models_groups" },
-        typeNames: { node: "InferenceModelType" },
-        capabilities: ["list", "groups"],
-        filterFields: ["provider", "publisher"],
-        orderFields: [],
-        aggregateFields: ["id"],
-        groupByFields: ["provider", "provider_Name", "publisher"],
-        groupDimensions: [
-          {
-            field: "provider",
-            input: "PROVIDER",
-            key: "providerId",
-            kind: "relation",
-            scalar: "ID",
-          },
-          {
-            field: "provider_Name",
-            input: "PROVIDER__NAME",
-            key: "provider_Name",
-            kind: "column",
-            scalar: "String",
-          },
-          {
-            field: "publisher",
-            input: "PUBLISHER",
-            key: "publisher",
-            kind: "relation",
-            scalar: "ID",
-          },
-        ],
-        relationAxes: [],
-      },
-    },
-    InferenceProviderType: {
-      typeName: "InferenceProviderType",
-      recordRepresentation: "name",
-      rootFields: { list: "inference_providers" },
-      resource: relationResource(
-        "agents.InferenceProvider",
-        "inference_providers",
-      ),
-      fields: {
-        name: { name: "name", kind: "scalar", scalar: "String" },
-      },
-    },
-  },
-});
-
-function relationResource(
-  modelLabel: string,
-  list: string,
-): DataResourceMetadata {
-  return testDataResource(modelLabel, {
-    publicIdField: "sqid",
-    roots: { list },
-    typeNames: {},
-    capabilities: ["list"],
-  });
+const query = ResourceQuery.forRows({ fields: {
+  id: { scalar: "ID" }, name: { scalar: "String" },
+  provider: { kind: "relation", identityPath: "provider.id", labelPath: "provider.name" },
+  publisher: { kind: "relation", identityPath: "publisher.id", labelPath: "publisher.name" },
+} }).contract;
+for (const field of ["provider", "publisher"]) {
+  const key = field === "provider" ? "providerId" : "publisher";
+  query.axes[field]!.server = { input: field.toUpperCase(), key,
+    ...(field === "provider" ? { labelInput: "PROVIDER__NAME", labelKey: "provider_Name" } : {}),
+  };
+  query.axes[field]!.drill = { kind: "identity", field, valueKey: key, nullMode: "isNull", valueMap: [] };
 }
+const METADATA = schemaFieldMetadataFromDataResources([testDataResource("agents.InferenceModel", {
+  roots: { groups: "inference_models_groups" }, query,
+  fields: ["name", "provider", "publisher"].map((name) => ({ name,
+    kind: name === "name" ? "scalar" : "relation", scalar: name === "name" ? "String" : "ID",
+    readable: true, aggregatable: false, creatable: false, updatable: false, requiredOnCreate: false,
+  })),
+})]);
 
 function Metadata({ children }: { children: ReactNode }): ReactNode {
   return (

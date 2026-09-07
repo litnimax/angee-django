@@ -9,8 +9,9 @@ import type { DocumentVariables } from "@angee/refine";
 
 export const IamOverview = graphql(`
   query IamOverview($peekLimit: Int = 6) {
-    roles {
+    iam_roles(limit: 1000, order_by: [{ namespace: asc }, { role_id: asc }]) {
       id
+      role_id
       namespace
       label
     }
@@ -86,8 +87,8 @@ export const IamRebacSchema = graphql(`
 export const IAM_ROLE_MUTATION_INVALIDATES = ["iam.Grant", "iam.Relationship"] as const;
 
 export const IamRevokeRole = graphql(`
-  mutation IamRevokeRole($principal_id: String!, $role: String!) {
-    revoke_role(principal_id: $principal_id, role: $role)
+  mutation IamRevokeRole($principal_id: String!, $role: String!, $caveat_name: String! = "") {
+    revoke_role(principal_id: $principal_id, role: $role, caveat_name: $caveat_name)
   }
 `);
 
@@ -96,10 +97,6 @@ export const IamGrantRole = graphql(`
     grant_role(principal_id: $principal_id, role: $role)
   }
 `);
-
-/** One `roles` row, derived from the `IamOverview` selection — the same
- * `{id, namespace, label}` shape the dropped standalone `IamRoles` query exposed. */
-export type IAMRole = DocumentType<typeof IamOverview>["roles"][number];
 
 export type IAMOverviewVariables = DocumentVariables<typeof IamOverview>;
 

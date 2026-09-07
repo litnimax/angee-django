@@ -12,11 +12,14 @@ from typing import Any
 import strawberry
 from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured, ValidationError
 from django.db import models, transaction
+from django.db.models.expressions import Combinable
 from rebac import PermissionDenied, system_context
 from strawberry_django.mutations import resolvers as mutation_resolvers
 from strawberry_django_aggregates import (
     default_operators_for,
     group_by_alias,
+    group_by_enum_member,
+    group_by_range_alias,
 )
 from strawberry_django_aggregates.granularity import NumberGranularity, TimeGranularity
 from strawberry_django_hasura import (
@@ -39,44 +42,48 @@ from angee.base.scoping import (
     bind_actor,
     requires_angee_rebac_contract,
 )
-from angee.data.field_classification import is_to_one_relation, model_field_scalar
+from angee.data.field_classification import (
+    is_to_one_relation,
+)
 from angee.data.metadata import (
     DataAggregateMeasureMetadata,
-    DataGroupBucketFilterMetadata,
-    DataGroupBucketFilterValueMapMetadata,
-    DataGroupDimensionMetadata,
-    DataGroupExtractionMetadata,
     DataLinesMetadata,
+    DataQueryAxis,
+    DataQueryDrill,
+    DataQueryExtraction,
+    DataQueryServerAxis,
+    DataQueryValueMap,
     DataResourceFieldMetadata,
     DataResourceRoots,
     DataResourceSubtitleMetadata,
-    DataResourceTypeNames,
 )
 from angee.graphql.access import assert_no_gated_read_fields
 from angee.graphql.constants import PUBLIC_ID_FIELD_NAME
+from angee.graphql.data.lookups import resource_filter_lookups
 from angee.graphql.data.metadata import (
-    attach_data_resource_metadata,
-    make_data_resource_metadata,
-    model_resource_fields,
+    DataResourceContribution,
+    DataResourcePolicy,
+    attach_data_resource_contribution,
     relation_group_by_fields,
-    resource_fields,
     resource_type_name,
     resource_wire_field_name,
     resource_wire_field_names,
 )
-from angee.graphql.data.resource_bundle import resource_query_metadata
+from angee.graphql.data.resource_fields import (
+    final_input_only_resource_fields,
+    final_input_wire_fields,
+    final_required_input_wire_fields,
+    final_resource_fields,
+)
 from angee.graphql.deletion import delete_by_public_id
 from angee.graphql.ids import PublicID, require_instance_for_id
 from angee.graphql.introspection import (
     FieldPathError,
     require_field_for_path,
 )
+from angee.graphql.relations import actor_scoped_relation_group_expression
 from angee.graphql.writes import write_queryset
-
-# The stock Refine provider emits anchored regexes for case-insensitive
-# starts/ends-with. Enable the Django lookup per model resource; computed
-# sources retain the upstream portable operator set.
-_HASURA_FILTER_LOOKUPS = {"iregex": ("__iregex", False)}
+from graphql import GraphQLError
 
 
 @dataclass(frozen=True)
@@ -377,7 +384,7 @@ class AngeeHasuraWriteBackend:
                 return
             message = self.delete_guard(instance)
             if message:
-                raise ValueError(message)
+                raise GraphQLError(message, extensions={"code": "BAD_USER_INPUT"})
 
         preview = delete_by_public_id(
             self.model,
@@ -589,6 +596,24 @@ def _aggregate_queryset(
     return get_aggregate_queryset
 
 
+def _group_by_expression_provider(
+    info: strawberry.Info,
+    queryset: models.QuerySet[Any],
+    spec: list[tuple[str, Any]],
+) -> Mapping[str, Combinable]:
+    """Project selected related scalar axes through actor-scoped guards."""
+
+    del info
+    expressions: dict[str, Combinable] = {}
+    for path, _granularity in spec:
+        if "__" not in path or "." in path:
+            continue
+        expression = actor_scoped_relation_group_expression(queryset, path)
+        if expression is not None:
+            expressions[path] = expression
+    return expressions
+
+
 def declared_hasura_resource_fields(
     model: type[models.Model],
     attribute: str,
@@ -685,6 +710,7 @@ def hasura_model_resource(  # noqa: PLR0913 - mirrors the upstream declarative b
     name: str | None = None,
     filterable: Sequence[str],
     sortable: Sequence[str],
+    sortable_aliases: Mapping[str, str] | None = None,
     aggregatable: Sequence[str],
     groupable: Sequence[str] = (),
     json_paths: Mapping[str, str] | None = None,
@@ -701,7 +727,6 @@ def hasura_model_resource(  # noqa: PLR0913 - mirrors the upstream declarative b
     write_backend: WriteBackend | None = None,
     id_decode: Callable[[Any], Any] | None = None,
     id_column: str = "pk",
-    declared_fields: Sequence[str | DataResourceFieldMetadata] = (),
     model_label: str | None = None,
     public_id_field: str = PUBLIC_ID_FIELD_NAME,
     row_model: str = "server",
@@ -778,17 +803,20 @@ def hasura_model_resource(  # noqa: PLR0913 - mirrors the upstream declarative b
         declared=field_id_decode,
     )
     active_json_paths = dict(json_paths or {})
+    filter_lookups = resource_filter_lookups(model, tuple(filterable))
     resource = build_hasura_resource(
         node,
         model=model,
         name=name,
         filterable=list(filterable),
         sortable=list(sortable),
+        sortable_aliases=sortable_aliases,
         aggregatable=list(aggregatable),
         groupable=list(active_groupable) or None,
         json_paths=active_json_paths,
         group_key_encoders=_relation_group_key_encoders(model, active_groupable),
-        filter_lookups=_HASURA_FILTER_LOOKUPS,
+        get_group_by_expressions=_group_by_expression_provider,
+        filter_lookups=filter_lookups,
         writable=list(writable) if writable is not None else None,
         insertable=list(insertable) if insertable is not None else None,
         updatable=list(updatable) if updatable is not None else None,
@@ -809,17 +837,13 @@ def hasura_model_resource(  # noqa: PLR0913 - mirrors the upstream declarative b
         resource,
         node=node,
         model=model,
-        name=resource_name,
         filterable=tuple(filterable),
         sortable=tuple(sortable),
         aggregatable=tuple(aggregatable),
         groupable=active_groupable,
         json_paths=active_json_paths,
-        insert=insert,
-        update=update,
-        delete=delete,
+        filter_operators=tuple(filter_lookups),
         lines=lines,
-        declared_fields=tuple(declared_fields),
         model_label=model_label,
         public_id_field=public_id_field,
         row_model=row_model,
@@ -971,129 +995,49 @@ def attach_hasura_resource_metadata(
     *,
     node: type,
     model: type[models.Model],
-    name: str,
     filterable: tuple[str, ...],
     sortable: tuple[str, ...],
     aggregatable: tuple[str, ...],
     groupable: tuple[str, ...] = (),
     json_paths: Mapping[str, str] | None = None,
-    insert: bool = True,
-    update: bool = True,
-    delete: bool = True,
+    filter_operators: tuple[str, ...] = (),
     lines: HasuraLines | None = None,
-    declared_fields: tuple[str | DataResourceFieldMetadata, ...] = (),
     model_label: str | None = None,
     public_id_field: str = PUBLIC_ID_FIELD_NAME,
     row_model: str = "server",
     subtitle: DataResourceSubtitleMetadata | None = None,
 ) -> HasuraResource:
-    """Attach Angee resource metadata to a built Hasura resource bundle."""
+    """Attach the native bundle and Angee-only policy for final projection."""
 
-    roots, type_names, filter_type, order_type = resource_query_metadata(resource)
-    insert_input_type = resource.insert_input_type
-    set_input_type = resource.set_input_type
-    insert_one_root = resource.insert_one_root
-    update_by_pk_root = resource.update_by_pk_root
-    delete_by_pk_root = resource.delete_by_pk_root
-    insert = "insert" in resource.enabled_operations
-    update = "update" in resource.enabled_operations
-    delete = "delete" in resource.enabled_operations
-
-    parent_create_fields = (
-        resource_wire_field_names(insert_input_type, exclude=_parent_write_exclude(lines)) if insert else ()
-    )
-    parent_update_fields = resource_wire_field_names(set_input_type, exclude=("id",)) if update else ()
     active_json_paths = dict(json_paths or {})
-    fields = model_resource_fields(
-        model,
-        declared_fields,
-        filter_fields=filterable,
-        order_fields=sortable,
-        aggregate_fields=aggregatable,
-        group_by_fields=groupable,
-        create_fields=parent_create_fields,
-        update_fields=parent_update_fields,
-    )
-    if roots.detail_name is None:
+    if resource.detail_root is None:
         raise ImproperlyConfigured(f"{model._meta.label} Hasura resource did not expose a detail root.")
-    attach_data_resource_metadata(
-        resource.query,
-        make_data_resource_metadata(
-            model=model,
-            model_label=model_label,
-            public_id_field=public_id_field,
-            node_type=node,
-            filter_type=filter_type,
-            order_type=order_type,
-            roots=roots,
-            type_names=type_names,
-            capabilities=("list", "detail", "aggregate", *(("groups",) if groupable else ())),
+    contribution = DataResourceContribution(
+        model=model,
+        model_label=model_label or model._meta.label,
+        native_resource=resource,
+        roots=DataResourceRoots(
+            save_name=(
+                resource_wire_field_name(resource.mutation, f"{resource.name}_save") if lines is not None else None
+            )
+        ),
+        policy=DataResourcePolicy(
             filter_fields=filterable,
+            filter_operators=filter_operators,
             order_fields=sortable,
             aggregate_fields=aggregatable,
             group_by_fields=groupable,
-            group_dimensions=_hasura_group_dimensions(model, groupable, filterable, json_paths=active_json_paths),
+            query_axes=_hasura_query_axes(model, groupable, filterable, json_paths=active_json_paths),
             aggregate_measures=_hasura_aggregate_measures(model, aggregatable),
             default_measures=(DataAggregateMeasureMetadata(op="count"),),
-            fields=fields,
+            public_id_field=public_id_field,
             row_model=row_model,
             subtitle=subtitle,
+            lines_declaration=lines,
         ),
     )
-    mutation_capabilities = tuple(
-        "create" if operation == "insert" else operation for operation in resource.enabled_operations
-    )
-    if lines is not None:
-        mutation_capabilities = (*mutation_capabilities, "save")
-    if mutation_capabilities:
-        save_root = resource_wire_field_name(resource.mutation, f"{name}_save") if lines is not None else None
-        attach_data_resource_metadata(
-            resource.mutation,
-            make_data_resource_metadata(
-                model=model,
-                model_label=model_label,
-                public_id_field=public_id_field,
-                node_type=node,
-                roots=DataResourceRoots(
-                    create_name=(
-                        resource_wire_field_name(
-                            resource.mutation,
-                            insert_one_root,
-                        )
-                        if insert and insert_one_root is not None
-                        else None
-                    ),
-                    update_name=(
-                        resource_wire_field_name(
-                            resource.mutation,
-                            update_by_pk_root,
-                        )
-                        if update and update_by_pk_root is not None
-                        else None
-                    ),
-                    save_name=save_root,
-                    delete_name=(
-                        resource_wire_field_name(
-                            resource.mutation,
-                            delete_by_pk_root,
-                        )
-                        if delete and delete_by_pk_root is not None
-                        else None
-                    ),
-                ),
-                type_names=DataResourceTypeNames(
-                    node=resource_type_name(node),
-                    create_input=resource_type_name(insert_input_type),
-                    update_input=resource_type_name(set_input_type),
-                ),
-                create_input_type=insert_input_type,
-                update_input_type=set_input_type,
-                create_fields=parent_create_fields,
-                update_fields=parent_update_fields,
-                lines=_line_metadata(lines, resource) if lines is not None else None,
-                capabilities=mutation_capabilities,
-            ),
-        )
+    attach_data_resource_contribution(resource.query, contribution)
+    attach_data_resource_contribution(resource.mutation, contribution)
     return resource
 
 
@@ -1103,16 +1047,25 @@ def _parent_write_exclude(lines: HasuraLines | None) -> tuple[str, ...]:
     return ("id",) if lines is None else ("id", lines.field)
 
 
-def _line_metadata(lines: HasuraLines, resource: HasuraResource) -> DataLinesMetadata:
+def _line_metadata(
+    lines: HasuraLines,
+    resource: HasuraResource,
+    schema: Any,
+) -> DataLinesMetadata:
     """Return the frontend editable-lines contract for a document resource."""
 
     line_input = resource.nested_input_types.get(lines.field)
-    child_fields = resource_wire_field_names(line_input, exclude=("id",))
+    input_name = resource_type_name(line_input)
+    child_fields = final_input_wire_fields(
+        schema,
+        input_name,
+        accepted=resource_wire_field_names(line_input, exclude=("id",)),
+    )
     return DataLinesMetadata(
         field=lines.field,
         model_label=lines.model._meta.label,
-        input_type=resource_type_name(line_input),
-        fields=_line_child_fields(lines, child_fields),
+        input_type=input_name,
+        fields=_line_child_fields(lines, child_fields, schema, input_name),
         position_field=lines.position_field if _has_model_field(lines.model, lines.position_field) else None,
     )
 
@@ -1120,53 +1073,51 @@ def _line_metadata(lines: HasuraLines, resource: HasuraResource) -> DataLinesMet
 def _line_child_fields(
     lines: HasuraLines,
     child_fields: tuple[str, ...],
+    schema: Any,
+    input_name: str | None,
 ) -> tuple[DataResourceFieldMetadata, ...]:
     """Return per-column metadata for a document's editable child fields.
 
     The child **node** surface owns each field's projected shape — an enum's
     values, a relation/list target — so the line cells read it there through the
-    same :func:`resource_fields` classifier the parent resource uses, instead of
-    re-deriving enum members and item shapes from the model (which the bare model
-    reconstruction cannot do). An M2M child is a ``kind="list"`` relation whose
+    final composed node and input types instead of re-deriving enum members and
+    item shapes from the model. An M2M child is a ``kind="list"`` relation whose
     target the frontend renders as a multi-select and persists as public ids; an
-    enum child carries its wire values. A writable child column the node does not
-    project (a write-only relation) falls back to the model reconstruction.
+    enum child carries its final wire values. Accepted input-only fields retain
+    Django relation and widget semantics with ``readable=False``.
     """
 
-    wanted = set(child_fields)
-    by_name: dict[str, DataResourceFieldMetadata] = {
-        field.name: field for field in _line_node_fields(lines, child_fields) if field.name in wanted
-    }
-    unprojected = tuple(name for name in child_fields if name not in by_name)
-    for field in model_resource_fields(
-        lines.model,
-        unprojected,
-        create_fields=unprojected,
-        update_fields=unprojected,
-    ):
-        by_name[field.name] = field
-    return tuple(by_name[name] for name in child_fields)
-
-
-def _line_node_fields(
-    lines: HasuraLines,
-    child_fields: tuple[str, ...],
-) -> tuple[DataResourceFieldMetadata, ...]:
-    """Return node-surface field metadata for the editable child columns."""
-
-    if lines.node is None:
-        return ()
-    return resource_fields(
-        lines.node,
-        lines.model,
-        filter_fields=(),
-        order_fields=(),
+    required = final_required_input_wire_fields(
+        schema,
+        input_name,
+        accepted=child_fields,
+    )
+    readable: tuple[DataResourceFieldMetadata, ...] = ()
+    node_name = resource_type_name(lines.node)
+    if node_name is not None and schema.get_type(node_name) is not None:
+        readable = final_resource_fields(
+            schema,
+            node_name,
+            lines.model,
+            aggregate_fields=(),
+            create_fields=child_fields,
+            update_fields=child_fields,
+            required_create_fields=required,
+        )
+    input_only = final_input_only_resource_fields(
+        schema,
+        create_input_name=input_name,
+        update_input_name=input_name,
+        model=lines.model,
         aggregate_fields=(),
-        group_by_fields=(),
         create_fields=child_fields,
         update_fields=child_fields,
-        required_create_fields=(),
-        relation_axes=(),
+        required_create_fields=required,
+        readable_fields=readable,
+    )
+    wanted = set(child_fields)
+    return tuple(
+        field for field in (*readable, *input_only) if field.name in wanted or field.model_field_name in wanted
     )
 
 
@@ -1180,38 +1131,39 @@ def _has_model_field(model: type[models.Model], name: str) -> bool:
     return True
 
 
-def _hasura_group_dimensions(
+def _hasura_query_axes(
     model: type[models.Model],
     groupable: tuple[str, ...],
     filterable: tuple[str, ...],
     *,
     json_paths: Mapping[str, str] | None = None,
-) -> tuple[DataGroupDimensionMetadata, ...]:
+) -> tuple[DataQueryAxis, ...]:
     """Return typed-key group metadata using the aggregate builder's public contract."""
 
     active_json_paths = dict(json_paths or {})
-    return tuple(_hasura_group_dimension(model, path, filterable, json_paths=active_json_paths) for path in groupable)
+    return tuple(_hasura_query_axis(model, path, filterable, json_paths=active_json_paths) for path in groupable)
 
 
-def _hasura_group_dimension(
+def _hasura_query_axis(
     model: type[models.Model],
     path: str,
     filterable: tuple[str, ...],
     *,
     json_paths: Mapping[str, str] | None = None,
-) -> DataGroupDimensionMetadata:
+) -> DataQueryAxis:
     declared_json_type = (json_paths or {}).get(path)
     if declared_json_type is not None:
         key = group_by_alias(path, None)
         filter_metadata = _hasura_json_group_bucket_filter(model, path, key)
-        return DataGroupDimensionMetadata(
+        return DataQueryAxis(
             field=path,
-            input=_group_input_name(path),
-            key=key,
+            server=DataQueryServerAxis(input=group_by_enum_member(path), key=key),
             kind="json",
-            scalar=_scalar_for_json_group_type(declared_json_type),
-            filter=filter_metadata,
-            extractions=_hasura_json_group_extractions(path, declared_json_type, key),
+            drill=filter_metadata,
+            extractions=_hasura_group_extractions(
+                path,
+                declared_json_type=declared_json_type,
+            ),
         )
     field = _require_group_field(model, path)
     key = _group_key_path(field, path)
@@ -1223,35 +1175,43 @@ def _hasura_group_dimension(
         filterable=filterable,
         is_relation=is_relation,
     )
-    return DataGroupDimensionMetadata(
+    return DataQueryAxis(
         field=path,
-        input=_group_input_name(path),
-        key=key,
-        kind="relation" if is_relation else "column",
-        scalar="ID" if is_relation else _scalar_for_field(field),
-        filter=filter_metadata,
-        extractions=_hasura_group_extractions(field, key, filter_metadata),
+        server=DataQueryServerAxis(input=group_by_enum_member(path), key=key),
+        kind="relation"
+        if is_relation
+        else "date"
+        if isinstance(field, (models.DateField, models.DateTimeField))
+        else "column",
+        drill=filter_metadata,
+        extractions=_hasura_group_extractions(
+            path,
+            field=field,
+            bucket_filter=filter_metadata,
+        ),
     )
 
 
 def _hasura_group_extractions(
-    field: models.Field[Any, Any],
-    key: str,
-    bucket_filter: DataGroupBucketFilterMetadata | None,
-) -> tuple[DataGroupExtractionMetadata, ...]:
-    if not isinstance(field, (models.DateField, models.DateTimeField)):
+    path: str,
+    *,
+    field: models.Field[Any, Any] | None = None,
+    declared_json_type: str | None = None,
+    bucket_filter: DataQueryDrill | None = None,
+) -> tuple[DataQueryExtraction, ...]:
+    if not (isinstance(field, (models.DateField, models.DateTimeField)) or declared_json_type in {"date", "datetime"}):
         return ()
-    extractions: list[DataGroupExtractionMetadata] = []
+    extractions: list[DataQueryExtraction] = []
     for granularity in (*TimeGranularity, *NumberGranularity):
-        extraction_key = f"{key}_{granularity.value}"
-        range_key = f"{key}_{granularity.value}_range" if isinstance(granularity, TimeGranularity) else None
+        extraction_key = group_by_alias(path, granularity, field)
+        range_key = group_by_range_alias(path, granularity) if isinstance(granularity, TimeGranularity) else None
         extractions.append(
-            DataGroupExtractionMetadata(
+            DataQueryExtraction(
                 name=granularity.value,
                 input=granularity.name,
                 key=extraction_key,
                 range_key=range_key,
-                filter=(
+                drill=(
                     _hasura_group_range_filter(
                         bucket_filter,
                         value_key=extraction_key,
@@ -1265,30 +1225,6 @@ def _hasura_group_extractions(
     return tuple(extractions)
 
 
-def _hasura_json_group_extractions(
-    path: str,
-    declared_type: str,
-    key: str,
-) -> tuple[DataGroupExtractionMetadata, ...]:
-    """Return date/datetime extraction metadata for a JSON-path group axis."""
-
-    if declared_type not in {"date", "datetime"}:
-        return ()
-    extractions: list[DataGroupExtractionMetadata] = []
-    for granularity in (*TimeGranularity, *NumberGranularity):
-        extraction_key = group_by_alias(path, granularity)
-        range_key = f"{extraction_key}_range" if isinstance(granularity, TimeGranularity) else None
-        extractions.append(
-            DataGroupExtractionMetadata(
-                name=granularity.value,
-                input=granularity.name,
-                key=extraction_key,
-                range_key=range_key,
-            )
-        )
-    return tuple(extractions)
-
-
 def _hasura_group_bucket_filter(
     field: models.Field[Any, Any],
     path: str,
@@ -1296,29 +1232,27 @@ def _hasura_group_bucket_filter(
     *,
     filterable: tuple[str, ...],
     is_relation: bool,
-) -> DataGroupBucketFilterMetadata | None:
+) -> DataQueryDrill | None:
     """Return the backend-owned drill-down filter for a group dimension."""
 
     filter_field = _group_filter_field(path, filterable)
     if filter_field is None:
         return None
     if is_relation:
-        return DataGroupBucketFilterMetadata(
-            kind="equality",
+        return DataQueryDrill(
+            kind="identity",
             field=filter_field,
             value_key=key,
-            lookup=PUBLIC_ID_FIELD_NAME,
         )
     if isinstance(field, models.JSONField):
-        return DataGroupBucketFilterMetadata(
-            kind="equality",
+        return DataQueryDrill(
+            kind="value",
             field=filter_field,
             value_key=key,
-            lookup="exact",
             value_transform="json",
         )
-    return DataGroupBucketFilterMetadata(
-        kind="equality",
+    return DataQueryDrill(
+        kind="value",
         field=filter_field,
         value_key=key,
         value_map=_enum_value_map_for_field(field),
@@ -1329,7 +1263,7 @@ def _hasura_json_group_bucket_filter(
     model: type[models.Model],
     path: str,
     key: str,
-) -> DataGroupBucketFilterMetadata | None:
+) -> DataQueryDrill | None:
     """Return the JSON containment drill-down filter for an allowlisted path."""
 
     root, *json_path = path.split(".")
@@ -1341,30 +1275,29 @@ def _hasura_json_group_bucket_filter(
         return None
     if not isinstance(field, models.JSONField):
         return None
-    return DataGroupBucketFilterMetadata(
-        kind="equality",
+    return DataQueryDrill(
+        kind="json",
         field=root,
         value_key=key,
-        lookup="jsonContains",
-        null_lookup=None,
-        value_transform=f"jsonObject:{'.'.join(json_path)}",
+        json_path=".".join(json_path),
+        null_mode="value",
     )
 
 
 def _hasura_group_range_filter(
-    bucket_filter: DataGroupBucketFilterMetadata | None,
+    bucket_filter: DataQueryDrill | None,
     *,
     value_key: str,
     range_key: str,
-) -> DataGroupBucketFilterMetadata | None:
+) -> DataQueryDrill | None:
     if bucket_filter is None:
         return None
-    return DataGroupBucketFilterMetadata(
+    return DataQueryDrill(
         kind="range",
         field=bucket_filter.field,
         value_key=value_key,
         range_key=range_key,
-        null_lookup=bucket_filter.null_lookup,
+        null_mode=bucket_filter.null_mode,
     )
 
 
@@ -1380,13 +1313,13 @@ def _group_filter_field(path: str, filterable: tuple[str, ...]) -> str | None:
 
 def _enum_value_map_for_field(
     field: models.Field[Any, Any],
-) -> tuple[DataGroupBucketFilterValueMapMetadata, ...]:
+) -> tuple[DataQueryValueMap, ...]:
     choices_enum = getattr(field, "choices_enum", None)
     members = getattr(choices_enum, "__members__", None)
     if not members:
         return ()
     return tuple(
-        DataGroupBucketFilterValueMapMetadata(
+        DataQueryValueMap(
             from_value=str(name),
             to_value=str(member.value),
         )
@@ -1422,12 +1355,6 @@ def _require_group_field(
         ) from None
 
 
-def _group_input_name(path: str) -> str:
-    """Return the generated ``<Model>GroupableField`` enum member name."""
-
-    return path.replace(".", "__").upper()
-
-
 def _group_key_path(
     field: models.Field[Any, Any],
     path: str,
@@ -1461,24 +1388,3 @@ def _measure_ops_for_field(field: models.Field[Any, Any]) -> tuple[str, ...]:
 
     available = {op.value for op in default_operators_for(type(field).__name__)}
     return tuple(op for op in _ANGEE_CURATED_OPS if op in available)
-
-
-def _scalar_for_field(field: models.Field[Any, Any]) -> str | None:
-    """Return the group-dimension key scalar for a field; String columns carry none."""
-
-    scalar = model_field_scalar(field)
-    return None if scalar == "String" else scalar
-
-
-def _scalar_for_json_group_type(declared_type: str) -> str | None:
-    """Return the group-dimension key scalar for a declared JSON-path type."""
-
-    return {
-        "str": None,
-        "int": "Int",
-        "float": "Float",
-        "Decimal": "Decimal",
-        "bool": "Boolean",
-        "date": "Date",
-        "datetime": "DateTime",
-    }.get(declared_type)

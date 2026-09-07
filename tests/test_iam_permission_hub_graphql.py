@@ -185,6 +185,40 @@ def test_roles_grants_resources_are_admin_scoped(
     assert _data(allowed)["iam_grants"]
 
 
+def test_legacy_and_computed_role_bindings_share_canonical_rows(
+    iam_permission_hub_tables: None,
+) -> None:
+    """One role computation preserves legacy short IDs and canonical resource IDs."""
+
+    admin = _platform_admin("hub-role-bindings-admin")
+    target = User.objects.create_user(username="hub-role-bindings-target")
+    grant(actor=target, role="angee/role:auditor")
+
+    data = _data(
+        _execute(
+            _schema("console"),
+            """
+            query {
+              roles { id namespace label }
+              iam_roles(limit: 50) { id role_id namespace label }
+            }
+            """,
+            user=admin,
+        )
+    )
+    computed = {row["id"]: row for row in data["iam_roles"]}
+
+    assert data["roles"]
+    for legacy in data["roles"]:
+        canonical_id = f"{legacy['namespace']}/role:{legacy['id']}"
+        assert computed[canonical_id] == {
+            "id": canonical_id,
+            "role_id": legacy["id"],
+            "namespace": legacy["namespace"],
+            "label": legacy["label"],
+        }
+
+
 def test_roles_query_excludes_role_types_missing_from_rebac_schema(
     iam_permission_hub_tables: None,
 ) -> None:
@@ -584,6 +618,71 @@ def test_revoke_role_returns_false_for_missing_membership(
 
     assert result["revoke_role"] is False
     assert not _role_membership_exists(target, role)
+
+
+@pytest.mark.parametrize("storage", ["denormalized", "registry"])
+def test_caveated_grants_have_distinct_identity_and_revoke_exact_selected_tuple(
+    iam_permission_hub_tables: None,
+    storage: str,
+) -> None:
+    """Caveat identity and selected-row deletion use the native tuple key in both stores."""
+
+    with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+        admin = _platform_admin(f"hub-caveat-{storage}-admin")
+        target = User.objects.create_user(username=f"hub-caveat-{storage}-target")
+        subject = to_subject_ref(target)
+        role = "angee/role:auditor"
+        role_ref = ObjectRef.parse(role)
+        with system_context(reason="test caveated grants"):
+            for caveat_name in ("", "business_hours", "trusted_network"):
+                active_relationship_model().objects.create(
+                    resource_type=role_ref.resource_type,
+                    resource_id=role_ref.resource_id,
+                    relation=ROLE_RELATION,
+                    subject_type=subject.subject_type,
+                    subject_id=subject.subject_id,
+                    optional_subject_relation=subject.optional_relation,
+                    caveat_name=caveat_name,
+                    caveat_context={"version": 1},
+                )
+
+        listed = _data(
+            _execute(
+                _schema("console"),
+                """
+                query { iam_grants(limit: 50) { id principal_id role caveat_name } }
+                """,
+                user=admin,
+            )
+        )["iam_grants"]
+        selected = [row for row in listed if row["principal_id"] == str(target.sqid) and row["role"] == role]
+        assert {row["caveat_name"] for row in selected} == {"", "business_hours", "trusted_network"}
+        assert len({row["id"] for row in selected}) == 3
+        uncaveated = next(row for row in selected if row["caveat_name"] == "")
+        assert uncaveated["id"] == f"{subject.subject_type}:{subject.subject_id}:{role}"
+
+        revoked = _data(
+            _execute(
+                _schema("console"),
+                """
+                mutation Revoke($principalId: String!, $role: String!, $caveat: String!) {
+                  revoke_role(principal_id: $principalId, role: $role, caveat_name: $caveat)
+                }
+                """,
+                {"principalId": str(target.sqid), "role": role, "caveat": "business_hours"},
+                user=admin,
+            )
+        )
+        assert revoked["revoke_role"] is True
+        remaining = set(
+            active_relationship_model().objects.filter(
+                resource_type=role_ref.resource_type,
+                resource_id=role_ref.resource_id,
+                subject_type=subject.subject_type,
+                subject_id=subject.subject_id,
+            ).values_list("caveat_name", flat=True)
+        )
+        assert remaining == {"", "trusted_network"}
 
 
 def test_role_refs_are_current_user_only(

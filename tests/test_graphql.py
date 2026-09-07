@@ -2,26 +2,27 @@
 
 from __future__ import annotations
 
+import logging
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
 import strawberry
 import strawberry_django
-from angee.base.fields import StateField
-from angee.base.mixins import RevisionMixin
-from angee.base.models import AngeeManager, AngeeModel
 from django.apps import AppConfig
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.db import models
 from django_choices_field import IntegerChoicesField
-from graphql import GraphQLEnumType, GraphQLObjectType, get_named_type
+from graphql import GraphQLEnumType, GraphQLError, GraphQLObjectType, get_named_type
 from rebac import MissingActorError, PermissionDenied, RebacMixin, SubjectRef
 from rebac.graphql.strawberry import RebacExtension
 from rebac.graphql.strawberry_django import RebacDjangoOptimizerExtension
 from rebac.managers import RebacManager
 from strawberry.extensions import SchemaExtension
 
+from angee.base.fields import StateField
+from angee.base.mixins import RevisionMixin
+from angee.base.models import AngeeManager, AngeeModel
 from angee.graphql.data import hasura as hasura_data
 from angee.graphql.data.hasura import AngeeHasuraWriteBackend
 from angee.graphql.revisions import revisions
@@ -225,6 +226,23 @@ class ValidationQuery:
     @strawberry.field
     def plain_error(self) -> str:
         raise ValidationError("Something went wrong.")
+
+
+@strawberry.type
+class UnexpectedErrorQuery:
+    @strawberry.field
+    def failure(self) -> str:
+        raise GraphQLError(
+            "secret=top-secret request=https://example.test/?token=canary",
+            extensions={"request": {"token": "extension-canary"}},
+        )
+
+    @strawberry.field
+    def expected_failure(self) -> str:
+        raise GraphQLError(
+            "Choose another value.",
+            extensions={"code": "BAD_USER_INPUT", "request": {"token": "extension-canary"}},
+        )
 
 
 def test_hasura_write_backend_decodes_public_relations_through_write_queryset(
@@ -692,6 +710,128 @@ def test_validation_errors_surface_per_field_extensions() -> None:
     assert plain_extensions["formErrors"] == ["Something went wrong."]
 
 
+def test_unexpected_graphql_errors_hide_exception_details(caplog: pytest.LogCaptureFixture) -> None:
+    """Unexpected resolver values do not cross either the response or ordinary logs."""
+
+    schema = GraphQLSchemas([addon(public={"query": [UnexpectedErrorQuery]})]).build("public")
+
+    result = schema.execute_sync("{ failure }")
+
+    assert result.errors is not None
+    assert result.errors[0].message == "An unexpected error occurred."
+    assert result.errors[0].extensions == {"code": "INTERNAL"}
+    assert "top-secret" not in caplog.text
+    assert "token=canary" not in caplog.text
+    assert "GraphQLError" in caplog.text
+    assert "extension-canary" not in caplog.text
+
+    expected = schema.execute_sync("{ expected_failure }")
+    assert expected.errors is not None
+    assert expected.errors[0].message == "Choose another value."
+    assert expected.errors[0].extensions == {"code": "BAD_USER_INPUT"}
+
+
+def test_variable_coercion_errors_preserve_client_details_without_logging(caplog: pytest.LogCaptureFixture) -> None:
+    """Request coercion retains graphql-core diagnostics without logging input values."""
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def echo(self, value: int) -> int:
+            return value
+
+    schema = GraphQLSchemas([addon(public={"query": [Query]})]).build("public")
+    invalid_value = "not-an-int-secret"
+
+    result = schema.execute_sync(
+        "query Q($value: Int!) { echo(value: $value) }",
+        variable_values={"value": invalid_value},
+    )
+
+    assert result.errors is not None
+    assert result.errors[0].formatted == {
+        "message": (
+            "Variable '$value' got invalid value 'not-an-int-secret'; "
+            "Int cannot represent non-integer value: 'not-an-int-secret'"
+        ),
+        "locations": [{"line": 1, "column": 9}],
+        "extensions": {"code": "BAD_USER_INPUT"},
+    }
+    assert "Unexpected" not in caplog.text
+    assert invalid_value not in caplog.text
+
+
+def test_variable_coercion_preserves_custom_scalar_error_code(caplog: pytest.LogCaptureFixture) -> None:
+    """The custom scalar owns its coercion error code, including during variable parsing."""
+
+    from strawberry.schema.config import StrawberryConfig
+
+    from angee.graphql.schema import AngeeSchema
+
+    def parse_value(value: Any) -> int:
+        raise GraphQLError("Choose another value.", extensions={"code": "CUSTOM_INPUT"})
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def echo(self, value: int) -> int:
+            return value
+
+    schema = AngeeSchema(
+        query=Query,
+        config=StrawberryConfig(
+            scalar_map={int: strawberry.scalar(name="CodedInt", serialize=int, parse_value=parse_value)}
+        ),
+    )
+    invalid_value = "custom-scalar-secret"
+
+    result = schema.execute_sync(
+        "query Q($value: CodedInt!) { echo(value: $value) }",
+        variable_values={"value": invalid_value},
+    )
+
+    assert result.errors is not None
+    assert result.errors[0].path is None
+    assert result.errors[0].extensions == {"code": "CUSTOM_INPUT"}
+    assert "Choose another value." in result.errors[0].message
+    assert invalid_value not in caplog.text
+
+
+def test_unexpected_graphql_errors_log_frames_without_exception_values(caplog: pytest.LogCaptureFixture) -> None:
+    """Resolver failures log their class, path and frames without exception values."""
+
+    secret = "secret-token-xyz"
+
+    def raise_provider_failure() -> str:
+        raise RuntimeError(secret)
+
+    @strawberry.type
+    class Query:
+        @strawberry.field
+        def failure(self) -> str:
+            return raise_provider_failure()
+
+    schema = GraphQLSchemas([addon(public={"query": [Query]})]).build("public")
+
+    result = schema.execute_sync("{ failure }")
+
+    assert result.errors is not None
+    assert result.errors[0].message == "An unexpected error occurred."
+    assert result.errors[0].extensions == {"code": "INTERNAL"}
+    assert result.errors[0].original_error is None
+    records = [
+        record for record in caplog.records if record.name == "angee.graphql.schema" and record.levelno == logging.ERROR
+    ]
+    assert len(records) == 1
+    diagnostic = records[0].getMessage()
+    assert "RuntimeError" in diagnostic
+    assert "['failure']" in diagnostic
+    assert __file__ in diagnostic
+    assert "in raise_provider_failure" in diagnostic
+    assert "raise RuntimeError(secret)" in diagnostic
+    assert secret not in caplog.text
+
+
 def test_graphql_identity_exports_public_node() -> None:
     """The framework exposes one public node seam."""
 
@@ -837,9 +977,7 @@ def test_revisions_rejects_relation_revision_fields() -> None:
 def test_build_schema_includes_mutation_root() -> None:
     """A mutation bucket becomes the schema mutation root."""
 
-    schema = GraphQLSchemas([addon(public={"query": [HelloQuery], "mutation": [PingMutation]})]).build(
-        "public"
-    )
+    schema = GraphQLSchemas([addon(public={"query": [HelloQuery], "mutation": [PingMutation]})]).build("public")
 
     result = schema.execute_sync("mutation { ping }")
 
@@ -870,9 +1008,7 @@ def test_surface_shared_across_named_schemas_renders() -> None:
     field object to two builds.
     """
 
-    rendered = GraphQLSchemas(
-        [addon(public={"query": [NodeQuery]}, console={"query": [NodeQuery]})]
-    ).render_sdl()
+    rendered = GraphQLSchemas([addon(public={"query": [NodeQuery]}, console={"query": [NodeQuery]})]).render_sdl()
 
     assert "thing: ThingType" in rendered["public"]
     assert "thing: ThingType" in rendered["console"]

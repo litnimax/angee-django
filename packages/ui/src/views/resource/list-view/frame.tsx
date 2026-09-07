@@ -1,6 +1,5 @@
 import * as React from "react";
-import { stableSerialize } from "@angee/refine";
-import { isClientRowModel, modelMetadataForLabel, useModelMetadata, useSchemaFieldMetadata } from "@angee/metadata";
+import { ResourceQuery, isClientRowModel, modelMetadataForLabel, useModelMetadata, useSchemaFieldMetadata } from "@angee/metadata";
 import type { Row } from "@angee/metadata";
 import { useUiT } from "../../../i18n";
 import { useValueStable } from "../../../lib/use-value-stable";
@@ -9,7 +8,6 @@ import { Filter, availableResourceViewKinds } from "../resource-view-model";
 import { CalendarCollectionSurface } from "../../calendar/calendar-collection-surface";
 import { type GroupedResourceViewSurface, type ResourceViewSurface, type UseResourceViewSurfaceProps } from "../resource-view-surface";
 import type { ResolvedBoardLaneSource } from "../resource-view-board-lanes";
-import { resourceViewGroupToAggregateDimension } from "../resource-view-list-body";
 import type { ListViewProps } from "../resource-view-types";
 import { resolveResourceViewGroup } from "../resource-view-utils";
 import { columnsWithMetadataDefaults, relationFieldInfo } from "../model-metadata-defaults";
@@ -17,9 +15,13 @@ import { useRelationFacets } from "../../relation/relation-facet";
 import { useScalarFacets } from "../../relation/scalar-facet";
 import { defaultGroupForView } from "../resource-view-toolbar-inputs";
 import { useResourceViewGroupState } from "../resource-view-group-state";
+import { initialResourceSorting } from "../resource-view-codecs";
 import { useRowActionsSurface } from "../RowActions";
 import { isBoardFoldField, isBoardRankField, ListViewContent } from "./content";
 import { ClientSurfaceBody, GroupedServerSurfaceBody, ServerSurfaceBody } from "./surface-adapters";
+import { ResourceQueryError } from "../ResourceQueryError";
+import { validateResourceViewState } from "../model/state";
+import { ErrorBanner } from "../../../fragments/ErrorBanner";
 export function ListView<TRow extends Row = Row>(
   props: ListViewProps<TRow>,
 ): React.ReactElement {
@@ -30,36 +32,57 @@ function ListViewFrame<TRow extends Row = Row>(
   props: ListViewProps<TRow>,
 ): React.ReactElement {
   const resourceView = useResourceViewMaybe();
+  const modelMetadata = useModelMetadata(props.resource);
   const scope = props.scope ?? "inherit";
-  const navigationScope = props.navigationScope;
-  const resolvedProps = navigationScope
-    ? {
-        ...props,
-        baseFilter:
-          navigationScope.filter as ListViewProps<TRow>["baseFilter"],
-        order: navigationScope.order as ListViewProps<TRow>["order"],
-        pageSize: navigationScope.pageSize,
+  const initial = React.useMemo(
+    () => {
+      try {
+        return { state: { pageSize: props.pageSize, view: props.defaultView, sorting: initialResourceSorting(modelMetadata, props.order) }, error: null };
+      } catch (error) {
+        return { state: {}, error: error instanceof Error ? error : new Error("Invalid declared query.") };
       }
-    : props;
-  const initialState = React.useMemo(
-    () => ({
-      page: navigationScope?.page,
-      pageSize: resolvedProps.pageSize,
-      view: props.defaultView,
-    }),
-    [navigationScope?.page, props.defaultView, resolvedProps.pageSize],
+    },
+    [props.defaultView, props.pageSize, props.order, modelMetadata],
   );
+  if (initial.error) return <ErrorBanner description={initial.error.message} />;
   return withResourceViewScope({
     ambient: resourceView,
     resource: props.resource,
     scope,
-    initialState,
-    isolated: navigationScope !== undefined,
-    providerKey: navigationScope ? stableSerialize(navigationScope) : undefined,
+    initialState: initial.state,
     children: (scopedResourceView) => (
-      <ListViewBody {...resolvedProps} resourceView={scopedResourceView} />
+      <ValidatedListViewBody {...props} resourceView={scopedResourceView} />
     ),
   });
+}
+
+function ValidatedListViewBody<TRow extends Row>(props: ListViewProps<TRow> & { resourceView: ResourceViewContextValue }): React.ReactElement {
+  const metadata = useModelMetadata(props.resource);
+  let error = props.resourceView.state.queryError;
+  if (!error && metadata) {
+    try {
+      const query = ResourceQuery.from(metadata);
+      error = validateResourceViewState(props.resourceView.state, query).queryError;
+      query.toWhere(props.baseFilter, props.resourceView.state.filter);
+      const group = props.resourceView.state.view === "board" && props.laneSource
+        ? { field: props.laneSource.field }
+        : defaultGroupForView(props.defaultGroup, props.defaultGroups, props.resourceView.state.view);
+      if (group) query.group(group);
+      const groups = query.groupsFrom(props.resourceView.state.groupStack);
+      const effectiveGroups = props.resourceView.state.view === "board" && props.laneSource && group
+        ? [group] : groups.length > 0 ? groups : group ? [group] : [];
+      if (effectiveGroups.length > 0) {
+        if (!isClientRowModel(metadata.resource)
+          && (props.resourceView.state.view === "list"
+            || (props.resourceView.state.view === "board" && !props.laneSource))) {
+          query.toGroupBy(effectiveGroups);
+        } else {
+          query.selection(effectiveGroups);
+        }
+      }
+    } catch (cause) { error = cause instanceof Error ? cause : new Error("Invalid resource query."); }
+  }
+  return error ? <ResourceQueryError error={error} onReset={props.resourceView.resetQuery} /> : <ListViewBody {...props} />;
 }
 
 function ListViewBody<TRow extends Row = Row>({
@@ -206,18 +229,10 @@ function ListViewBody<TRow extends Row = Row>({
   // TanStack row models — never the server _groups/GroupedListBody path (the
   // aggregate it would query does not exist).
   const clientRowModel = isClientRowModel(modelMetadata?.resource);
-  const groupDimensions = React.useMemo(
-    () =>
-      clientRowModel
-        ? []
-        : effectiveGroupStack.map((group) =>
-            resourceViewGroupToAggregateDimension(group, modelMetadata),
-          ),
-    [clientRowModel, effectiveGroupStack, modelMetadata],
-  );
-  const groupedListMode =
-    resourceView.state.view === "list"
-    && groupDimensions.length > 0
+  const serverGroupedMode =
+    (resourceView.state.view === "list"
+      || (resourceView.state.view === "board" && !resolvedLaneSource))
+    && effectiveGroupStack.length > 0
     && !clientRowModel;
   const surfaceProps: UseResourceViewSurfaceProps<TRow> = {
     resource,
@@ -230,7 +245,7 @@ function ListViewBody<TRow extends Row = Row>({
     groupStack: effectiveGroupStack,
     defaultExpandedGroups,
     laneSource: resolvedLaneSource,
-    enabled: !groupedListMode,
+    enabled: !serverGroupedMode,
     onListStateChange,
   };
   const content = (
@@ -246,7 +261,7 @@ function ListViewBody<TRow extends Row = Row>({
       effectiveGroupStack={effectiveGroupStack}
       boardGroupingPinned={boardGroupingPinned}
       clientRowModel={clientRowModel}
-      groupedListMode={groupedListMode}
+      serverGroupedMode={serverGroupedMode}
       declaredFacets={declaredFacets}
       scalarFacets={scalarFacets}
       explicitGroupOptions={explicitGroupOptions}
@@ -294,7 +309,7 @@ function ListViewBody<TRow extends Row = Row>({
   if (clientRowModel) {
     return <ClientSurfaceBody<TRow> surfaceProps={surfaceProps}>{content}</ClientSurfaceBody>;
   }
-  if (groupedListMode) {
+  if (serverGroupedMode) {
     return <GroupedServerSurfaceBody<TRow> surfaceProps={surfaceProps}>{content}</GroupedServerSurfaceBody>;
   }
   return <ServerSurfaceBody<TRow> surfaceProps={surfaceProps}>{content}</ServerSurfaceBody>;

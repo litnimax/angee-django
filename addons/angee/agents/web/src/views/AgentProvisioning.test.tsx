@@ -18,6 +18,7 @@ import {
 import type {
   SchemaFieldMetadata,
 } from "@angee/metadata";
+import { withTestResourceInventory, testResourceQuery, testQueryField } from "@angee/metadata/testing";
 
 import { enAgentsMessages } from "../i18n";
 import { AgentProvisioning } from "./AgentProvisioning";
@@ -179,21 +180,18 @@ describe("AgentProvisioning", () => {
   });
 });
 
-const AGENT_METADATA: SchemaFieldMetadata = {
+const AGENT_METADATA: SchemaFieldMetadata = withTestResourceInventory({
   types: {
     AgentType: {
-      typeName: "AgentType",
       fields: {},
-      rootFields: {
-        detail: "agent",
-        list: "agents",
-      },
       resource: {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: {}, sort: { default: [] } }),
+
         schemaName: "console",
         modelLabel: "agents.Agent",
         appLabel: "agents",
         modelName: "Agent",
-        publicIdField: "id",
+
         roots: { detail: "agent", list: "agents" },
         typeNames: {
           node: "AgentType",
@@ -201,15 +199,15 @@ const AGENT_METADATA: SchemaFieldMetadata = {
           order: "AgentOrder",
         },
         capabilities: ["detail", "list"],
-        filterFields: [],
-        orderFields: [],
+
+
         aggregateFields: [],
-        groupByFields: [],
-        relationAxes: [],
+
+
       },
     },
   },
-};
+});
 
 function renderProvisioning(children: ReactElement): ReturnType<typeof render> {
   return render(

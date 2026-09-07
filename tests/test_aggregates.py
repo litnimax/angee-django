@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import json
 import warnings
 from collections.abc import Iterator
 from decimal import Decimal
@@ -18,12 +17,13 @@ from django.db import connection, models
 from rebac import system_context
 from strawberry import auto
 from strawberry_django_aggregates.errors import GroupByFieldNotAllowed
+from strawberry_django_hasura import hasura_config
 
 from angee.base.models import AngeeDataModel
 from angee.data.metadata import (
     DataAggregateMeasureMetadata,
-    DataGroupBucketFilterMetadata,
-    DataGroupDimensionMetadata,
+    DataQueryDrill,
+    DataQueryServerAxis,
     DataResourceFieldMetadata,
     DataResourceRoots,
     DataResourceSubtitleMetadata,
@@ -32,14 +32,13 @@ from angee.data.metadata import (
 from angee.graphql.data import hasura_model_resource, public_pk_decoder
 from angee.graphql.data import metadata as metadata_module
 from angee.graphql.data.hasura import (
-    _hasura_group_dimensions,
+    _hasura_query_axes,
     _measure_ops_for_field,
     _relation_filter_decoders,
     _relation_group_key_encoders,
 )
-from angee.graphql.data.metadata import (
-    make_data_resource_metadata,
-)
+from angee.graphql.data.metadata import _finalize_data_resource as _project_final_data_resource
+from angee.graphql.data.resource_fields import resource_string_field_names
 from angee.graphql.ids import require_public_id
 from angee.graphql.node import AngeeNode
 from angee.graphql.schema import GraphQLSchemas
@@ -211,6 +210,48 @@ with warnings.catch_warnings():
     )
 
 
+@strawberry.type
+class ResourceMetadataProbeQuery:
+    """Query root anchoring final-schema metadata projection fixtures."""
+
+    ready: bool = True
+
+
+def _finalize_data_resource(
+    *,
+    node_type: type | None = None,
+    type_names: DataResourceTypeNames,
+    **kwargs: Any,
+) -> Any:
+    """Project a focused fixture through a real composed graphql-core schema."""
+
+    if node_type is not None and type_names.node is None:
+        type_names = dataclasses.replace(
+            type_names,
+            node=metadata_module.resource_type_name(node_type),
+        )
+    schema = strawberry.Schema(
+        query=ResourceMetadataProbeQuery,
+        types=[] if node_type is None else [node_type],
+        config=hasura_config(),
+    )
+    if "public_id_field" not in kwargs and node_type is not None and not issubclass(node_type, AngeeNode):
+        model = kwargs.get("model")
+        for field in node_type.__strawberry_definition__.fields:
+            python_name = field.python_name
+            try:
+                model._meta.get_field(python_name)
+            except AttributeError, FieldDoesNotExist:
+                continue
+            kwargs["public_id_field"] = python_name
+            break
+    return _project_final_data_resource(
+        graphql_schema=schema._schema,
+        type_names=type_names,
+        **kwargs,
+    )
+
+
 def test_resource_field_metadata_has_a_field_owner_module() -> None:
     """The field description is neutral while GraphQL projection stays local."""
 
@@ -233,7 +274,7 @@ def test_resource_subtitle_timestamp_defaults_follow_model_field_flags() -> None
         born_on: auto
         touched_on: auto
 
-    metadata = make_data_resource_metadata(
+    metadata = _finalize_data_resource(
         model=ResourceFlaggedTimestampThing,
         node_type=ResourceFlaggedTimestampThingType,
         roots=DataResourceRoots(),
@@ -257,7 +298,7 @@ def test_resource_subtitle_rejects_relation_valued_terminal_field() -> None:
             "selection path 'parent'.*declare a scalar subfield"
         ),
     ):
-        make_data_resource_metadata(
+        _finalize_data_resource(
             model=ResourceChild,
             node_type=ResourceSubtitleChildType,
             roots=DataResourceRoots(),
@@ -349,13 +390,13 @@ def test_hasura_resource_attaches_angee_resource_metadata() -> None:
         "update",
         "delete",
     )
-    assert metadata.filter_fields == ("id", "name", "word_count")
-    assert metadata.order_fields == ("word_count", "name")
+    assert {name for name, field in metadata.query.fields.items() if field.filter} == {"id", "word_count", "name"}
+    assert {name for name, field in metadata.query.fields.items() if field.sort} == {"word_count", "name"}
     assert metadata.aggregate_fields == ("id", "word_count")
-    assert metadata.group_by_fields == ("name",)
-    assert metadata.group_dimensions[0].field == "name"
-    assert metadata.group_dimensions[0].input == "NAME"
-    assert metadata.group_dimensions[0].key == "name"
+    assert set(metadata.query.axes) == {"name"}
+    assert next(iter(metadata.query.axes.values())).field == "name"
+    assert next(iter(metadata.query.axes.values())).server.input == "NAME"
+    assert next(iter(metadata.query.axes.values())).server.key == "name"
     assert metadata.aggregate_measures == (
         DataAggregateMeasureMetadata(op="sum", field="word_count", input="word_count"),
         DataAggregateMeasureMetadata(op="avg", field="word_count", input="word_count"),
@@ -363,7 +404,7 @@ def test_hasura_resource_attaches_angee_resource_metadata() -> None:
         DataAggregateMeasureMetadata(op="max", field="word_count", input="word_count"),
     )
     assert metadata.default_measures[0].op == "count"
-    assert [(sort.field, sort.direction) for sort in metadata.default_sort] == [
+    assert [(sort.field, sort.direction) for sort in metadata.query.sort.default] == [
         ("word_count", "DESC"),
         ("name", "ASC"),
     ]
@@ -375,8 +416,8 @@ def test_hasura_resource_attaches_angee_resource_metadata() -> None:
         updated="updated_at",
         word_count="word_count",
     )
-    assert fields["word_count"].filterable is True
-    assert fields["word_count"].sortable is True
+    assert metadata.query.fields["word_count"].filter is not None
+    assert metadata.query.fields["word_count"].sort is not None
     assert fields["word_count"].aggregatable is True
     assert fields["word_count"].creatable is True
     assert fields["word_count"].updatable is True
@@ -390,6 +431,416 @@ def test_hasura_resource_attaches_angee_resource_metadata() -> None:
     sdl = schema.as_str()
     assert "word_count" in sdl
     assert "wordCount" not in sdl
+
+
+def test_named_schemas_project_only_the_native_roots_they_expose(monkeypatch: Any) -> None:
+    """One native resource finalizes once per schema with that schema's actual roots."""
+
+    @strawberry_django.type(HasuraResourceThing, name="NamedSchemaThingType")
+    class NamedSchemaThingType(AngeeNode):
+        name: auto
+        word_count: auto
+
+    @strawberry.type
+    class HealthQuery:
+        healthy: bool = True
+
+    write_backend = type(
+        "NoopWriteBackend",
+        (),
+        {
+            "create": lambda self, info, data: None,
+            "update": lambda self, info, pk, data: None,
+            "delete": lambda self, info, pk: None,
+        },
+    )()
+    resource = hasura_model_resource(
+        NamedSchemaThingType,
+        model=HasuraResourceThing,
+        name="named_things",
+        filterable=["id", "name"],
+        sortable=["name"],
+        aggregatable=["id"],
+        get_queryset=lambda info: HasuraResourceThing.objects.all(),
+        write_backend=write_backend,
+        id_decode=lambda value: value,
+    )
+    finalized_labels: list[str | None] = []
+    original_finalize = metadata_module._finalize_data_resource
+
+    def counted_finalize(**kwargs: Any) -> Any:
+        finalized_labels.append(kwargs.get("model_label"))
+        return original_finalize(**kwargs)
+
+    monkeypatch.setattr(metadata_module, "_finalize_data_resource", counted_finalize)
+    schemas = GraphQLSchemas(
+        [
+            SchemaAddon(
+                {
+                    "public": {
+                        "query": [resource.query],
+                        "types": [NamedSchemaThingType, *resource.types],
+                    },
+                    "console": {
+                        "query": [resource.query],
+                        "mutation": [resource.mutation],
+                        "types": [NamedSchemaThingType, *resource.types],
+                    },
+                    "write_only": {
+                        "query": [HealthQuery],
+                        "mutation": [resource.mutation],
+                        "types": [NamedSchemaThingType, *resource.types],
+                    },
+                }
+            )
+        ]
+    )
+
+    [public] = schemas.build("public").angee_resources
+    [console] = schemas.build("console").angee_resources
+    [write_only] = schemas.build("write_only").angee_resources
+
+    assert public.roots.list_name == "named_things"
+    assert public.roots.create_name is None
+    assert public.type_names.create_input is None
+    assert not ({"create", "update", "delete"} & set(public.capabilities))
+    assert public.create_fields == ()
+    assert public.update_fields == ()
+
+    assert console.roots.list_name == "named_things"
+    assert console.roots.create_name == "insert_named_things_one"
+    assert {"list", "create", "update", "delete"} <= set(console.capabilities)
+    assert console.create_fields == ("name", "word_count")
+
+    assert write_only.roots.list_name is None
+    assert write_only.roots.create_name == "insert_named_things_one"
+    assert "list" not in write_only.capabilities
+    assert {"create", "update", "delete"} <= set(write_only.capabilities)
+    assert finalized_labels == [
+        "tests.HasuraResourceThing",
+        "tests.HasuraResourceThing",
+        "tests.HasuraResourceThing",
+    ]
+
+
+def test_final_extension_relation_uses_target_type_source_link() -> None:
+    """A final resolver field gets its relation target from the target Django type."""
+
+    @strawberry_django.type(ResourceParent, name="FinalRelationParentType")
+    class FinalRelationParentType(AngeeNode):
+        name: auto
+
+    @strawberry_django.type(HasuraResourceThing, name="FinalRelationThingType")
+    class FinalRelationThingType(AngeeNode):
+        name: auto
+
+    def inferred_parent(self: Any) -> Any:
+        return None
+
+    inferred_parent.__annotations__["return"] = FinalRelationParentType | None
+    FinalRelationThingExtension = strawberry.type(
+        type(
+            "FinalRelationThingExtension",
+            (),
+            {"inferred_parent": strawberry.field(resolver=inferred_parent)},
+        ),
+        name="FinalRelationThingType",
+        extend=True,
+    )
+
+    resource = hasura_model_resource(
+        FinalRelationThingType,
+        model=HasuraResourceThing,
+        name="final_relation_things",
+        filterable=["id", "name"],
+        sortable=["name"],
+        aggregatable=["id"],
+        insert=False,
+        update=False,
+        delete=False,
+        get_queryset=lambda info: HasuraResourceThing.objects.all(),
+    )
+    schema = GraphQLSchemas(
+        [
+            SchemaAddon(
+                {
+                    "public": {
+                        "query": [resource.query],
+                        "types": [
+                            FinalRelationThingType,
+                            FinalRelationParentType,
+                            *resource.types,
+                        ],
+                        "type_extensions": [FinalRelationThingExtension],
+                    }
+                }
+            )
+        ]
+    ).build("public")
+    fields = {field.name: field for field in schema.angee_resources[0].fields}
+
+    assert fields["inferred_parent"].kind == "relation"
+    assert fields["inferred_parent"].relation_object is True
+    assert fields["inferred_parent"].relation_model_label == "tests.ResourceParent"
+
+
+def test_relation_label_candidates_require_native_string_fields() -> None:
+    """Enum and list projections cannot displace a later String label field."""
+
+    @strawberry.enum
+    class CandidateState(enum.Enum):
+        OPEN = "open"
+
+    @strawberry.type
+    class CandidateType:
+        state: CandidateState
+        tags: list[str]
+        capture_payload_hash: str
+
+    assert resource_string_field_names(CandidateType) == ("capture_payload_hash",)
+
+
+def test_final_metadata_includes_only_allowlisted_input_only_fields() -> None:
+    """An accepted write-only input is described once without gaining read access."""
+
+    @strawberry_django.type(HasuraResourceThing, name="WriteOnlyThingType")
+    class WriteOnlyThingType(AngeeNode):
+        name: auto
+
+    resource = hasura_model_resource(
+        WriteOnlyThingType,
+        model=HasuraResourceThing,
+        name="write_only_things",
+        filterable=["id", "name", "word_count"],
+        sortable=["name", "word_count"],
+        aggregatable=["id", "word_count"],
+        groupable=["word_count"],
+        insertable=["name", "word_count"],
+        updatable=["word_count"],
+        get_queryset=lambda info: HasuraResourceThing.objects.all(),
+        id_decode=lambda value: value,
+    )
+    schema = GraphQLSchemas(
+        [
+            SchemaAddon(
+                {
+                    "public": {
+                        "query": [resource.query],
+                        "mutation": [resource.mutation],
+                        "types": [WriteOnlyThingType, *resource.types],
+                    }
+                }
+            )
+        ]
+    ).build("public")
+    metadata = schema.angee_resources[0]
+    fields = {field.name: field for field in metadata.fields}
+
+    assert fields["name"].readable is True
+    assert fields["word_count"].readable is False
+    assert metadata.query.fields["word_count"].filter is not None
+    assert metadata.query.fields["word_count"].sort is not None
+    assert fields["word_count"].aggregatable is True
+    assert "word_count" in metadata.query.axes
+    assert fields["word_count"].creatable is True
+    assert fields["word_count"].updatable is True
+    assert metadata_module.readable_model_field_names(schema.angee_resources[0]) == frozenset({"id", "name"})
+
+
+def test_final_scalar_id_fk_keeps_django_relation_semantics() -> None:
+    """A scalar ID relation remains a relation while rejecting sub-selections."""
+
+    @strawberry_django.type(ResourceChild, name="FinalScalarRelationChildType")
+    class FinalScalarRelationChildType(AngeeNode):
+        name: auto
+
+        @strawberry_django.field(name="owner", only=["parent_id"])
+        def parent(self) -> strawberry.ID:
+            return strawberry.ID(str(self.parent_id))
+
+    resource = hasura_model_resource(
+        FinalScalarRelationChildType,
+        model=ResourceChild,
+        name="final_scalar_relation_children",
+        filterable=["id", "name", "parent"],
+        sortable=["name"],
+        aggregatable=["id"],
+        groupable=["parent"],
+        insert=False,
+        update=False,
+        delete=False,
+        get_queryset=lambda info: ResourceChild.objects.all(),
+    )
+    schema = GraphQLSchemas(
+        [
+            SchemaAddon(
+                {
+                    "public": {
+                        "query": [resource.query],
+                        "types": [FinalScalarRelationChildType, *resource.types],
+                    }
+                }
+            )
+        ]
+    ).build("public")
+    metadata = schema.angee_resources[0]
+    parent = {field.name: field for field in metadata.fields}["owner"]
+
+    assert metadata.query.identity.field == "id"
+    assert metadata.query.fields["owner"].relation.identity_path == "owner"
+    assert parent.kind == "relation"
+    assert parent.scalar is None
+    assert parent.widget == "many2one"
+    assert parent.relation_model_label == "tests.ResourceParent"
+    assert parent.relation_object is False
+    assert metadata.query.axes["owner"].field == "owner"
+    assert metadata.query.axes["owner"].server.label_key == "parent__name"
+
+
+def test_final_custom_public_id_alias_is_metadata_identity() -> None:
+    """A non-Node surface carries its authored final identity alias without an id fallback."""
+
+    @strawberry_django.type(ResourceThing, name="CustomIdentityThingType")
+    class CustomIdentityThingType:
+        @strawberry_django.field(name="public_key", only=["sqid"])
+        def sqid(self) -> strawberry.ID:
+            return strawberry.ID(str(self.sqid))
+
+    resource = hasura_model_resource(
+        CustomIdentityThingType,
+        model=ResourceThing,
+        name="custom_identity_things",
+        public_id_field="sqid",
+        filterable=["sqid"],
+        sortable=["sqid"],
+        aggregatable=["sqid"],
+        insert=False,
+        update=False,
+        delete=False,
+        get_queryset=lambda info: ResourceThing.objects.all(),
+    )
+    schema = GraphQLSchemas(
+        [SchemaAddon({"public": {"query": [resource.query], "types": [CustomIdentityThingType, *resource.types]}})]
+    ).build("public")
+    metadata = schema.angee_resources[0]
+
+    assert metadata.query.identity.field == "public_key"
+    node = schema._schema.get_type(metadata.type_names.node)
+    assert metadata.query.identity.field in node.fields
+
+
+def test_readable_resource_rejects_absent_final_public_identity() -> None:
+    """List metadata cannot name a stored identity absent from its final node."""
+
+    @strawberry_django.type(ResourceThing, name="MissingIdentityThingType")
+    class MissingIdentityThingType:
+        name: auto
+
+    with pytest.raises(
+        ImproperlyConfigured,
+        match="tests.ResourceThing.*sqid.*MissingIdentityThingType",
+    ):
+        _finalize_data_resource(
+            model=ResourceThing,
+            node_type=MissingIdentityThingType,
+            roots=DataResourceRoots(list_name="missing_identity_things"),
+            type_names=DataResourceTypeNames(),
+            capabilities=("list",),
+            public_id_field="sqid",
+        )
+
+
+def test_readable_resource_rejects_ambiguous_final_public_identity() -> None:
+    """A missing direct identity alias cannot guess between multiple final ID fields."""
+
+    @strawberry_django.type(ResourceThing, name="AmbiguousIdentityThingType")
+    class AmbiguousIdentityThingType:
+        first: strawberry.ID
+        second: strawberry.ID
+
+    with pytest.raises(ImproperlyConfigured, match="tests.ResourceThing.*sqid.*AmbiguousIdentityThingType"):
+        _finalize_data_resource(
+            model=ResourceThing,
+            node_type=AmbiguousIdentityThingType,
+            roots=DataResourceRoots(list_name="ambiguous_identity_things"),
+            type_names=DataResourceTypeNames(),
+            capabilities=("list",),
+            public_id_field="sqid",
+        )
+
+
+def test_final_alias_keeps_model_source_for_readable_publisher_fields() -> None:
+    """Final wire aliases retain their Django source for publisher redaction."""
+
+    @strawberry_django.type(HasuraResourceThing, name="FinalAliasThingType")
+    class FinalAliasThingType(AngeeNode):
+        name: auto = strawberry_django.field(name="display_name")
+
+    resource = hasura_model_resource(
+        FinalAliasThingType,
+        model=HasuraResourceThing,
+        name="final_alias_things",
+        filterable=["id", "name"],
+        sortable=["name"],
+        aggregatable=["id"],
+        insert=False,
+        update=False,
+        delete=False,
+        get_queryset=lambda info: HasuraResourceThing.objects.all(),
+    )
+    schema = GraphQLSchemas(
+        [
+            SchemaAddon(
+                {
+                    "public": {
+                        "query": [resource.query],
+                        "types": [FinalAliasThingType, *resource.types],
+                    }
+                }
+            )
+        ]
+    ).build("public")
+    metadata = schema.angee_resources[0]
+    display_name = {field.name: field for field in metadata.fields}["display_name"]
+
+    assert display_name.model_field_name == "name"
+    assert {name for name, field in metadata.query.fields.items() if field.filter} == {"id", "display_name"}
+    assert {name for name, field in metadata.query.fields.items() if field.sort} == {"display_name"}
+    assert metadata_module.readable_model_field_names(metadata) >= {"name"}
+
+
+def test_final_input_projection_maps_aliases_defaults_and_author_allowlist() -> None:
+    """Executable input shape refines, but never expands, authored write policy."""
+
+    @strawberry.input(name="FinalWritePolicyInput")
+    class FinalWritePolicyInput:
+        required_name: str = strawberry.field(name="required_alias")
+        optional_count: int = 3
+        denied_extension: str = "denied"
+
+    @strawberry.type
+    class FinalInputQuery:
+        ready: bool = True
+
+    def save(self: Any, data: Any) -> bool:
+        return bool(data)
+
+    save.__annotations__["data"] = FinalWritePolicyInput
+    save.__annotations__["return"] = bool
+    FinalInputMutation = strawberry.type(type("FinalInputMutation", (), {"save": strawberry.mutation(resolver=save)}))
+    schema = strawberry.Schema(query=FinalInputQuery, mutation=FinalInputMutation)._schema
+    accepted = metadata_module.final_input_wire_fields(
+        schema,
+        "FinalWritePolicyInput",
+        accepted=("required_name", "optional_count"),
+    )
+
+    assert accepted == ("required_alias", "optionalCount")
+    assert metadata_module.final_required_input_wire_fields(
+        schema,
+        "FinalWritePolicyInput",
+        accepted=accepted,
+    ) == ("required_alias",)
 
 
 def test_hasura_nested_relation_group_dimension_matches_group_key_contract() -> None:
@@ -433,41 +884,26 @@ def test_hasura_nested_relation_group_dimension_matches_group_key_contract() -> 
         ]
     ).build("public")
     metadata = schema.angee_resources[0]
-    nested = {dimension.field: dimension for dimension in metadata.group_dimensions}["child__parent"]
+    nested = metadata.query.axes["child.parent"]
     group_key = schema._schema.get_type(metadata.type_names.group_key)
 
-    assert nested == DataGroupDimensionMetadata(
-        field="child__parent",
-        input="CHILD__PARENT",
-        key="child__parent_id",
-        kind="relation",
-        scalar="ID",
-        filter=DataGroupBucketFilterMetadata(
-            kind="equality",
-            field="child__parent",
-            value_key="child__parent_id",
-            lookup="sqid",
-        ),
-    )
+    assert nested.field == "child.parent"
+    assert nested.kind == "relation"
+    assert nested.server == DataQueryServerAxis(input="CHILD__PARENT", key="child__parent_id")
+    assert nested.drill == DataQueryDrill(kind="identity", field="child.parent", value_key="child__parent_id")
     assert group_key is not None
-    assert nested.key in group_key.fields  # type: ignore[attr-defined]
+    assert nested.server.key in group_key.fields  # type: ignore[attr-defined]
     # The relation label fallback resolves the related model's preferred
     # display column even without a node surface (donor/scalar-id axes).
-    assert metadata.relation_axes[0].label_axis == "child__name"
+    assert metadata.query.axes["child"].server.label_key == "child__name"
 
 
-def test_hasura_single_level_relation_group_metadata_is_byte_identical() -> None:
-    """The established direct-FK dimension payload stays byte-identical."""
+def test_hasura_relation_axis_has_one_server_identity_and_drill() -> None:
+    """One axis carries the aggregate alias and public-ID drill intent."""
 
-    dimension = _hasura_group_dimensions(ResourceChild, ("parent",), ("parent",))[0]
-    payload = json.dumps(dataclasses.asdict(dimension), separators=(",", ":"), sort_keys=True).encode()
-
-    assert payload == (
-        b'{"extractions":[],"field":"parent","filter":{"field":"parent","kind":"equality",'
-        b'"lookup":"sqid","null_lookup":"isNull","range_key":null,"value_key":"parent_id",'
-        b'"value_map":[],"value_transform":null},"input":"PARENT","key":"parent_id",'
-        b'"kind":"relation","scalar":"ID"}'
-    )
+    axis = _hasura_query_axes(ResourceChild, ("parent",), ("parent",))[0]
+    assert axis.server == DataQueryServerAxis(input="PARENT", key="parent_id")
+    assert axis.drill == DataQueryDrill(kind="identity", field="parent", value_key="parent_id")
 
 
 def test_hasura_model_resource_groups_json_path_axes() -> None:
@@ -514,23 +950,12 @@ def test_hasura_model_resource_groups_json_path_axes() -> None:
     ).build("public")
     metadata = schema.angee_resources[0]
 
-    assert metadata.group_by_fields == ("metadata.mailbox",)
-    assert metadata.group_dimensions == (
-        DataGroupDimensionMetadata(
-            field="metadata.mailbox",
-            input="METADATA__MAILBOX",
-            key="metadata__mailbox",
-            kind="json",
-            filter=DataGroupBucketFilterMetadata(
-                kind="equality",
-                field="metadata",
-                value_key="metadata__mailbox",
-                lookup="jsonContains",
-                null_lookup=None,
-                value_transform="jsonObject:mailbox",
-            ),
-        ),
-    )
+    assert set(metadata.query.axes) == {"metadata.mailbox"}
+    axis = metadata.query.axes["metadata.mailbox"]
+    assert axis.kind == "json"
+    assert axis.server == DataQueryServerAxis(input="METADATA__MAILBOX", key="metadata__mailbox")
+    assert axis.drill is None  # The JSON root is not filterable on this surface.
+    assert axis.identity_path is None  # Nor is the JSON root selectable.
     assert "METADATA__MAILBOX" in schema.as_str()
     assert "metadata__mailbox: String" in schema.as_str()
 
@@ -653,7 +1078,7 @@ def test_data_resource_metadata_requires_direct_relation_axis_for_relation_label
         name: auto
 
     with pytest.raises(ImproperlyConfigured, match="requires matching direct relation"):
-        make_data_resource_metadata(
+        _finalize_data_resource(
             model=ResourceChild,
             roots=DataResourceRoots(list_name="children", group_name="children_groups"),
             type_names=DataResourceTypeNames(node="ResourceChildInvalidRelationType"),
@@ -671,7 +1096,7 @@ def test_data_resource_metadata_rejects_multiple_relation_label_axes() -> None:
         name: auto
 
     with pytest.raises(ImproperlyConfigured, match="multiple label axes"):
-        make_data_resource_metadata(
+        _finalize_data_resource(
             model=ResourceChild,
             roots=DataResourceRoots(list_name="children", group_name="children_groups"),
             type_names=DataResourceTypeNames(node="ResourceChildAmbiguousRelationType"),
@@ -689,7 +1114,7 @@ def test_data_resource_metadata_rejects_duplicate_group_axes() -> None:
         name: auto
 
     with pytest.raises(ImproperlyConfigured, match="duplicate group axis 'name'"):
-        make_data_resource_metadata(
+        _finalize_data_resource(
             model=ResourceThing,
             roots=DataResourceRoots(list_name="things", group_name="things_groups"),
             type_names=DataResourceTypeNames(node="ResourceThingDuplicateGroupType"),
@@ -703,20 +1128,14 @@ def test_data_resource_metadata_rejects_duplicate_field_metadata() -> None:
     """Resource field metadata names are authoritative and must be unique."""
 
     with pytest.raises(ImproperlyConfigured, match="duplicate resource field 'name'"):
-        make_data_resource_metadata(
-            model=ResourceThing,
-            roots=DataResourceRoots(list_name="things"),
-            type_names=DataResourceTypeNames(node="ResourceThingType"),
-            capabilities=("list",),
-            fields=(
+        metadata_module.require_unique_resource_fields(
+            ResourceThing._meta.label,
+            (
                 DataResourceFieldMetadata(
                     name="name",
                     kind="scalar",
                     readable=True,
-                    filterable=False,
-                    sortable=False,
                     aggregatable=False,
-                    groupable=False,
                     creatable=False,
                     updatable=False,
                     required_on_create=False,
@@ -725,10 +1144,7 @@ def test_data_resource_metadata_rejects_duplicate_field_metadata() -> None:
                     name="name",
                     kind="scalar",
                     readable=True,
-                    filterable=False,
-                    sortable=False,
                     aggregatable=False,
-                    groupable=False,
                     creatable=False,
                     updatable=False,
                     required_on_create=False,
@@ -765,34 +1181,7 @@ def test_data_resource_metadata_rejects_unsupported_explicit_field_metadata(
     """Explicit field metadata must stay inside the generated artifact vocabulary."""
 
     with pytest.raises(ImproperlyConfigured, match=message):
-        make_data_resource_metadata(
-            model=ResourceThing,
-            roots=DataResourceRoots(list_name="things"),
-            type_names=DataResourceTypeNames(node="ResourceThingType"),
-            capabilities=("list",),
-            fields=(field,),
-        )
-
-
-def test_data_resource_metadata_rejects_generated_duplicate_field_names() -> None:
-    """Generated resource field metadata must not emit duplicate wire names."""
-
-    @strawberry_django.type(ResourceThing)
-    class ResourceThingDuplicateFieldType:
-        name: auto
-
-        @strawberry.field(name="name")
-        def name_copy(self) -> str:
-            return self.name
-
-    with pytest.raises(ImproperlyConfigured, match="duplicate resource field 'name'"):
-        make_data_resource_metadata(
-            model=ResourceThing,
-            roots=DataResourceRoots(list_name="things"),
-            type_names=DataResourceTypeNames(node="ResourceThingDuplicateFieldType"),
-            capabilities=("list",),
-            node_type=ResourceThingDuplicateFieldType,
-        )
+        metadata_module.require_unique_resource_fields(ResourceThing._meta.label, (field,))
 
 
 def test_data_resource_metadata_marks_public_id_field_as_id_scalar() -> None:
@@ -802,7 +1191,7 @@ def test_data_resource_metadata_marks_public_id_field_as_id_scalar() -> None:
     class ResourceThingNodeType(AngeeNode):
         name: auto
 
-    resource = make_data_resource_metadata(
+    resource = _finalize_data_resource(
         model=ResourceThing,
         roots=DataResourceRoots(list_name="things"),
         type_names=DataResourceTypeNames(node="ResourceThingNodeType"),
@@ -811,32 +1200,10 @@ def test_data_resource_metadata_marks_public_id_field_as_id_scalar() -> None:
     )
     fields = {field.name: field for field in resource.fields}
 
+    assert resource.query.identity.field == "id"
     assert fields["id"].kind == "scalar"
     assert fields["id"].scalar == "ID"
     assert fields["id"].widget is None
-
-
-def test_model_resource_metadata_marks_decimal_fields_as_decimal_scalar() -> None:
-    """Model-field metadata keeps Decimal distinct from Float."""
-
-    fields = {
-        field.name: field
-        for field in metadata_module.model_resource_fields(
-            MeasureOpsThing,
-            ("amount", "ratio"),
-            filter_fields=("amount", "ratio"),
-            order_fields=("amount", "ratio"),
-            aggregate_fields=("amount", "ratio"),
-        )
-    }
-
-    assert fields["amount"].kind == "scalar"
-    assert fields["amount"].scalar == "Decimal"
-    assert fields["amount"].widget == "float"
-    assert fields["amount"].filterable is True
-    assert fields["amount"].sortable is True
-    assert fields["amount"].aggregatable is True
-    assert fields["ratio"].scalar == "Float"
 
 
 def test_surface_resource_metadata_marks_decimal_fields_as_decimal_scalar() -> None:
@@ -851,7 +1218,7 @@ def test_surface_resource_metadata_marks_decimal_fields_as_decimal_scalar() -> N
         def computed_amount(self) -> Decimal:
             return self.amount
 
-    resource = make_data_resource_metadata(
+    resource = _finalize_data_resource(
         model=MeasureOpsThing,
         roots=DataResourceRoots(list_name="measure_ops"),
         type_names=DataResourceTypeNames(node="MeasureOpsThingType"),
@@ -878,7 +1245,7 @@ def test_data_resource_metadata_marks_computed_surface_enum_field() -> None:
         def mood(self) -> ResourceThingMoodType:
             return ResourceThingMood.HAPPY
 
-    resource = make_data_resource_metadata(
+    resource = _finalize_data_resource(
         model=ResourceThing,
         roots=DataResourceRoots(list_name="things"),
         type_names=DataResourceTypeNames(node="ResourceThingComputedEnumType"),
@@ -889,35 +1256,6 @@ def test_data_resource_metadata_marks_computed_surface_enum_field() -> None:
 
     assert fields["mood"].kind == "enum"
     assert fields["mood"].scalar is None
-
-
-def test_data_resource_metadata_marks_forward_object_field_as_relation() -> None:
-    """Unresolved object return types are relation-shaped, not scalar guesses."""
-
-    @strawberry_django.type(ResourceThing)
-    class ResourceThingForwardRelationType(AngeeNode):
-        name: auto
-
-        @strawberry.field
-        def parent(self) -> ResourceParentForwardTargetType | None:  # type: ignore[name-defined]
-            return None
-
-    resource = make_data_resource_metadata(
-        model=ResourceThing,
-        roots=DataResourceRoots(list_name="things"),
-        type_names=DataResourceTypeNames(node="ResourceThingForwardRelationType"),
-        capabilities=("list",),
-        node_type=ResourceThingForwardRelationType,
-    )
-
-    @strawberry_django.type(ResourceParent)
-    class ResourceParentForwardTargetType(AngeeNode):
-        name: auto
-
-    fields = {field.name: field for field in resource.fields}
-
-    assert fields["parent"].kind == "relation"
-    assert fields["parent"].scalar is None
 
 
 def test_data_resource_metadata_rejects_unsupported_surface_scalar() -> None:
@@ -935,7 +1273,7 @@ def test_data_resource_metadata_rejects_unsupported_surface_scalar() -> None:
         ImproperlyConfigured,
         match="cannot classify GraphQL scalar for field 'mystery' \\(ResourceThingUnsupportedScalar\\)",
     ):
-        make_data_resource_metadata(
+        _finalize_data_resource(
             model=ResourceThing,
             roots=DataResourceRoots(list_name="things"),
             type_names=DataResourceTypeNames(node="ResourceThingUnsupportedScalarType"),
@@ -947,16 +1285,12 @@ def test_data_resource_metadata_rejects_unsupported_surface_scalar() -> None:
 def test_data_resource_metadata_marks_to_many_node_fields_as_lists() -> None:
     """Resource fields must not describe to-many object lists as to-one relations."""
 
-    @strawberry_django.type(ResourceParent)
-    class ResourceParentListFieldType:
-        name: auto
-
     @strawberry_django.type(ResourceChild)
     class ResourceChildListFieldType:
         name: auto
-        related_parents: list[ResourceParentListFieldType]
+        related_parents: list[ResourceSubtitleParentType]
 
-    resource = make_data_resource_metadata(
+    resource = _finalize_data_resource(
         model=ResourceChild,
         roots=DataResourceRoots(list_name="children"),
         type_names=DataResourceTypeNames(node="ResourceChildListFieldType"),
@@ -973,16 +1307,12 @@ def test_data_resource_metadata_marks_to_many_node_fields_as_lists() -> None:
 def test_data_resource_metadata_marks_plain_relation_targets() -> None:
     """Object relations expose their target model even when they are not group axes."""
 
-    @strawberry_django.type(ResourceParent)
-    class ResourceParentRelationType:
-        name: auto
-
     @strawberry_django.type(ResourceChild)
     class ResourceChildRelationType:
         name: auto
-        parent: ResourceParentRelationType
+        parent: ResourceSubtitleParentType
 
-    resource = make_data_resource_metadata(
+    resource = _finalize_data_resource(
         model=ResourceChild,
         roots=DataResourceRoots(list_name="children"),
         type_names=DataResourceTypeNames(node="ResourceChildRelationType"),
@@ -994,7 +1324,7 @@ def test_data_resource_metadata_marks_plain_relation_targets() -> None:
     assert fields["parent"].kind == "relation"
     assert fields["parent"].widget == "many2one"
     assert fields["parent"].relation_model_label == "tests.ResourceParent"
-    assert fields["parent"].relation_label_axis is None
+    assert resource.query.fields["parent"].relation.identity_path is None
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,6 @@ from typing import Any, cast
 
 import strawberry
 import strawberry_django
-from angee.data.metadata import DataResourceEnumValueMetadata, DataResourceFieldMetadata
 from django.apps import apps
 from django.contrib.auth import get_user_model
 from strawberry import auto
@@ -20,7 +19,7 @@ from angee.graphql.data import (
     public_pk_decoder,
 )
 from angee.graphql.ids import PublicID, optional_public_id, require_public_id
-from angee.graphql.node import AngeeNode
+from angee.graphql.node import NODE_DISPLAY_NAME_DESCRIPTION, AngeeNode
 from angee.graphql.relations import actor_scoped_to_one
 from angee.graphql.revisions import revisions
 from angee.graphql.subscriptions import changes
@@ -77,70 +76,6 @@ _PROJECT_EXTENSION_PUBLIC_ID_FIELDS = tuple(
 )
 
 
-def _extension_declared_fields(
-    model: type,
-    readable_fields: tuple[str, ...],
-    *,
-    filterable_fields: tuple[str, ...],
-    sortable_fields: tuple[str, ...],
-    aggregatable_fields: tuple[str, ...],
-    groupable_fields: tuple[str, ...],
-    insertable_fields: tuple[str, ...],
-    updatable_fields: tuple[str, ...],
-) -> tuple[str | DataResourceFieldMetadata, ...]:
-    """Return metadata for donor fields projected after the parent node.
-
-    Ordinary fields retain model reconstruction. A contributed ``StateField``
-    supplies its enum metadata explicitly because the downstream type extension
-    is composed after this parent resource is declared.
-    """
-
-    filterable = set(filterable_fields)
-    sortable = set(sortable_fields)
-    aggregatable = set(aggregatable_fields)
-    groupable = set(groupable_fields)
-    insertable = set(insertable_fields)
-    updatable = set(updatable_fields)
-    declared: list[str | DataResourceFieldMetadata] = []
-    for name in readable_fields:
-        choices_enum = getattr(model._meta.get_field(name), "choices_enum", None)
-        if choices_enum is None:
-            declared.append(name)
-            continue
-        declared.append(
-            DataResourceFieldMetadata(
-                name=name,
-                kind="enum",
-                values=tuple(
-                    DataResourceEnumValueMetadata(
-                        value=str(member.name),
-                        description=str(member.label) if str(member.label).strip() else None,
-                    )
-                    for member in choices_enum
-                ),
-                widget="select",
-                filterable=name in filterable,
-                sortable=name in sortable,
-                aggregatable=name in aggregatable,
-                groupable=name in groupable,
-                creatable=name in insertable,
-                updatable=name in updatable,
-            )
-        )
-    return tuple(declared)
-
-
-_PROJECT_EXTENSION_DECLARED_FIELDS = _extension_declared_fields(
-    Project,
-    _PROJECT_EXTENSION_READ_FIELDS,
-    filterable_fields=_PROJECT_EXTENSION_FILTER_FIELDS,
-    sortable_fields=_PROJECT_EXTENSION_ORDER_FIELDS,
-    aggregatable_fields=_PROJECT_EXTENSION_AGGREGATE_FIELDS,
-    groupable_fields=_PROJECT_EXTENSION_GROUP_FIELDS,
-    insertable_fields=_PROJECT_EXTENSION_INSERT_FIELDS,
-    updatable_fields=_PROJECT_EXTENSION_UPDATE_FIELDS,
-)
-
 _TASK_EXTENSION_READ_FIELDS = declared_hasura_resource_fields(
     Task,
     "hasura_readable_fields",
@@ -175,17 +110,6 @@ _TASK_EXTENSION_FORBIDDEN_INSERT_FIELDS = set(
 _TASK_EXTENSION_WRITE_FIELDS = tuple(dict.fromkeys((*_TASK_EXTENSION_INSERT_FIELDS, *_TASK_EXTENSION_UPDATE_FIELDS)))
 _TASK_EXTENSION_PUBLIC_ID_FIELDS = tuple(
     name for name in _TASK_EXTENSION_WRITE_FIELDS if Task._meta.get_field(name).is_relation
-)
-
-_TASK_EXTENSION_DECLARED_FIELDS = _extension_declared_fields(
-    Task,
-    _TASK_EXTENSION_READ_FIELDS,
-    filterable_fields=_TASK_EXTENSION_FILTER_FIELDS,
-    sortable_fields=_TASK_EXTENSION_ORDER_FIELDS,
-    aggregatable_fields=_TASK_EXTENSION_AGGREGATE_FIELDS,
-    groupable_fields=_TASK_EXTENSION_GROUP_FIELDS,
-    insertable_fields=_TASK_EXTENSION_INSERT_FIELDS,
-    updatable_fields=_TASK_EXTENSION_UPDATE_FIELDS,
 )
 
 DroppedReason = Task._meta.get_field("dropped_reason").choices_enum
@@ -261,6 +185,11 @@ class MilestoneType(AuthoredRefMixin, AngeeNode):
 class TaskType(AuthoredRefMixin, AngeeNode):
     """GraphQL projection of one human action."""
 
+    display_name: str = strawberry_django.field(
+        resolver=AngeeNode.display_name,
+        only=["title"],
+        description=NODE_DISPLAY_NAME_DESCRIPTION,
+    )
     title: auto
     note: auto
     status: auto
@@ -303,6 +232,11 @@ class TaskType(AuthoredRefMixin, AngeeNode):
 class ConsoleTaskType(AuthoredRefMixin, AngeeNode):
     """Console task projection with label-bearing user relations."""
 
+    display_name: str = strawberry_django.field(
+        resolver=AngeeNode.display_name,
+        only=["title"],
+        description=NODE_DISPLAY_NAME_DESCRIPTION,
+    )
     title: auto
     note: auto
     status: auto
@@ -578,7 +512,6 @@ def _project_resource(node_type: type) -> Any:
             Project,
             public_id_fields=("lead", "folder", *_PROJECT_EXTENSION_PUBLIC_ID_FIELDS),
         ),
-        declared_fields=_PROJECT_EXTENSION_DECLARED_FIELDS,
     )
 
 
@@ -722,7 +655,6 @@ def _task_resource(node_type: type) -> Any:
                 *_TASK_EXTENSION_PUBLIC_ID_FIELDS,
             ),
         ),
-        declared_fields=_TASK_EXTENSION_DECLARED_FIELDS,
     )
 
 

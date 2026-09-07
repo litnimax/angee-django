@@ -20,10 +20,12 @@ from typing import Any
 import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
+from django.core.exceptions import ValidationError
 from django.core.management import call_command
-from django.db import IntegrityError
+from django.db import connection
 from django.db.models.signals import post_save
 from django.test import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from rebac import app_settings, system_context
 from rebac.roles import grant
 
@@ -51,12 +53,14 @@ from tests.conftest import (
 from tests.conftest import (
     result_data as _data,
 )
+from tests.test_agents import InferenceProvider
 from tests.test_agents_graphql import AGENTS_GRAPHQL_MODELS
 from tests.test_messaging import MESSAGING_TEST_MODELS
 
 User = get_user_model()
 iam_schema = importlib.import_module("angee.iam.schema")
 integrate_schema = importlib.import_module("angee.integrate.schema")
+integrate_vcs_schema = importlib.import_module("angee.integrate_vcs.schema")
 _BRIDGE_SYNCED = str(EventKind.BRIDGE_SYNCED)
 """Raw stored value of one integration event kind (``str`` for clean typing)."""
 
@@ -102,6 +106,98 @@ def test_integration_node_resolves_nested_relations(
     }
 
 
+def test_integration_capabilities_are_native_creatable_children(
+    integrate_console_tables: None,
+) -> None:
+    """Runtime capabilities expose only installed children with a real create ingress."""
+
+    admin = _platform_admin("integration-capabilities-admin")
+    rows = _data(
+        _execute(
+            _schema(),
+            "query { integration_capabilities { resource label icon create_mode } }",
+            user=admin,
+        )
+    )["integration_capabilities"]
+    modes = {row["resource"]: row["create_mode"] for row in rows}
+    assert modes["integrate_vcs.VcsBridge"] == "FORM"
+    assert "agents.InferenceProvider" not in modes
+    assert "messaging.Channel" not in modes
+    assert "posts.Feed" not in modes
+
+
+def test_integration_concrete_target_keeps_parent_only_rows_unavailable(
+    integrate_console_tables: None,
+) -> None:
+    """Parent-only legacy rows remain visible without a guessed child target."""
+
+    admin = _platform_admin("integration-target-admin")
+    parent = make_integration("target-parent")
+    child = make_integration("target-vcs", model=VcsBridge)
+    rows = _data(
+        _execute(
+            _schema(),
+            "query { integrations(limit: 20) { id concrete_target { state resource id } } }",
+            user=admin,
+        )
+    )["integrations"]
+    targets = {row["id"]: row["concrete_target"] for row in rows}
+    assert targets[_public_id(parent)] == {"state": "UNAVAILABLE", "resource": None, "id": None}
+    assert targets[_public_id(child)] == {
+        "state": "AVAILABLE",
+        "resource": "integrate_vcs.VcsBridge",
+        "id": _public_id(child),
+    }
+
+
+def test_concrete_target_fails_closed_for_unexposed_and_ambiguous_children(
+    integrate_console_tables: None,
+) -> None:
+    """Real hidden and sibling child rows never disclose an arbitrary target."""
+
+    admin = _platform_admin("integration-target-closed-admin")
+    hidden = make_integration("target-hidden", model=InferenceProvider, backend_class="manual")
+    sibling_parent = make_integration("target-sibling", model=InferenceProvider, backend_class="manual")
+    VcsBridge(integration_ptr_id=sibling_parent.pk, backend_class="local").save_base(raw=True, force_insert=True)
+    rows = _data(
+        _execute(
+            _schema(),
+            "query { integrations(limit: 20) { id concrete_target { state resource id } } }",
+            user=admin,
+        )
+    )["integrations"]
+    targets = {row["id"]: row["concrete_target"] for row in rows}
+    assert targets[_public_id(hidden)] == {"state": "UNAVAILABLE", "resource": None, "id": None}
+    # One exposed and one hidden sibling collapses to UNAVAILABLE so the hidden
+    # capability is not revealed and the exposed sibling is never chosen.
+    assert targets[_public_id(sibling_parent)] == {"state": "UNAVAILABLE", "resource": None, "id": None}
+
+
+def test_concrete_target_list_query_cost_is_bounded_by_child_types(
+    integrate_console_tables: None,
+) -> None:
+    """Adding parent rows does not add one concrete-child query per row."""
+
+    admin = _platform_admin("integration-target-budget-admin")
+    parent = make_integration("target-budget-parent")
+    make_integration("target-budget-one", model=VcsBridge)
+    hidden = make_integration("target-budget-hidden", model=InferenceProvider, backend_class="manual")
+    schema = _schema()
+    query = "query { integrations(limit: 20) { id concrete_target { state resource id } } }"
+    with CaptureQueriesContext(connection) as one:
+        first = _data(_execute(schema, query, user=admin))["integrations"]
+    first_targets = {row["id"]: row["concrete_target"]["state"] for row in first}
+    assert first_targets[_public_id(parent)] == "UNAVAILABLE"
+    assert first_targets[_public_id(hidden)] == "UNAVAILABLE"
+    assert "AVAILABLE" in first_targets.values()
+    for index in range(4):
+        make_integration(f"target-budget-more-{index}", model=VcsBridge)
+    with CaptureQueriesContext(connection) as many:
+        many_rows = _data(_execute(schema, query, user=admin))["integrations"]
+    assert sum(row["concrete_target"]["state"] == "AVAILABLE" for row in many_rows) == 5
+    assert len(many) <= len(one) + 1
+
+
 def test_integration_groups_aggregate_runs_with_rebac_scope(
     integrate_console_tables: None,
 ) -> None:
@@ -121,7 +217,7 @@ def test_integration_groups_aggregate_runs_with_rebac_scope(
             """
             query IntegrationGroups($groupBy: [GROUP_BY_SPEC!]!) {
               integrations_groups(group_by: $groupBy, limit: 10) {
-                key { vendor_id vendor__display_name kind impl_class }
+                key { vendor_id vendor__display_name kind }
                 aggregate { count }
               }
             }
@@ -131,7 +227,6 @@ def test_integration_groups_aggregate_runs_with_rebac_scope(
                     {"field": "VENDOR"},
                     {"field": "VENDOR__DISPLAY_NAME"},
                     {"field": "KIND"},
-                    {"field": "IMPL_CLASS"},
                 ],
             },
             user=admin,
@@ -143,7 +238,6 @@ def test_integration_groups_aggregate_runs_with_rebac_scope(
                 "vendor_id": vendor_id,
                 "vendor__display_name": "Conn-Groups",
                 "kind": "Integration",
-                "impl_class": "NONE",
             },
             "aggregate": {"count": 1},
         }
@@ -155,65 +249,64 @@ def test_console_resource_metadata_declares_integration_surface() -> None:
 
     schemas = _schemas()
     console_schema = schemas.build("console")
-    metadata = {
-        item.model_label: item
-        for item in console_schema.angee_resources
-    }["integrate.Integration"]
+    metadata = {item.model_label: item for item in console_schema.angee_resources}["integrate.Integration"]
 
     assert schemas.resources("console") == console_schema.angee_resources
     assert metadata.roots.list_name == "integrations"
     assert metadata.roots.detail_name == "integrations_by_pk"
     assert metadata.roots.aggregate_name == "integrations_aggregate"
     assert metadata.roots.group_name == "integrations_groups"
-    assert metadata.roots.create_name == "insert_integrations_one"
+    assert metadata.roots.create_name is None
     assert metadata.roots.update_name == "update_integrations_by_pk"
     assert metadata.roots.delete_name == "delete_integrations_by_pk"
-    assert metadata.filter_fields == (
-        "id", "display_name", "vendor", "kind", "impl_class", "lifecycle", "runtime_status", "updated_at",
-    )
-    assert metadata.order_fields == (
-        "display_name", "vendor", "kind", "impl_class", "lifecycle", "runtime_status", "created_at", "updated_at",
-    )
-    assert metadata.aggregate_fields == ("id",)
-    assert metadata.group_by_fields == (
-        "kind",
-        "impl_class",
-        "vendor",
-        "vendor__display_name",
-        "lifecycle",
+    assert {name for name, field in metadata.query.fields.items() if field.filter} == {
+        "display_name",
         "runtime_status",
-    )
+        "lifecycle",
+        "id",
+        "kind",
+        "vendor",
+        "updated_at",
+    }
+    assert {name for name, field in metadata.query.fields.items() if field.sort} == {
+        "display_name",
+        "runtime_status",
+        "lifecycle",
+        "created_at",
+        "kind",
+        "vendor",
+        "updated_at",
+    }
+    assert metadata.aggregate_fields == ("id",)
+    assert set(metadata.query.axes) == {"runtime_status", "lifecycle", "vendor", "kind"}
     assert {
-        dimension.field: (dimension.input, dimension.key, dimension.kind, dimension.scalar)
-        for dimension in metadata.group_dimensions
+        dimension.field: (dimension.server.input, dimension.server.key, dimension.kind)
+        for dimension in metadata.query.axes.values()
     } == {
-        "kind": ("KIND", "kind", "column", None),
-        "impl_class": ("IMPL_CLASS", "impl_class", "column", None),
-        "vendor": ("VENDOR", "vendor_id", "relation", "ID"),
-        "vendor__display_name": ("VENDOR__DISPLAY_NAME", "vendor__display_name", "column", None),
-        "lifecycle": ("LIFECYCLE", "lifecycle", "column", None),
-        "runtime_status": ("RUNTIME_STATUS", "runtime_status", "column", None),
+        "kind": ("KIND", "kind", "column"),
+        "vendor": ("VENDOR", "vendor_id", "relation"),
+        "lifecycle": ("LIFECYCLE", "lifecycle", "column"),
+        "runtime_status": ("RUNTIME_STATUS", "runtime_status", "column"),
     }
     assert metadata.default_measures[0].op == "count"
     assert metadata.aggregate_measures == ()
-    assert metadata.capabilities == ("list", "detail", "aggregate", "groups", "create", "update", "delete", "changes")
-    assert metadata.relation_axes[0].field == "vendor"
-    assert metadata.relation_axes[0].model_label == "integrate.Vendor"
-    assert metadata.relation_axes[0].public_id_field == "sqid"
-    assert metadata.relation_axes[0].label_axis == "vendor__display_name"
-    assert metadata.group_aliases == ()
+    assert metadata.capabilities == ("list", "detail", "aggregate", "groups", "update", "delete", "changes")
+    assert metadata.query.axes["vendor"].field == "vendor"
+    assert metadata.query.fields["vendor"].relation.model == "integrate.Vendor"
+    assert metadata.query.fields["vendor"].relation.identity_path == "vendor.id"
+    assert metadata.query.axes["vendor"].server.label_key == "vendor__display_name"
+    assert metadata.query.identity.field == "id"
+    assert not hasattr(metadata, "group_aliases")
     serialized = console_schema._schema.extensions["angee"]["resources"]
-    integration = {
-        item["modelLabel"]: item
-        for item in serialized
-    }["integrate.Integration"]
+    integration = {item["modelLabel"]: item for item in serialized}["integrate.Integration"]
     assert integration["schemaName"] == "console"
+    assert integration["query"]["identity"]["field"] == "id"
     assert integration["roots"]["list"] == "integrations"
     assert integration["roots"]["detail"] == "integrations_by_pk"
     assert integration["roots"]["aggregate"] == "integrations_aggregate"
     assert integration["roots"]["groups"] == "integrations_groups"
     assert integration["roots"]["groupsCount"] == "integrations_groups_count"
-    assert integration["roots"]["create"] == "insert_integrations_one"
+    assert integration["roots"]["create"] is None
     assert integration["roots"]["update"] == "update_integrations_by_pk"
     assert integration["roots"]["delete"] == "delete_integrations_by_pk"
     assert integration["roots"]["changes"] == "integrationChanged"
@@ -222,69 +315,58 @@ def test_console_resource_metadata_declares_integration_surface() -> None:
         "detail",
         "aggregate",
         "groups",
-        "create",
         "update",
         "delete",
         "changes",
     ]
-    assert integration["groupByFields"] == [
+    assert list(integration["query"]["axes"]) == [
         "kind",
-        "impl_class",
         "vendor",
-        "vendor__display_name",
         "lifecycle",
         "runtime_status",
     ]
     assert {
         dimension["field"]: (
-            dimension["input"],
-            dimension["key"],
+            dimension["server"]["input"],
+            dimension["server"]["key"],
             dimension["kind"],
-            dimension["scalar"],
         )
-        for dimension in integration["groupDimensions"]
+        for dimension in integration["query"]["axes"].values()
     } == {
-        "kind": ("KIND", "kind", "column", None),
-        "impl_class": ("IMPL_CLASS", "impl_class", "column", None),
-        "vendor": ("VENDOR", "vendor_id", "relation", "ID"),
-        "vendor__display_name": ("VENDOR__DISPLAY_NAME", "vendor__display_name", "column", None),
-        "lifecycle": ("LIFECYCLE", "lifecycle", "column", None),
-        "runtime_status": ("RUNTIME_STATUS", "runtime_status", "column", None),
+        "kind": ("KIND", "kind", "column"),
+        "vendor": ("VENDOR", "vendor_id", "relation"),
+        "lifecycle": ("LIFECYCLE", "lifecycle", "column"),
+        "runtime_status": ("RUNTIME_STATUS", "runtime_status", "column"),
     }
     assert integration["defaultMeasures"] == [{"op": "count", "field": None, "input": None}]
     assert integration["aggregateMeasures"] == []
-    assert integration["relationAxes"] == [
-        {
-            "field": "vendor",
-            "modelLabel": "integrate.Vendor",
-            "publicIdField": "sqid",
-            "labelAxis": "vendor__display_name",
-        }
-    ]
-    assert integration["groupAliases"] == []
+    assert integration["query"]["fields"]["vendor"]["relation"] == {
+        "model": "integrate.Vendor",
+        "identityPath": "vendor.id",
+        "labelPath": "vendor.display_name",
+    }
+    assert "groupAliases" not in integration
     assert integration["updateFields"] == ["vendor", "credential", "account", "owner"]
     kind_field = {field["name"]: field for field in integration["fields"]}["kind"]
     assert kind_field["kind"] == "scalar"
-    assert kind_field["filterable"] is True
-    assert kind_field["sortable"] is True
-    assert kind_field["groupable"] is True
+    assert integration["query"]["fields"]["kind"]["filter"] is not None
+    assert integration["query"]["fields"]["kind"]["sort"] is not None
+    assert "kind" in integration["query"]["axes"]
     assert kind_field["updatable"] is False
-    impl_field = {field["name"]: field for field in integration["fields"]}["impl_class"]
-    assert impl_field["values"] == [{"value": "NONE", "description": "None"}]
     lifecycle_field = {field["name"]: field for field in integration["fields"]}["lifecycle"]
     assert lifecycle_field["kind"] == "enum"
     assert lifecycle_field["widget"] == "select"
     assert lifecycle_field["readable"] is True
-    assert lifecycle_field["filterable"] is True
-    assert lifecycle_field["sortable"] is True
-    assert lifecycle_field["groupable"] is True
+    assert integration["query"]["fields"]["lifecycle"]["filter"] is not None
+    assert integration["query"]["fields"]["lifecycle"]["sort"] is not None
+    assert "lifecycle" in integration["query"]["axes"]
     assert lifecycle_field["updatable"] is False
     runtime_status_field = {field["name"]: field for field in integration["fields"]}["runtime_status"]
     assert runtime_status_field["kind"] == "enum"
     assert runtime_status_field["readable"] is True
-    assert runtime_status_field["filterable"] is True
-    assert runtime_status_field["sortable"] is True
-    assert runtime_status_field["groupable"] is True
+    assert integration["query"]["fields"]["runtime_status"]["filter"] is not None
+    assert integration["query"]["fields"]["runtime_status"]["sort"] is not None
+    assert "runtime_status" in integration["query"]["axes"]
     assert runtime_status_field["updatable"] is False
 
 
@@ -298,12 +380,12 @@ def test_resource_metadata_names_the_impl_columns_it_projects() -> None:
 
     schema = _schema()
     resources = {item.model_label: item for item in schema.angee_resources}
-    assert resources["integrate.Integration"].impl_fields == ("impl_class",)
-    assert resources["integrate.VcsBridge"].impl_fields == ("backend_class",)
+    assert resources["integrate.Integration"].impl_fields == ()
+    assert resources["integrate_vcs.VcsBridge"].impl_fields == ("backend_class",)
     assert resources["integrate.Vendor"].impl_fields == ()
 
     wire = {item["modelLabel"]: item for item in schema._schema.extensions["angee"]["resources"]}
-    assert wire["integrate.Integration"]["implFields"] == ["impl_class"]
+    assert wire["integrate.Integration"]["implFields"] == []
     assert wire["integrate.Vendor"]["implFields"] == []
 
 
@@ -315,7 +397,7 @@ def test_impl_choices_are_admin_only(integrate_console_tables: None) -> None:
     admin = _platform_admin("impl-choices-admin")
     query = """
         query {
-          impl_choices(model: "integrate.Integration", field: "implClass") {
+          impl_choices(model: "integrate_vcs.VcsBridge", field: "backendClass") {
             key
           }
         }
@@ -323,77 +405,54 @@ def test_impl_choices_are_admin_only(integrate_console_tables: None) -> None:
 
     assert _execute(console_schema, query, user=plain).errors is not None
     result = _data(_execute(console_schema, query, user=admin))["impl_choices"]
-    assert {"key": "none"} in result
+    assert {"key": "stub"} in result
 
     vcs_result = _data(
         _execute(
             console_schema,
             """
             query {
-              impl_choices(model: "integrate.VcsBridge", field: "backendClass") {
+              impl_choices(model: "integrate_vcs.VcsBridge", field: "backendClass") {
                 key
+                config_schema
               }
             }
             """,
             user=admin,
         )
     )["impl_choices"]
-    assert {"key": "stub"} in vcs_result
-
-
-def test_update_integration_rejects_impl_class_patch(integrate_console_tables: None) -> None:
-    """The implementation discriminator is create-time only."""
-
-    admin = _platform_admin("impl-patch-admin")
-    conn = make_integration("impl-patch")
-    console_schema = _schema()
-
-    result = _execute(
-        console_schema,
-        """
-        mutation UpdateIntegration($id: String!) {
-          update_integrations_by_pk(pk_columns: {id: $id}, _set: {impl_class: "stub"}) {
-            lifecycle
-          }
-        }
-        """,
-        {"id": _public_id(conn)},
-        user=admin,
-    )
-
-    assert result.errors is not None
-    assert "impl_class" in result.errors[0].message
-
-
-def test_create_integration_rejects_child_backend_key(integrate_console_tables: None) -> None:
-    """Child backend keys are not valid parent integration implementation keys."""
-
-    console_schema = _schema()
-    admin = _platform_admin("vcs-parent-create-admin")
-    owner = User.objects.create_user(username="vcs-parent-create-owner", email="owner@example.com")
-    with system_context(reason="test.integrate.vcs_parent_create.seed"):
-        vendor = Vendor.objects.create(slug="vcs-parent-create", display_name="VCS Parent Create")
-
-    result = _execute(
-        console_schema,
-        """
-        mutation CreateIntegration($vendor: ID!, $owner: ID!) {
-          insert_integrations_one(object: {vendor: $vendor, owner: $owner, impl_class: "stub"}) {
-            id
-          }
-        }
-        """,
-        {
-            "vendor": _public_id(vendor.sqid),
-            "owner": str(owner.sqid),
+    assert {"key": "stub", "config_schema": None} in vcs_result
+    local = next(choice for choice in vcs_result if choice["key"] == "local")
+    assert local["config_schema"] == {
+        "type": "object",
+        "properties": {
+            "local_root": {
+                "type": "string",
+                "label": "Local Root",
+                "description": "Path to the checkout root.",
+                "defaultValue": "../..",
+            },
+            "local_name": {
+                "type": "string",
+                "label": "Local Name",
+                "description": "Repository name override.",
+                "defaultValue": "",
+            },
+            "local_org": {
+                "type": "string",
+                "label": "Local Org",
+                "description": "Repository organization label.",
+                "defaultValue": "local",
+            },
+            "local_default_branch": {
+                "type": "string",
+                "label": "Local Default Branch",
+                "description": "Default branch label.",
+                "defaultValue": "main",
+            },
         },
-        user=admin,
-    )
-
-    assert result.errors is not None
-    assert "impl_class" in result.errors[0].message
-    with system_context(reason="test.integrate.vcs_parent_create.verify"):
-        assert not Integration.objects.filter(owner=owner, vendor=vendor).exists()
+        "required": [],
+    }
 
 
 def test_vcs_bridge_child_creation_creates_parent_identity(integrate_console_tables: None) -> None:
@@ -413,8 +472,6 @@ def test_vcs_bridge_child_creation_creates_parent_identity(integrate_console_tab
             {"api_key": "x"},
         )
         vendor = Vendor.objects.create(slug="vcs-child", display_name="VCS Child")
-        assert Integration.impl_key_for("impl_class", "", default="none") == "none"
-        assert Integration.impl_key_for("impl_class", "   ", default="none") == "none"
         assert VcsBridge.impl_key_for("backend_class", "STUB", default="local") == "stub"
         bridge = VcsBridge.objects.create(
             vendor=vendor,
@@ -426,7 +483,6 @@ def test_vcs_bridge_child_creation_creates_parent_identity(integrate_console_tab
         )
         integration = Integration.objects.get(pk=bridge.pk)
 
-        assert integration.impl_class == "none"
         assert integration.kind == "VCS bridge"
         assert bridge.backend_class == "stub"
         assert str(integration.lifecycle) == "disconnected"
@@ -435,6 +491,36 @@ def test_vcs_bridge_child_creation_creates_parent_identity(integrate_console_tab
         assert bridge.vendor_id == integration.vendor_id
         assert bridge.credential_id == integration.credential_id
         assert str(bridge.webhook_secret) == "created-secret"
+
+
+def test_vcs_bridge_create_maps_typed_config_errors_to_nested_field(
+    integrate_console_tables: None,
+) -> None:
+    """Concrete GraphQL creation enforces backend config at the model save boundary."""
+
+    seed = make_integration("typed-config-seed", backend_class="stub", model=VcsBridge)
+    result = _execute(
+        _schema(),
+        """
+        mutation InvalidConfig($vendor: ID!, $owner: ID!) {
+          create_vcs_bridge(data: {
+            vendor: $vendor,
+            owner: $owner,
+            backend_class: "local",
+            config: {unknown_local_option: true}
+          }) { id }
+        }
+        """,
+        {"vendor": _public_id(seed.vendor.sqid), "owner": str(seed.owner.sqid)},
+        user=_platform_admin("typed-config-admin"),
+    )
+
+    assert result.errors is not None
+    assert result.errors[0].extensions == {
+        "code": "VALIDATION",
+        "validationErrors": {"config.unknown_local_option": ["Extra inputs are not permitted"]},
+        "formErrors": [],
+    }
 
 
 def test_integration_kind_backfill_recovers_child_rows(integrate_console_tables: None) -> None:
@@ -459,22 +545,6 @@ def test_integration_update_delete_are_admin_only(
     conn = make_integration("conn-crud")
     console_schema = _schema()
 
-    # Hasura create is still REBAC-gated; the deliberately bogus relation ids
-    # only need to prove a plain user cannot create through the generic root.
-    owner_id = str(conn.owner.sqid)
-    assert _execute(
-        console_schema,
-        """
-        mutation CreateIntegration($owner: ID!) {
-          insert_integrations_one(object: {owner: $owner, vendor: $owner, credential: $owner}) {
-            lifecycle
-          }
-        }
-        """,
-        {"owner": owner_id},
-        user=plain,
-    ).errors is not None
-
     integration_id = _public_id(conn)
     update_integration = """
         mutation UpdateIntegration($id: String!) {
@@ -487,9 +557,9 @@ def test_integration_update_delete_are_admin_only(
 
     assert _execute(console_schema, update_integration, {"id": integration_id}, user=plain).errors is not None
 
-    updated = _data(
-        _execute(console_schema, update_integration, {"id": integration_id}, user=admin)
-    )["update_integrations_by_pk"]
+    updated = _data(_execute(console_schema, update_integration, {"id": integration_id}, user=admin))[
+        "update_integrations_by_pk"
+    ]
     assert updated == {"account": None, "vendor": {"slug": "conn-crud"}}
 
     delete_integration = """
@@ -502,12 +572,91 @@ def test_integration_update_delete_are_admin_only(
 
     assert _execute(console_schema, delete_integration, {"id": integration_id}, user=plain).errors is not None
 
-    deleted = _data(
-        _execute(console_schema, delete_integration, {"id": integration_id}, user=admin)
-    )["delete_integrations_by_pk"]
+    deleted = _data(_execute(console_schema, delete_integration, {"id": integration_id}, user=admin))[
+        "delete_integrations_by_pk"
+    ]
     assert deleted["id"] == integration_id
     with system_context(reason="test.integrate.integration_crud.after_delete"):
         assert not Integration.objects.filter(pk=conn.pk).exists()
+
+
+def test_attach_integration_credential_targets_owned_concrete_child(
+    integrate_console_tables: None,
+) -> None:
+    """Credential-first ingress preserves the concrete identity and rejects another owner."""
+
+    bridge = make_integration("credential-target", backend_class="stub", model=VcsBridge)
+    other = User.objects.create_user(username="credential-target-other", email="other@example.com")
+    with system_context(reason="test.integrate.credential_target.seed"):
+        replacement = Credential.objects.create_local_credential(
+            bridge.owner,
+            kind=CredentialKind.STATIC_TOKEN,
+            name="replacement-token",
+            material={"api_key": "replacement"},
+        )
+    mutation = """
+        mutation Attach($resource: String!, $id: ID!, $credential: ID!) {
+          attach_integration_credential(resource: $resource, id: $id, credential: $credential) {
+            lifecycle
+            credential { display_name }
+          }
+        }
+    """
+    variables = {
+        "resource": "integrate_vcs.VcsBridge",
+        "id": _public_id(bridge),
+        "credential": _public_id(replacement),
+    }
+
+    denied = _execute(_schema(), mutation, variables, user=other)
+    assert denied.errors is not None
+    attached = _data(_execute(_schema(), mutation, variables, user=bridge.owner))["attach_integration_credential"]
+    assert attached == {
+        "lifecycle": "CONNECTED",
+        "credential": {"display_name": "replacement-token"},
+    }
+    with system_context(reason="test.integrate.credential_target.verify"):
+        assert VcsBridge.objects.get(pk=bridge.pk).credential_id == replacement.pk
+
+
+def test_connect_integration_reuses_live_oauth_for_explicit_concrete_child(
+    integrate_console_tables: None,
+) -> None:
+    """OAuth ingress carries the authorized child resource and public id through attach."""
+
+    bridge = make_integration(
+        "oauth-concrete-target",
+        kind=CredentialKind.OAUTH,
+        backend_class="stub",
+        model=VcsBridge,
+    )
+    credential = bridge.credential
+    with system_context(reason="test.integrate.oauth_concrete_target.disconnect"):
+        VcsBridge.objects.filter(pk=bridge.pk).update(credential=None, lifecycle="disconnected")
+    mutation = """
+        mutation Connect($resource: String!, $id: ID!) {
+          connect_integration(resource: $resource, id: $id) {
+            attached
+            integration { id lifecycle credential { display_name } }
+            error_code
+          }
+        }
+    """
+    variables = {"resource": "integrate_vcs.VcsBridge", "id": _public_id(bridge)}
+
+    result = _data(_execute(_schema(), mutation, variables, user=bridge.owner))["connect_integration"]
+    assert result == {
+        "attached": True,
+        "integration": {
+            "id": _public_id(bridge),
+            "lifecycle": "CONNECTED",
+            "credential": {"display_name": "Oauth-Concrete-Target"},
+        },
+        "error_code": None,
+    }
+    with system_context(reason="test.integrate.oauth_concrete_target.verify"):
+        persisted = VcsBridge.objects.get(pk=bridge.pk)
+        assert persisted.credential_id == credential.pk
 
 
 def test_integration_lifecycle_action_mutations_pause_connect_and_disconnect(
@@ -588,9 +737,10 @@ def test_webhook_crud_secret_write_only(
     admin = _platform_admin("webhook-admin")
     owner = User.objects.create_user(username="webhook-owner", email="owner@example.com")
     # ``createWebhookSubscription`` is admin gated before owner-id resolution.
-    assert _execute(
-        console_schema,
-        """
+    assert (
+        _execute(
+            console_schema,
+            """
         mutation CreateWebhook($owner: ID!) {
           insert_webhook_subscriptions_one(
             object: {owner: $owner, target_url: "https://hooks.example/x", secret: "s"}
@@ -599,9 +749,11 @@ def test_webhook_crud_secret_write_only(
           }
         }
         """,
-        {"owner": str(owner.sqid)},
-        user=plain,
-    ).errors is not None
+            {"owner": str(owner.sqid)},
+            user=plain,
+        ).errors
+        is not None
+    )
     with system_context(reason="test.integrate.webhook_crud.create"):
         subscription = WebhookSubscription.objects.create(
             owner=owner,
@@ -659,9 +811,9 @@ def test_webhook_crud_secret_write_only(
 
     assert _execute(console_schema, delete_webhook, {"id": subscription_id}, user=plain).errors is not None
 
-    deleted = _data(
-        _execute(console_schema, delete_webhook, {"id": subscription_id}, user=admin)
-    )["delete_webhook_subscriptions_by_pk"]
+    deleted = _data(_execute(console_schema, delete_webhook, {"id": subscription_id}, user=admin))[
+        "delete_webhook_subscriptions_by_pk"
+    ]
     assert deleted["id"] == subscription_id
     with system_context(reason="test.integrate.webhook_crud.after_delete"):
         assert not WebhookSubscription.objects.filter(pk=subscription.pk).exists()
@@ -693,169 +845,6 @@ def test_integration_action_mutations_are_admin_only(
     ]
     for query, variables in denied:
         assert _execute(console_schema, query, variables, user=plain).errors is not None
-
-
-def test_create_integration_from_credential_is_authenticated_user_owned(
-    integrate_console_tables: None,
-) -> None:
-    """A signed-in user can create an integration only from their own credential."""
-
-    console_schema = _schema()
-    owner = User.objects.create_user(username="credential-owner", email="owner@example.com")
-    other = User.objects.create_user(username="credential-other", email="other@example.com")
-    with system_context(reason="test.integrate.credential_handoff.seed"):
-        oauth_client = OAuthClient.objects.create(
-            slug="anthropic",
-            display_name="Anthropic",
-            client_id="public-client",
-        )
-        credential = Credential.objects.upsert_for_user(
-            owner,
-            oauth_client,
-            CredentialKind.OAUTH,
-            {"access_token": "oauth-token"},
-        )
-        Vendor.objects.create(slug="anthropic", display_name="Anthropic")
-    credential_id = str(credential.sqid)
-    mutation = """
-        mutation Connect($credential: ID!) {
-          create_integration_from_credential(
-            credential: $credential
-            vendor_slug: "anthropic"
-          ) {
-            vendor { slug }
-            owner { username }
-            credential { display_name }
-          }
-        }
-    """
-
-    assert _execute(console_schema, mutation, {"credential": credential_id}, user=other).errors is not None
-
-    created = _data(
-        _execute(console_schema, mutation, {"credential": credential_id}, user=owner)
-    )["create_integration_from_credential"]
-
-    assert created["vendor"] == {"slug": "anthropic"}
-    assert created["owner"] == {"username": "credential-owner"}
-    # The OAuth credential is labelled from its provider's display name on create
-    # (``CredentialManager._oauth_credential_name``).
-    assert created["credential"]["display_name"] == "Anthropic"
-    with system_context(reason="test.integrate.credential_handoff.verify"):
-        integration = Integration.objects.get(owner=owner, credential=credential)
-        assert integration.vendor.slug == "anthropic"
-
-
-def test_connect_integration_reuses_existing_row_with_enum_impl_class(
-    integrate_console_tables: None,
-) -> None:
-    """The self-service connect mutation accepts read-side enum casing on retry."""
-
-    console_schema = _schema()
-    conn = make_integration(
-        "connect-enum",
-        kind=CredentialKind.OAUTH,
-    )
-    mutation = """
-        mutation {
-          connect_integration(vendor_slug: "connect-enum", impl_class: "NONE") {
-            attached
-            error
-            integration {
-              impl_class
-              vendor { slug }
-            }
-          }
-        }
-    """
-
-    for _attempt in range(2):
-        result = _data(_execute(console_schema, mutation, user=conn.owner))["connect_integration"]
-        assert result == {
-            "attached": True,
-            "error": None,
-            "integration": {
-                "impl_class": "NONE",
-                "vendor": {"slug": "connect-enum"},
-            },
-        }
-
-    with system_context(reason="test.integrate.connect_enum.verify"):
-        assert Integration.objects.filter(
-            owner=conn.owner,
-            vendor=conn.vendor,
-            impl_class="none",
-        ).count() == 1
-
-
-def test_integration_disconnected_factory_is_database_unique(
-    integrate_console_tables: None,
-) -> None:
-    """The Integration owner, not resolvers, owns disconnected-row uniqueness."""
-
-    owner = User.objects.create_user(username="draft-unique", email="draft-unique@example.com")
-    with system_context(reason="test.integrate.draft_unique.seed"):
-        vendor = Vendor.objects.create(slug="draft-unique", display_name="Draft Unique")
-        first = Integration.objects.disconnected_for(owner, vendor=vendor, impl_class="none")
-        second = Integration.objects.disconnected_for(owner, vendor=vendor, impl_class="none")
-
-    assert second.pk == first.pk
-    with pytest.raises(IntegrityError), system_context(reason="test.integrate.draft_unique.duplicate"):
-        Integration.objects.create(owner=owner, vendor=vendor, impl_class="none")
-
-
-def test_connect_integration_uses_shared_oauth_client_error_code(
-    integrate_console_tables: None,
-) -> None:
-    """Integration connect reports the shared OAuth-client lookup error code."""
-
-    console_schema = _schema()
-    owner = User.objects.create_user(username="missing-oauth-owner", email="owner@example.com")
-    with system_context(reason="test.integrate.missing_oauth.seed"):
-        Vendor.objects.create(slug="missing-oauth", display_name="Missing OAuth")
-    mutation = """
-        mutation {
-          connect_integration(vendor_slug: "missing-oauth", impl_class: "NONE") {
-            attached
-            error
-            error_code
-          }
-        }
-    """
-
-    result = _data(_execute(console_schema, mutation, user=owner))["connect_integration"]
-
-    assert result == {
-        "attached": False,
-        "error": "Integration has no enabled OAuth client.",
-        "error_code": "oauth_client_not_connectable",
-    }
-
-
-def test_connect_integration_rejects_child_backend_key(integrate_console_tables: None) -> None:
-    """Self-service connect cannot use a child backend key as a parent implementation."""
-
-    console_schema = _schema()
-    owner = User.objects.create_user(username="vcs-parent-connect-owner", email="owner@example.com")
-    with system_context(reason="test.integrate.vcs_parent_connect.seed"):
-        vendor = Vendor.objects.create(slug="vcs-parent-connect", display_name="VCS Parent Connect")
-
-    result = _execute(
-        console_schema,
-        """
-        mutation {
-          connect_integration(vendor_slug: "vcs-parent-connect", impl_class: "STUB") {
-            attached
-          }
-        }
-        """,
-        user=owner,
-    )
-
-    assert result.errors is not None
-    assert "ANGEE_INTEGRATION_IMPLS" in result.errors[0].message
-    with system_context(reason="test.integrate.vcs_parent_connect.verify"):
-        assert not Integration.objects.filter(owner=owner, vendor=vendor).exists()
 
 
 def test_sync_integration_runs_for_an_admin(
@@ -899,6 +888,7 @@ def test_sync_integration_queues_bridge_for_an_admin(
 
     monkeypatch.setattr(integrate_queue, "queue_bridge_sync", fake_queue_bridge_sync)
     monkeypatch.setattr("angee.integrate.schema.queue_bridge_sync", fake_queue_bridge_sync)
+    monkeypatch.setattr("angee.integrate_vcs.schema.queue_bridge_sync", fake_queue_bridge_sync)
 
     result = _data(
         _execute(
@@ -978,6 +968,7 @@ def test_rotate_webhook_secret_changes_the_stored_secret(
 def test_test_webhook_delivery_records_failure_status(
     integrate_console_tables: None,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A failed test delivery records the HTTP status classified by the model owner."""
 
@@ -994,7 +985,10 @@ def test_test_webhook_delivery_records_failure_status(
 
     def fail_delivery(self: WebhookSubscription, body: bytes) -> str:
         assert b'"type":"test"' in body
-        raise WebhookDeliveryError("service unavailable", status="503")
+        raise WebhookDeliveryError(
+            "service unavailable at https://hooks.example/?token=canary-secret",
+            status="503",
+        )
 
     monkeypatch.setattr(WebhookSubscription, "deliver", fail_delivery)
 
@@ -1008,9 +1002,11 @@ def test_test_webhook_delivery_records_failure_status(
     )["test_webhook_delivery"]
 
     subscription.refresh_from_db()
-    assert result == {"ok": False, "message": "Delivery failed: WebhookDeliveryError: service unavailable"}
+    assert result == {"ok": False, "message": "Delivery failed: Webhook returned HTTP 503."}
     assert subscription.last_delivery_status == "503"
+    assert subscription.last_error == "Webhook returned HTTP 503."
     assert subscription.consecutive_failures == 1
+    assert "canary-secret" not in caplog.text
 
 
 def test_update_vcs_bridge_lifecycle_accepts_the_lowercase_value(
@@ -1114,8 +1110,15 @@ def test_create_vcs_bridge_creates_child_row(
             """
             mutation CreateVcs($vendor: ID!, $owner: ID!) {
               create_vcs_bridge(
-                data: {vendor: $vendor, owner: $owner, backend_class: "stub", config: {stub_repos: []}}
+                data: {
+                  vendor: $vendor,
+                  owner: $owner,
+                  display_name: "Primary source host",
+                  backend_class: "stub",
+                  config: {stub_repos: []}
+                }
               ) {
+                display_name
                 backend_class
                 lifecycle
                 config
@@ -1131,52 +1134,184 @@ def test_create_vcs_bridge_creates_child_row(
     )["create_vcs_bridge"]
 
     assert result == {
+        "display_name": "Primary source host",
         "backend_class": "STUB",
         "lifecycle": "DISCONNECTED",
         "config": {"stub_repos": []},
     }
 
 
-def test_update_vcs_bridge_accepts_backend_class(
+@pytest.mark.parametrize("name, expected_name", [("Renamed", "Renamed"), (None, "")])
+def test_update_vcs_bridge_merges_typed_config(
+    integrate_console_tables: None,
+    name: str | None,
+    expected_name: str,
+) -> None:
+    """Unsent typed options survive patches; removing an option restores its default."""
+
+    original = {
+        "local_root": "../custom-checkout",
+        "local_name": "Original",
+        "local_org": "custom-org",
+        "local_default_branch": "develop",
+    }
+    bridge = make_integration("vcs-config-patch", backend_class="local", model=VcsBridge, config=original)
+    result = _data(
+        _execute(
+            _schema(),
+            """
+            mutation UpdateConfig($id: ID!, $config: JSON!) {
+              update_vcs_bridge(data: {id: $id, config: $config}) { config }
+            }
+            """,
+            {"id": _public_id(bridge.sqid), "config": {"local_name": name}},
+            user=_platform_admin("vcs-config-patch-admin"),
+        )
+    )["update_vcs_bridge"]
+
+    expected = {**original, "local_name": expected_name}
+    assert result == {"config": expected}
+    with system_context(reason="test.integrate.vcs_config_patch.verify"):
+        bridge.refresh_from_db()
+        assert bridge.config == expected
+
+
+def test_update_vcs_bridge_rejects_unknown_config_key_after_merge(integrate_console_tables: None) -> None:
+    """Patch merging still runs the typed config's unknown-key validation on save."""
+
+    bridge = make_integration(
+        "vcs-config-patch-invalid",
+        backend_class="local",
+        model=VcsBridge,
+        config={"local_org": "kept"},
+    )
+    original = dict(bridge.config)
+    result = _execute(
+        _schema(),
+        """
+        mutation InvalidConfig($id: ID!) {
+          update_vcs_bridge(data: {id: $id, config: {unknown_local_option: true}}) { id }
+        }
+        """,
+        {"id": _public_id(bridge.sqid)},
+        user=_platform_admin("vcs-config-patch-invalid-admin"),
+    )
+
+    assert result.errors is not None
+    assert result.errors[0].extensions == {
+        "code": "VALIDATION",
+        "validationErrors": {"config.unknown_local_option": ["Extra inputs are not permitted"]},
+        "formErrors": [],
+    }
+    with system_context(reason="test.integrate.vcs_config_patch_invalid.verify"):
+        bridge.refresh_from_db()
+        assert bridge.config == original
+
+
+def test_update_vcs_bridge_rejects_backend_switch(
     integrate_console_tables: None,
 ) -> None:
-    """A saved VCS child can switch backend and materialize backend defaults."""
+    """A saved child cannot reinterpret its private config under another backend."""
 
     console_schema = _schema()
     admin = _platform_admin("vcs-update-admin")
     bridge = make_integration("vcs-update", backend_class="stub", model=VcsBridge)
-    result = _data(
-        _execute(
-            console_schema,
-            """
+    result = _execute(
+        console_schema,
+        """
             mutation UpdateVcs($id: ID!) {
-              update_vcs_bridge(data: {id: $id, backend_class: "local"}) {
-                backend_class
-                config
+              update_vcs_bridge(data: {id: $id, display_name: "Mutated", backend_class: "local"}) {
+                id
               }
             }
             """,
-            {"id": _public_id(bridge.sqid)},
-            user=admin,
-        )
-    )["update_vcs_bridge"]
+        {"id": _public_id(bridge.sqid)},
+        user=admin,
+    )
 
-    assert result == {
-        "backend_class": "LOCAL",
-        "config": {
-            "local_default_branch": "main",
-            "local_org": "local",
-            "local_root": "../..",
-        },
+    assert result.errors is not None
+    assert result.errors[0].extensions["validationErrors"] == {
+        "backendClass": ["Implementation selection is create-only."]
     }
     with system_context(reason="test.integrate.vcs_update_backend.verify"):
         bridge.refresh_from_db()
-        assert bridge.backend_class == "local"
-        assert bridge.config == {
-            "local_default_branch": "main",
-            "local_org": "local",
-            "local_root": "../..",
-        }
+        assert bridge.display_name == ""
+        assert bridge.backend_class == "stub"
+
+
+def test_model_save_rejects_backend_switch_and_scopes_partial_config_validation(
+    integrate_console_tables: None,
+) -> None:
+    """The model boundary guards direct writers without blocking unrelated legacy-row updates."""
+
+    bridge = make_integration("vcs-model-impl-guard", backend_class="stub", model=VcsBridge)
+    with system_context(reason="test.integrate.vcs_model_impl_guard.load"):
+        loaded = VcsBridge.objects.get(pk=bridge.pk)
+        loaded.backend_class = "local"
+        with pytest.raises(ValidationError, match="Implementation selection is create-only"):
+            loaded.save()
+        with pytest.raises(ValidationError, match="Implementation selection is create-only"):
+            VcsBridge.objects.update_or_create(pk=bridge.pk, defaults={"backend_class": "local"})
+
+        reconstructed = VcsBridge(pk=bridge.pk, backend_class="local")
+        with pytest.raises(ValidationError, match="Implementation selection is create-only"):
+            reconstructed.save(using="default")
+
+        unpersisted = VcsBridge.objects.get(pk=bridge.pk)
+        unpersisted.backend_class = "local"
+        unpersisted.display_name = "Only this field"
+        unpersisted.save(update_fields={"display_name", "updated_at"})
+        with pytest.raises(ValidationError, match="Implementation selection is create-only"):
+            unpersisted.save()
+
+        deferred_assignment = VcsBridge.objects.only("id").get(pk=bridge.pk)
+        deferred_assignment.backend_class = "local"
+        with pytest.raises(ValidationError, match="Implementation selection is create-only"):
+            deferred_assignment.save(update_fields={"backend_class", "updated_at"})
+
+        VcsBridge.objects.filter(pk=bridge.pk).update(
+            backend_class="local",
+            config={"unknown_legacy_key": True},
+        )
+        legacy = VcsBridge.objects.get(pk=bridge.pk)
+        legacy.display_name = "Still writable"
+        legacy.save(update_fields={"display_name", "updated_at"})
+        legacy.config = {"unknown_legacy_key": False}
+        with pytest.raises(ValidationError, match="config.unknown_legacy_key"):
+            legacy.save(update_fields={"config", "updated_at"})
+
+        deferred = VcsBridge.objects.only("display_name").get(pk=bridge.pk)
+        deferred.display_name = "Deferred write"
+        deferred.save(update_fields={"display_name", "updated_at"})
+        assert deferred.backend_class == "local"
+        deferred.backend_class = "github"
+        with pytest.raises(ValidationError, match="Implementation selection is create-only"):
+            deferred.save(update_fields={"backend_class", "updated_at"})
+
+        refreshed = VcsBridge.objects.get(pk=bridge.pk)
+        refreshed.backend_class = "github"
+        refreshed.refresh_from_db(fields={"backend_class"})
+        assert refreshed.backend_class == "local"
+        refreshed.backend_class = "github"
+        with pytest.raises(ValidationError, match="Implementation selection is create-only"):
+            refreshed.save()
+
+
+def test_non_create_only_impl_field_remains_editable(integrate_console_tables: None) -> None:
+    """The integration invariant does not freeze unrelated implementation selectors."""
+
+    provider_field = OAuthClient.impl_field("provider_type")
+    first, second, *_rest = provider_field.registered_keys()
+    with system_context(reason="test.integrate.mutable_impl_field"):
+        client = OAuthClient.objects.create(
+            slug="mutable-provider-type",
+            display_name="Mutable provider type",
+            provider_type=first,
+        )
+        client.provider_type = second
+        client.save(update_fields={"provider_type", "updated_at"})
+        client.refresh_from_db()
+    assert client.provider_type == second
 
 
 def test_update_vcs_bridge_rejects_unknown_backend_class(
@@ -1201,7 +1336,7 @@ def test_update_vcs_bridge_rejects_unknown_backend_class(
     )
 
     assert result.errors is not None
-    assert "none" in result.errors[0].message
+    assert result.errors[0].extensions == {"code": "INTERNAL"}
     with system_context(reason="test.integrate.vcs_update_invalid_backend.verify"):
         bridge.refresh_from_db()
         assert bridge.backend_class == "stub"
@@ -1239,10 +1374,7 @@ def integrate_console_tables(transactional_db: Any) -> Iterator[None]:
     del transactional_db
     connection_models = tuple(
         dict.fromkeys(
-            MESSAGING_TEST_MODELS
-            + POSTS_TEST_MODELS
-            + (VcsBridge, WebhookSubscription)
-            + AGENTS_GRAPHQL_MODELS
+            MESSAGING_TEST_MODELS + POSTS_TEST_MODELS + (VcsBridge, WebhookSubscription) + AGENTS_GRAPHQL_MODELS
         )
     )
     _create_connection_tables(connection_models)
@@ -1264,7 +1396,7 @@ def _schemas() -> GraphQLSchemas:
 
     addons = [
         SchemaAddon({"console": {key: tuple(module.schemas["console"].get(key, ())) for key in SCHEMA_PART_KEYS}})
-        for module in (iam_schema, integrate_schema)
+        for module in (iam_schema, integrate_schema, integrate_vcs_schema)
     ]
     return GraphQLSchemas(addons)
 

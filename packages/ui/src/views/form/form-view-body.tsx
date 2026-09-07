@@ -468,6 +468,7 @@ function BoundFieldRow({
             value={value}
             readOnly={effectiveReadOnly}
             onChange={onChange}
+            controlProps={field.required ? { id: field.name, "aria-required": true } : undefined}
           />
         )}
       </div>

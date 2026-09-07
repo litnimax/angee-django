@@ -1,7 +1,10 @@
 // @vitest-environment happy-dom
 
-import { act, cleanup, render } from "@testing-library/react";
+import { act, cleanup, render as rtlRender } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactElement, ReactNode } from "react";
 
 import type { CalendarViewSpec } from "./resource-view-types";
 import type { FormViewProps } from "../form/FormView";
@@ -15,6 +18,7 @@ const captured = vi.hoisted(() => ({
   listCalendar: undefined as CalendarViewSpec | undefined,
   onCreateInLane: undefined as ListViewProps["onCreateInLane"],
   formDefaults: undefined as Record<string, unknown> | undefined,
+  registeredFormId: undefined as string | null | undefined,
 }));
 
 vi.mock("@tanstack/react-router", () => ({
@@ -66,10 +70,37 @@ beforeEach(() => {
   captured.listCalendar = undefined;
   captured.onCreateInLane = undefined;
   captured.formDefaults = undefined;
+  captured.registeredFormId = undefined;
 });
-afterEach(cleanup);
+const clients: QueryClient[] = [];
+afterEach(() => { cleanup(); clients.forEach((client) => client.clear()); clients.length = 0; });
+function render(element: ReactElement) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  clients.push(client);
+  return rtlRender(element, { wrapper: ({ children }: { children: ReactNode }) => <QueryClientProvider client={client}>{children}</QueryClientProvider> });
+}
 
 describe("ResourceList calendar quick-create", () => {
+  test("renders an addon-owned complete form through the resource controller", () => {
+    const CompleteForm = (props: FormViewProps) => {
+      captured.registeredFormId = props.id;
+      captured.formDefaults = props.defaultValues;
+      return null;
+    };
+    render(
+      <ResourceList
+        resource="agents.InferenceProvider"
+        columns={[]}
+        form={{ resource: "agents.InferenceProvider", Component: CompleteForm }}
+        creating
+        createDefaults={{ owner: "owner-1" }}
+      />,
+    );
+
+    expect(captured.registeredFormId).toBeNull();
+    expect(captured.formDefaults).toEqual({ owner: "owner-1" });
+  });
+
   test("range-select seeds the create form defaults through the routed-create seam", () => {
     const onSelect = vi.fn();
     const { rerender } = render(

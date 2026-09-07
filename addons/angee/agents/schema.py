@@ -15,12 +15,12 @@ from typing import Any, cast
 
 import strawberry
 import strawberry_django
-from angee.base.actors import actor_user_id
 from django.apps import apps
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
+from graphql import GraphQLError
 from rebac import current_actor, system_context
 from strawberry import auto
 from strawberry.scalars import JSON
@@ -29,6 +29,7 @@ from angee.agents import provisioning
 from angee.agents.autoconfig import SETTINGS as _AGENTS_SETTINGS
 from angee.agents.context import render_view_context
 from angee.agents.models import RuntimeStatus, SessionStatus
+from angee.base.actors import actor_user_id
 from angee.graphql.actions import ActionResult, action_target, resolve_action_target
 from angee.graphql.data import AngeeHasuraWriteBackend, hasura_model_resource, public_pk_decoder
 from angee.graphql.ids import PublicID
@@ -41,15 +42,13 @@ from angee.integrate.schema import (
     ConnectIntegrationResult,
     CredentialType,
     ExternalAccountType,
-    SourceType,
-    TemplateType,
     VendorType,
     apply_integration_patch_fields,
     connect_integration_target,
-    impl_default_update_fields,
     integration_create_attrs,
     save_provided_fields,
 )
+from angee.integrate_vcs.schema import SourceType, TemplateType
 from angee.operator.daemon import OperatorDaemon
 
 InferenceProvider = apps.get_model("agents", "InferenceProvider")
@@ -66,8 +65,8 @@ Integration = apps.get_model("integrate", "Integration")
 Vendor = apps.get_model("integrate", "Vendor")
 Credential = apps.get_model("integrate", "Credential")
 ExternalAccount = apps.get_model("integrate", "ExternalAccount")
-Source = apps.get_model("integrate", "Source")
-Template = apps.get_model("integrate", "Template")
+Source = apps.get_model("integrate_vcs", "Source")
+Template = apps.get_model("integrate_vcs", "Template")
 User = get_user_model()
 
 
@@ -287,7 +286,10 @@ class InferenceProviderPatch:
     lifecycle: str | None = strawberry.UNSET
     name: str | None = strawberry.UNSET
     base_url: str | None = strawberry.UNSET
-    config: JSON | None = strawberry.UNSET
+    config: JSON | None = strawberry.field(
+        default=strawberry.UNSET,
+        description="Merge supplied config keys with existing config; null removes a key.",
+    )
 
 
 _AGENT_RESOURCE = hasura_model_resource(
@@ -558,9 +560,8 @@ class InferenceProviderUpdateMutation:
 
     @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
     def update_inference_provider(self, data: InferenceProviderPatch) -> InferenceProviderType:
-        """Update a provider, rematerializing backend defaults when the backend changes."""
+        """Update a provider, merging supplied config keys."""
 
-        backend_changed = False
         with (
             action_target(
                 InferenceProvider,
@@ -569,15 +570,14 @@ class InferenceProviderUpdateMutation:
             ) as provider,
             transaction.atomic(),
         ):
+            if data.backend_class is not strawberry.UNSET:
+                provider.set_impl_key("backend_class", data.backend_class, default="manual")
             provided = apply_integration_patch_fields(
                 provider,
                 data,
                 reason="agents.graphql.inference_provider.update",
                 ignore_null_lifecycle=True,
             )
-            if data.backend_class is not strawberry.UNSET:
-                backend_changed = provider.set_impl_key("backend_class", data.backend_class, default="manual")
-                provided.add("backend_class")
             if data.name is not strawberry.UNSET:
                 provider.name = data.name or ""
                 provided.add("name")
@@ -585,11 +585,7 @@ class InferenceProviderUpdateMutation:
                 provider.base_url = data.base_url or ""
                 provided.add("base_url")
             if data.config is not strawberry.UNSET:
-                provider.config = data.config
-                provided.add("config")
-            if backend_changed:
-                provider.materialize_impl_defaults("backend_class", provided=frozenset(provided))
-                provided.update(impl_default_update_fields(provider, "backend_class"))
+                provided.update(provider.apply_config_patch(data.config))
             save_provided_fields(provider, provided)
         return cast(InferenceProviderType, provider)
 
@@ -610,7 +606,10 @@ def _mint_session(agent: Any) -> dict[str, Any]:
         service = agent.service
         mcp_servers = agent.mcp_config().get("mcpServers", {})
     if not service:
-        raise ValueError("Agent is not running — provision it first.")
+        raise GraphQLError(
+            "Agent is not running — provision it first.",
+            extensions={"code": "BAD_USER_INPUT"},
+        )
     daemon = OperatorDaemon.from_settings()
     endpoint = daemon.service_endpoint(service)
     if not endpoint.get("routed"):
@@ -647,11 +646,7 @@ def _agent_for_view(view: dict[str, Any]) -> Any:
             .order_by("-updated_at")
         )
         return next(
-            (
-                agent
-                for agent in candidates
-                if agent.runtime_backend.runs_in_process or bool(agent.service)
-            ),
+            (agent for agent in candidates if agent.runtime_backend.runs_in_process or bool(agent.service)),
             None,
         )
 

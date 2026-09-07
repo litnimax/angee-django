@@ -11,6 +11,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, test } from "vitest";
+import type { DataResourceFieldMetadata } from "@angee/metadata";
+import { testDataResource, testResourceQuery, testQueryField, testQueryAxis } from "@angee/metadata/testing";
 
 const roots: string[] = [];
 
@@ -72,6 +74,12 @@ describe("group operation codegen", () => {
     );
   });
 
+  test("validates an axis-backed scalar relation as a leaf selection", () => {
+    const generated = generateActions(SAVE_METADATA);
+
+    expect(generated).toContain('"value": "owner"');
+  });
+
   test("fails by name when codegen cannot resolve a relation representation", () => {
     const [entry] = SAVE_METADATA.angee.resources;
     const broken = {
@@ -125,6 +133,7 @@ const SDL = `
   schema { query: Query mutation: Mutation }
   type Mutation {
     submit_channel_password(id: ID!, password: String!): ActionResult!
+    order_save(pk: ID!, lines: [OrderLineInput!]): OrderType!
   }
   type ActionResult {
     ok: Boolean!
@@ -155,13 +164,19 @@ const SDL = `
   type notes_group { key: NoteGroupKey!, aggregate: NoteAggregate! }
   type NoteGroupKey { status: String }
   type NoteAggregate { count: Int! }
+  input OrderLineInput { product: ID }
+  type ProductType { id: ID!, name: String! }
+  type OrderLineType { id: ID!, product: ProductType! }
+  type OrderType { id: ID!, owner: ID, lines: [OrderLineType!]! }
 `;
 
 const METADATA = {
   angee: {
     resources: [
-      {
-        modelLabel: "notes.Note",
+      testDataResource("notes.Note", {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "id": testQueryField("id", { scalar: "ID", filter: null }),
+                "status": testQueryField("status", { scalar: "String", filter: null }) }, axes: { "status": testQueryAxis("status", { kind: "column", identityPath: "status", paths: ["status"], server: { input: "status", key: "status" }, extractions: [], drill: null }) }, sort: { default: [] } }),
+
         roots: {
           groups: "notes_groups",
           groupsCount: "notes_groups_count",
@@ -172,9 +187,9 @@ const METADATA = {
           groupOrder: "NoteGroupOrder",
           having: "NoteHaving",
         },
-        groupDimensions: [{ key: "status" }],
+
         aggregateMeasures: [],
-      },
+      }),
     ],
   },
 };
@@ -182,32 +197,76 @@ const METADATA = {
 const SAVE_METADATA = {
   angee: {
     resources: [
-      {
-        modelLabel: "sales.Order",
+      testDataResource("sales.Order", {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "owner": testQueryField("owner", { scalar: "ID", kind: "relation", filter: null, relation: { model: "accounts.User", identityPath: "owner" }, row: { path: "owner", paths: ["owner"] } }),
+                "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: {}, sort: { default: [] } }),
+
         roots: { save: "order_save" },
-        fields: [],
+        fields: [
+          resourceField({
+            name: "owner",
+            kind: "relation",
+            readable: true,
+            relationModelLabel: "accounts.User",
+            relationObject: false,
+          }),
+        ],
+
         linesResource: {
           field: "lines",
           modelLabel: "sales.OrderLine",
           inputType: "OrderLineInput",
           fields: [
-            {
+            resourceField({
               name: "product",
               kind: "relation",
               readable: true,
               relationModelLabel: "catalog.Product",
-            },
+              relationObject: true,
+            }),
           ],
         },
-      },
-      {
-        modelLabel: "catalog.Product",
+      }),
+      testDataResource("catalog.Product", {
         recordRepresentation: "name",
         roots: {},
         fields: [
-          { name: "name", kind: "scalar", readable: true },
+          resourceField({ name: "name", kind: "scalar", scalar: "String", readable: true }),
         ],
-      },
+      }),
+      testDataResource("accounts.User", {
+        recordRepresentation: "username",
+        roots: {},
+        fields: [
+          resourceField({
+            name: "username",
+            kind: "scalar",
+            scalar: "String",
+            readable: true,
+          }),
+        ],
+      }),
     ],
   },
 };
+
+function resourceField(
+  overrides: Pick<DataResourceFieldMetadata, "name" | "kind"> &
+    Partial<DataResourceFieldMetadata>,
+): DataResourceFieldMetadata {
+  return { ...baseResourceField(), ...overrides };
+}
+
+function baseResourceField() {
+  return {
+    name: "field",
+    kind: "scalar" as const,
+    readable: false,
+
+    aggregatable: false,
+
+    creatable: false,
+    updatable: false,
+    requiredOnCreate: false,
+  };
+}

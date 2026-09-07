@@ -1,9 +1,10 @@
 import * as React from "react";
-import { crudFiltersFromFilterRecord, hasuraWhereFromCrudFilters, useAngeeAggregate } from "@angee/refine";
-import { useModelMetadata } from "@angee/metadata";
+import { MAX_PAGE_SIZE, useAngeeAggregate } from "@angee/refine";
+import { ResourceQuery, useModelMetadata } from "@angee/metadata";
 import type { ModelFieldMetadata, Row } from "@angee/metadata";
 import { useUiT } from "../../../i18n";
 import { BoardView } from "../BoardView";
+import { GroupedBoardBody } from "../board/grouped";
 import { type ResourceViewContextValue } from "../resource-view-context";
 import { type ResourceViewGroup, type ResourceViewKind } from "../resource-view-model";
 import { DeletePreviewDialog } from "../../tree/DeletePreviewDialog";
@@ -20,6 +21,7 @@ import { useBulkDelete } from "../useBulkDelete";
 import { requireDataResource, useAggregateOperation } from "../resource-operations";
 import { useResourceToolbarProps } from "../resource-toolbar-props";
 import { useResourceViewToolbarInputs } from "../resource-view-toolbar-inputs";
+import { PAGE_SIZE_OPTIONS } from "../page-size";
 interface ListViewContentProps<TRow extends Row> {
   surface: ResourceViewSurface<TRow> | GroupedResourceViewSurface<TRow>;
   resource: string;
@@ -30,7 +32,7 @@ interface ListViewContentProps<TRow extends Row> {
   effectiveGroupStack: readonly ResourceViewGroup[];
   boardGroupingPinned: boolean;
   clientRowModel: boolean;
-  groupedListMode: boolean;
+  serverGroupedMode: boolean;
   declaredFacets: ReturnType<typeof useRelationFacets>;
   scalarFacets: ReturnType<typeof useScalarFacets>;
   explicitGroupOptions: ListViewProps<TRow>["groupOptions"];
@@ -64,7 +66,7 @@ export function ListViewContent<TRow extends Row = Row>({
   effectiveGroupStack,
   boardGroupingPinned,
   clientRowModel,
-  groupedListMode,
+  serverGroupedMode,
   declaredFacets,
   scalarFacets,
   explicitGroupOptions,
@@ -163,8 +165,10 @@ export function ListViewContent<TRow extends Row = Row>({
     onCreate,
     resourceView,
     groupingEnabled: !boardGroupingPinned,
-    pagerSubject: groupedListMode ? t("pager.groups") : undefined,
-    pagerTotalUnit: groupedListMode ? "groups" : undefined,
+    pagerSubject: serverGroupedMode ? t("pager.groups") : undefined,
+    pagerTotalUnit: serverGroupedMode ? "groups" : undefined,
+    pagerPageSizeOptions: clientRowModel ? undefined : PAGE_SIZE_OPTIONS,
+    pagerMaxPageSize: clientRowModel ? undefined : MAX_PAGE_SIZE,
   });
 
   return (
@@ -184,9 +188,9 @@ export function ListViewContent<TRow extends Row = Row>({
             ? bulkActions(surface.selectedIds, resourceView.clearSelectedIds)
             : undefined,
       }}
-      error={groupedListMode ? null : surface.list.error}
+      error={surface.list.error}
       loadingFooter={
-        !groupedListMode
+        !serverGroupedMode
         && resourceView.state.view !== "board"
         && surface.list.fetching
         && surface.rowModels.length > 0
@@ -205,16 +209,34 @@ export function ListViewContent<TRow extends Row = Row>({
         ) : null
       }
     >
-      {surface.kind === "grouped" ? (
-        <GroupedListBody
+      {surface.kind === "grouped" && resourceView.state.view === "board" ? (
+        <GroupedBoardBody
           columns={resolvedColumns}
+          modelMetadata={modelMetadata}
+          groupStack={effectiveGroupStack}
+          items={surface.groupedItems}
+          toggleGroup={surface.toggleGroup}
+          setScopePage={surface.setScopePage}
+          setScopePageSize={surface.setScopePageSize}
+          rowHref={rowHref}
+          onRowClick={onRowClick}
+          onListStateChange={onListStateChange}
+          cardActions={cardActions || renderRowActions ? boardCardActions : undefined}
+          cardActionContext={cardActionContext}
+          renderCard={renderCard}
+          fetching={surface.list.fetching}
+          error={surface.list.error}
+          emptyContent={emptyContent}
+        />
+      ) : surface.kind === "grouped" ? (
+        <GroupedListBody
           table={surface.table}
           tableColumns={surface.tableColumns}
           visibleColumnCount={surface.visibleColumnCount}
           visibleFields={surface.visibleFields}
           onVisibleFieldToggle={surface.toggleVisibleField}
           resourceView={resourceView}
-          modelMetadata={modelMetadata}
+          measures={surface.measures}
           listItems={surface.groupedItems}
           tableScrollRef={surface.tableScrollRef}
           rowVirtualizer={surface.rowVirtualizer}
@@ -222,6 +244,7 @@ export function ListViewContent<TRow extends Row = Row>({
           expandedKeys={surface.expandedKeys}
           toggleGroup={surface.toggleGroup}
           setScopePage={surface.setScopePage}
+          setScopePageSize={surface.setScopePageSize}
           selectedIds={surface.selectedIds}
           interactive={interactive}
           rowHref={rowHref}
@@ -243,7 +266,7 @@ export function ListViewContent<TRow extends Row = Row>({
           interactive={interactive}
           fetching={surface.list.fetching}
           emptyContent={emptyContent}
-          rowHref={rowHref}
+          rowHref={rowHref ? (row) => rowHref(row, surface.listState.navigationScope) : undefined}
           onRowClick={onRowClick}
           cardActions={
             cardActions || renderRowActions ? boardCardActions : undefined
@@ -276,7 +299,7 @@ export function ListViewContent<TRow extends Row = Row>({
           resourceView={resourceView}
           groupStack={effectiveGroupStack}
           interactive={interactive}
-          rowHref={rowHref}
+          rowHref={rowHref ? (row) => rowHref(row, surface.listState.navigationScope) : undefined}
           renderRowActions={renderRowActions}
           onRowClick={onRowClick}
           emptyContent={emptyContent}
@@ -299,7 +322,7 @@ export function ListViewContent<TRow extends Row = Row>({
           resourceView={resourceView}
           groupStack={effectiveGroupStack}
           interactive={interactive}
-          rowHref={rowHref}
+          rowHref={rowHref ? (row) => rowHref(row, surface.listState.navigationScope) : undefined}
           renderRowActions={renderRowActions}
           onRowClick={onRowClick}
           emptyContent={emptyContent}
@@ -349,8 +372,8 @@ function FlatListBodyWithAggregate<TRow extends Row>({
   const dataResource = requireDataResource(resource, modelMetadata);
   const aggregateOperation = useAggregateOperation(dataResource);
   const where = React.useMemo(
-    () => hasuraWhereFromCrudFilters(crudFiltersFromFilterRecord(filter)),
-    [filter],
+    () => ResourceQuery.from(dataResource).toWhere(filter),
+    [filter, dataResource],
   );
   const queryMeasures = React.useMemo(
     () => hasuraMeasuresFromGroupMeasures(measures, modelMetadata),

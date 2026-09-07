@@ -12,7 +12,7 @@ import { beforeEach,
 import {
   ModelMetadataProvider,
 } from "@angee/metadata";
-import { withTestResourceInventory } from "@angee/metadata/testing";
+import { withTestResourceInventory, testResourceQuery, testQueryField } from "@angee/metadata/testing";
 import { OperationDocumentsProvider } from "@angee/refine";
 import type {
   SchemaFieldMetadata,
@@ -204,20 +204,15 @@ describe("storage file/folder actions", () => {
 const STORAGE_METADATA: SchemaFieldMetadata = withTestResourceInventory({
   types: {
     FileType: {
-      typeName: "FileType",
       fields: {},
-      rootFields: {
-        detail: "file",
-        list: "files",
-        update: "updateFile",
-        delete: "deleteFile",
-      },
       resource: {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: {}, sort: { default: [] } }),
+
         schemaName: "console",
         modelLabel: "storage.File",
         appLabel: "storage",
         modelName: "File",
-        publicIdField: "id",
+
         roots: {
           detail: "file",
           list: "files",
@@ -231,31 +226,26 @@ const STORAGE_METADATA: SchemaFieldMetadata = withTestResourceInventory({
           deletePayload: "FileDeletePreview",
         },
         capabilities: ["detail", "list", "update", "delete"],
-        filterFields: [],
-        orderFields: [],
+
+
         aggregateFields: [],
-        groupByFields: [],
-        relationAxes: [],
+
+
       },
     },
     FolderType: {
-      typeName: "FolderType",
       fields: {
         name: { name: "name", kind: "scalar", scalar: "String" },
       },
-      rootFields: {
-        detail: "folder",
-        list: "folders",
-        create: "createFolder",
-        update: "updateFolder",
-        delete: "deleteFolder",
-      },
       resource: {
+        query: testResourceQuery({ identity: { field: "id" }, fields: { "name": testQueryField("name", { scalar: "String", kind: "scalar", filter: null, sort: { field: "name" } }),
+                "id": testQueryField("id", { scalar: "ID", filter: null }) }, axes: {}, sort: { default: [] } }),
+
         schemaName: "console",
         modelLabel: "storage.Folder",
         appLabel: "storage",
         modelName: "Folder",
-        publicIdField: "id",
+
         roots: {
           detail: "folder",
           list: "folders",
@@ -270,11 +260,11 @@ const STORAGE_METADATA: SchemaFieldMetadata = withTestResourceInventory({
           deletePayload: "FolderDeletePreview",
         },
         capabilities: ["detail", "list", "create", "update", "delete"],
-        filterFields: [],
-        orderFields: ["name"],
+
+
         aggregateFields: [],
-        groupByFields: [],
-        relationAxes: [],
+
+
       },
     },
   },

@@ -1,8 +1,9 @@
 import * as React from "react";
-import { type Row } from "@angee/metadata";
+import { ResourceQuery, type Row } from "@angee/metadata";
 import { getCoreRowModel, useReactTable, type ColumnDef, type Row as TableRowModel } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { crudFiltersFromFilterRecord, hasuraWhereFromCrudFilters, stableSerialize, useAngeeAggregate, useAngeeGroupByBatch, useAngeeListBatch, type GroupByBatchScope } from "@angee/refine";
+import { MAX_PAGE_SIZE, clampPageSize, stableSerialize, useAngeeAggregate, useAngeeGroupByBatch, useAngeeListBatch, type GroupByBatchScope } from "@angee/refine";
+import type { ResourceViewGroupExpansion } from "../resource-view-context";
 import { useUiT } from "../../../i18n";
 import { type ResourceListOrder } from "../resource-view-model";
 import { estimateGroupedItemSize, groupFieldLabel, groupMeasuresFromColumns, hasuraMeasuresFromGroupMeasures } from "../resource-view-list-body";
@@ -14,13 +15,13 @@ import { listResultFromPageState, useResourceRowsSnapshot, useResourceViewQueryF
 import { EMPTY_ARRAY, EMPTY_EXPANDED_KEYS, EMPTY_LEAF_RESULTS } from "./types";
 import type { GroupedResourceViewSurface, ResourceListResult, UseResourceViewSurfaceProps } from "./types";
 /**
- * The server-grouped list surface: the one owner of a folded group view's render
+ * The server-grouped collection surface: the owner of a folded group view's render
  * model. It emits a single measured `listItems` stream (per-level `_groups`
  * headers, the leaf record rows of expanded buckets, and the per-group pagers)
  * driving the same `useVirtualizer` the flat list uses, batches every `_groups`
  * level into one `useAngeeGroupByBatch` and every expanded leaf into one
  * `useAngeeListBatch`, and exposes per-group pagination via `setScopePage`. The
- * thin {@link GroupedListBody} composes this surface; it no longer fetches.
+ * thin list and board bodies compose this surface; neither fetches.
  */
 export function useGroupedResourceViewSurface<TRow extends Row = Row>({
   resource,
@@ -49,15 +50,13 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     resourceView,
     modelMetadata,
     laneSource,
+    groupStack: EMPTY_ARRAY,
   });
   const leafOrder = React.useMemo<ResourceListOrder | undefined>(
     () => sortOrder ?? order,
     [sortOrder, order],
   );
   const rowGroupStack = groupStack ?? resourceView.state.groupStack;
-  const rootPage = (resourceView.state.pagination.pageIndex + 1);
-  const statePageSize = resourceView.state.pagination.pageSize;
-
   // Shared table state plus per-group/footer measures.
   const tableState = useResourceViewTableState({
     columns,
@@ -65,13 +64,19 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     modelMetadata,
     groupStack: rowGroupStack,
     sortOrder,
+    maxPageSize: MAX_PAGE_SIZE,
   });
   const {
     tableColumns,
     columnVisibility,
     effectiveColumnVisibility,
     setColumnVisibility,
+    pagination: rootPagination,
+    sorting,
+    handleSortingChange,
   } = tableState;
+  const rootPage = rootPagination.pageIndex + 1;
+  const statePageSize = rootPagination.pageSize;
   const measures = React.useMemo(
     () => groupMeasuresFromColumns(columns),
     [columns],
@@ -81,8 +86,8 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     [measures, modelMetadata],
   );
   const where = React.useMemo(
-    () => hasuraWhereFromCrudFilters(crudFiltersFromFilterRecord(mergedFilter)),
-    [mergedFilter],
+    () => ResourceQuery.from(dataResource).toWhere(mergedFilter),
+    [dataResource, mergedFilter],
   );
   const grandTotal = useAngeeAggregate(aggregateOperation.target, {
     document: aggregateOperation.document,
@@ -98,10 +103,10 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     () => stableSerialize([rowGroupStack, defaultExpandedGroups]),
     [defaultExpandedGroups, rowGroupStack],
   );
-  const [expansionState, setExpansionState] =
-    React.useState<GroupExpansionState>(() => emptyGroupExpansion(expansionAxisKey));
+  const { groupExpansion: expansionState, setGroupExpansion: setExpansionState,
+    paginationByScope, setPaginationByScope } = resourceView;
   const activeExpansion =
-    expansionState.axisKey === expansionAxisKey
+    expansionState?.axisKey === expansionAxisKey
       ? expansionState
       : emptyGroupExpansion(expansionAxisKey);
   const expandedKeys = React.useMemo(
@@ -111,7 +116,7 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
   const toggleGroup = React.useCallback((key: string) => {
     setExpansionState((current) => {
       const base =
-        current.axisKey === expansionAxisKey
+        current?.axisKey === expansionAxisKey
           ? current
           : emptyGroupExpansion(expansionAxisKey);
       const currentlyExpanded =
@@ -128,19 +133,14 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
       }
       return { ...base, collapsedKeys, explicitExpandedKeys };
     });
-  }, [expansionAxisKey]);
-  const [pageByScope, setPageByScope] =
-    React.useState<Record<string, number>>({});
-  const setScopePage = React.useCallback((key: string, page: number) => {
-    setPageByScope((current) => ({ ...current, [key]: normaliseScopePage(page) }));
-  }, []);
+  }, [expansionAxisKey, setExpansionState]);
 
   const renderParams = React.useMemo<GroupedRenderParams>(
     () => ({
       groupStack: rowGroupStack,
       baseFilter: mergedFilter,
       expandedKeys,
-      pageByScope,
+      paginationByScope,
       rootPage,
       pageSize: statePageSize,
       queryMeasures,
@@ -151,9 +151,7 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
       emptyValueLabel: t("list.emptyValue"),
       emptyRelationLabel: (field) =>
         t("list.emptyRelation", {
-          relation: (
-            modelMetadata?.fields[field]?.label ?? groupFieldLabel(field)
-          ).toLocaleLowerCase(),
+          relation: groupFieldLabel(field).toLocaleLowerCase(),
         }),
       allRecordsLabel: t("list.allRecords"),
       t,
@@ -162,7 +160,7 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
       rowGroupStack,
       mergedFilter,
       expandedKeys,
-      pageByScope,
+      paginationByScope,
       rootPage,
       statePageSize,
       queryMeasures,
@@ -205,11 +203,11 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     if (defaultExpandedGroups !== "all" || rootBucketKeys.length === 0) return;
     setExpansionState((current) => {
       const base =
-        current.axisKey === expansionAxisKey
+        current?.axisKey === expansionAxisKey
           ? current
           : emptyGroupExpansion(expansionAxisKey);
       const defaultExpandedKeys = new Set(base.defaultExpandedKeys);
-      let changed = current.axisKey !== expansionAxisKey;
+      let changed = current?.axisKey !== expansionAxisKey;
       for (const key of rootBucketKeys) {
         if (base.collapsedKeys.has(key) || defaultExpandedKeys.has(key)) continue;
         defaultExpandedKeys.add(key);
@@ -217,7 +215,7 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
       }
       return changed ? { ...base, defaultExpandedKeys } : current;
     });
-  }, [defaultExpandedGroups, expansionAxisKey, rootBucketKeys]);
+  }, [defaultExpandedGroups, expansionAxisKey, rootBucketKeys, setExpansionState]);
   const desiredGroupScopes = scopeModel.groupScopes;
   const leafScopes = scopeModel.leafScopes;
   React.useEffect(() => {
@@ -227,10 +225,39 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
   }, [desiredGroupScopes]);
 
   // Every expanded leaf bucket's record page, batched into one request round.
-  const leafResults = useAngeeListBatch(listTarget, leafScopes, {
+  const leafRequests = React.useMemo(() => {
+    const query = ResourceQuery.from(dataResource);
+    return leafScopes.map(({ filter, order, ...scope }) => ({
+      ...scope, where: query.toWhere(filter), orderBy: query.toOrderBy(order),
+    }));
+  }, [dataResource, leafScopes]);
+  const leafResults = useAngeeListBatch(listTarget, leafRequests, {
     fields: requestedFields,
     enabled: leafScopes.length > 0,
   });
+
+  // Persist corrections from settled native counts for both subgroup and leaf
+  // pages. Otherwise a later count increase could revive an obsolete old page.
+  React.useEffect(() => {
+    setPaginationByScope((current) => {
+      let next = current;
+      const clamp = (key: string, total: number | undefined, settled: boolean) => {
+        const pagination = current[key];
+        if (!pagination || !settled || total === undefined) return;
+        const lastPage = Math.max(1, Math.ceil(total / pagination.pageSize));
+        if (pagination.pageIndex < lastPage) return;
+        if (next === current) next = { ...current };
+        next[key] = { ...pagination, pageIndex: lastPage - 1 };
+      };
+      for (const [key, result] of groupByResults) {
+        clamp(key, result.totalCount, !result.fetching && !result.error);
+      }
+      for (const [key, result] of leafResults) {
+        clamp(key, result.total, !result.fetching && !result.error);
+      }
+      return next;
+    });
+  }, [groupByResults, leafResults, setPaginationByScope]);
 
   // One table over the in-display-order concatenation of loaded leaf rows: row
   // ids stay the bare public id so selection identity matches the flat surface.
@@ -244,10 +271,13 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
   const table = useReactTable<TRow>({
     data: leafRows as TRow[],
     columns: tableColumns as ColumnDef<TRow>[],
-    state: { columnVisibility: effectiveColumnVisibility },
+    state: { columnVisibility: effectiveColumnVisibility, sorting },
     onColumnVisibilityChange: setColumnVisibility,
+    onSortingChange: handleSortingChange,
+    manualSorting: true,
+    enableMultiSort: false,
     getCoreRowModel: getCoreRowModel(),
-    getRowId: modelRowId,
+    getRowId: (row, index) => modelRowId(row, index, dataResource),
     autoResetPageIndex: false,
     autoResetExpanded: false,
   });
@@ -274,6 +304,20 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     [groupByResults, leafResults, rowModelsByScopeKey, renderParams],
   );
 
+  const setScopePage = React.useCallback((key: string, page: number) => {
+    const item = groupedItems.find((item) => item.kind === "groupHeader" && item.pager?.pageKey === key);
+    const pageSize = item?.kind === "groupHeader" ? item.pager?.pageSize : undefined;
+    setPaginationByScope((current) => ({ ...current, [key]: {
+      pageIndex: normaliseScopePage(page) - 1,
+      pageSize: current[key]?.pageSize ?? pageSize ?? statePageSize,
+    } }));
+  }, [groupedItems, setPaginationByScope, statePageSize]);
+  const setScopePageSize = React.useCallback((key: string, pageSize: number) => {
+    setPaginationByScope((current) => ({ ...current, [key]: {
+      pageIndex: 0, pageSize: clampPageSize(pageSize),
+    } }));
+  }, [setPaginationByScope]);
+
   const {
     visibleColumnCount,
     visibleFields,
@@ -289,7 +333,7 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
   });
 
   const rootResult = scopeModel.rootResult;
-  const rootWindow = rootResult
+  const rootWindow = rootResult && !rootResult.error
     ? groupedPageWindow(rootResult, rootPage, statePageSize)
     : undefined;
   const rootTotal = rootWindow?.total;
@@ -299,19 +343,25 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     if (
       rootResult
       && !rootResult.fetching
+      && !rootResult.error
       && rootPageCount !== undefined
       && rootPage > rootPageCount
     ) {
       resourceView.setPage(rootPageCount);
     }
   }, [resourceView.setPage, rootPage, rootPageCount, rootResult]);
+  const refetch = React.useCallback(() => {
+    for (const result of groupByResults.values()) result.refetch();
+    for (const result of leafResults.values()) result.refetch();
+    if (measures.length > 0) grandTotal.refetch();
+  }, [groupByResults, leafResults, measures.length, grandTotal.refetch]);
   const list = React.useMemo<ResourceListResult>(
     () =>
       listResultFromPageState({
         resourceView,
         error: rootResult?.error ?? null,
         fetching: rootResult ? rootResult.fetching : true,
-        refetch: () => rootResult?.refetch(),
+        refetch,
         rows: EMPTY_ARRAY,
         total: rootTotal,
         page: rootPage,
@@ -322,6 +372,7 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     [
       resourceView,
       rootResult,
+      refetch,
       rootPage,
       rootPageCount,
       rootTotal,
@@ -336,9 +387,9 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
   // Publish the snapshot like the flat surface: rows are empty here (the grouped
   // render stream owns the visible records), but the non-null `navigationScope`
   // carries the folded scope's own filter/order. Without this, a record pager
-  // built by `useListRecordNavigation` would retain a stale flat snapshot when a
-  // grouped scope (e.g. storage's default folder-grouped "All files") becomes
-  // active; a hidden replay list then pages the folded scope, not a prior folder.
+  // built by `useListRecordNavigation` could retain a stale flat descriptor when
+  // a grouped scope becomes active. The clicked row subsequently supplies its
+  // precise leaf descriptor; the native headless query consumes that scope.
   return {
     kind: "grouped",
     list,
@@ -348,7 +399,9 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
     mergedFilter,
     sortOrder,
     footerAggregate: grandTotal.aggregate,
+    measures: queryMeasures,
     setScopePage,
+    setScopePageSize,
     groupedItems,
     tableColumns: tableColumns as readonly ColumnDef<TRow>[],
     table,
@@ -365,14 +418,7 @@ export function useGroupedResourceViewSurface<TRow extends Row = Row>({
   };
 }
 
-interface GroupExpansionState {
-  axisKey: string;
-  collapsedKeys: ReadonlySet<string>;
-  explicitExpandedKeys: ReadonlySet<string>;
-  defaultExpandedKeys: ReadonlySet<string>;
-}
-
-function emptyGroupExpansion(axisKey: string): GroupExpansionState {
+function emptyGroupExpansion(axisKey: string): ResourceViewGroupExpansion {
   return {
     axisKey,
     collapsedKeys: EMPTY_EXPANDED_KEYS,
@@ -381,7 +427,7 @@ function emptyGroupExpansion(axisKey: string): GroupExpansionState {
   };
 }
 
-function effectiveExpandedKeys(state: GroupExpansionState): ReadonlySet<string> {
+function effectiveExpandedKeys(state: ResourceViewGroupExpansion): ReadonlySet<string> {
   if (
     state.defaultExpandedKeys.size === 0
     && state.explicitExpandedKeys.size === 0

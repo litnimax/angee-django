@@ -8,6 +8,7 @@ through their message/thread owners.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import date
 from typing import Annotated, Any, cast
 
@@ -19,11 +20,12 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.db.models.deletion import ProtectedError, RestrictedError
 from django.views.decorators.debug import sensitive_variables
+from graphql import GraphQLError
 from rebac import PermissionDenied
 from strawberry import auto
+from strawberry.types.nodes import SelectedField
 
 from angee.base.identity import instance_from_public_id
-from angee.data.metadata import DataResourceEnumValueMetadata, DataResourceFieldMetadata
 from angee.graphql.actions import ActionResult, action_target, resolve_action_target
 from angee.graphql.data import (
     AngeeHasuraWriteBackend,
@@ -33,7 +35,7 @@ from angee.graphql.data import (
 )
 from angee.graphql.deletion import DeletePreview, attach_delete_preview_metadata
 from angee.graphql.ids import PublicID, require_instance_for_id
-from angee.graphql.node import AngeeNode
+from angee.graphql.node import NODE_DISPLAY_NAME_DESCRIPTION, AngeeNode
 from angee.graphql.subscriptions import changes
 from angee.graphql.writes import write_queryset
 from angee.iam.permissions import ADMIN_PERMISSION_CLASSES, request_from_info
@@ -94,49 +96,6 @@ _CHANNEL_EXTENSION_PUBLIC_ID_FIELDS = tuple(
 )
 
 
-def _channel_extension_declared_fields() -> tuple[str | DataResourceFieldMetadata, ...]:
-    """Return parent-resource metadata for donor fields outside ChannelType.
-
-    Relations and scalars retain the framework's model reconstruction. A donor
-    ``StateField`` supplies explicit enum metadata because its GraphQL projection
-    is contributed later by the downstream addon's type extension.
-    """
-
-    filterable = set(_CHANNEL_EXTENSION_FILTER_FIELDS)
-    sortable = set(_CHANNEL_EXTENSION_ORDER_FIELDS)
-    aggregatable = set(_CHANNEL_EXTENSION_AGGREGATE_FIELDS)
-    groupable = set(_CHANNEL_EXTENSION_GROUP_FIELDS)
-    updatable = set(_CHANNEL_EXTENSION_UPDATE_FIELDS)
-    declared: list[str | DataResourceFieldMetadata] = []
-    for name in _CHANNEL_EXTENSION_READ_FIELDS:
-        choices_enum = getattr(Channel._meta.get_field(name), "choices_enum", None)
-        if choices_enum is None:
-            declared.append(name)
-            continue
-        declared.append(
-            DataResourceFieldMetadata(
-                name=name,
-                kind="enum",
-                values=tuple(
-                    DataResourceEnumValueMetadata(
-                        value=str(member.name),
-                        description=str(member.label) if str(member.label).strip() else None,
-                    )
-                    for member in choices_enum
-                ),
-                widget="select",
-                filterable=name in filterable,
-                sortable=name in sortable,
-                aggregatable=name in aggregatable,
-                groupable=name in groupable,
-                updatable=name in updatable,
-            )
-        )
-    return tuple(declared)
-
-
-_CHANNEL_EXTENSION_DECLARED_FIELDS = _channel_extension_declared_fields()
-
 
 @strawberry_django.type(Channel)
 class ChannelType(IntegrationLabelMixin, BridgeSyncStatusMixin, AngeeNode):
@@ -196,6 +155,15 @@ def _channel_webform_extension() -> type[Any] | None:
 _CHANNEL_WEBFORM_EXTENSION = _channel_webform_extension()
 
 
+def _pairing_result(operation: Any, *args: Any) -> Any:
+    """Expose only pairing-owner failures whose text is deliberately public."""
+
+    try:
+        return operation(*args)
+    except connect.PairingActionError as error:
+        raise GraphQLError(str(error), extensions={"code": "BAD_USER_INPUT"}) from error
+
+
 @strawberry.type
 class MessagingPairingQuery:
     """Admin pairing state for live message channels."""
@@ -209,7 +177,7 @@ class MessagingPairingQuery:
             id,
             reason="messaging.graphql.channel_pairing",
         )
-        return connect.channel_pairing(channel)
+        return _pairing_result(connect.channel_pairing, channel)
 
 
 @strawberry.type
@@ -221,7 +189,7 @@ class MessagingPairingMutation:
         """Resume retained pairing material or start a new pairing session."""
 
         with action_target(Channel, id, reason="messaging.graphql.resume_channel_pairing") as channel:
-            connect.resume_channel_pairing(channel)
+            _pairing_result(connect.resume_channel_pairing, channel)
         return ActionResult(ok=True, message="Channel connection started.")
 
     @strawberry.mutation(permission_classes=ADMIN_PERMISSION_CLASSES)
@@ -230,7 +198,7 @@ class MessagingPairingMutation:
         """Submit one consume-once account password to the live channel session."""
 
         with action_target(Channel, id, reason="messaging.graphql.submit_channel_password") as channel:
-            connect.submit_channel_password(channel, password)
+            _pairing_result(connect.submit_channel_password, channel, password)
         return ActionResult(ok=True, message="Password submitted.")
 
     @strawberry.mutation(permission_classes=ADMIN_PERMISSION_CLASSES)
@@ -238,7 +206,7 @@ class MessagingPairingMutation:
         """Skip one optional consume-once secret round."""
 
         with action_target(Channel, id, reason="messaging.graphql.skip_channel_password") as channel:
-            connect.skip_channel_password(channel)
+            _pairing_result(connect.skip_channel_password, channel)
         return ActionResult(ok=True, message="Password skipped.")
 
     @strawberry.mutation(permission_classes=ADMIN_PERMISSION_CLASSES)
@@ -246,7 +214,7 @@ class MessagingPairingMutation:
         """Wipe released pairing material and restart with a fresh session."""
 
         with action_target(Channel, id, reason="messaging.graphql.reset_channel_pairing") as channel:
-            connect.reset_channel_pairing(channel)
+            _pairing_result(connect.reset_channel_pairing, channel)
         return ActionResult(ok=True, message="Pairing reset; link the channel again.")
 
     @strawberry.mutation(permission_classes=ADMIN_PERMISSION_CLASSES)
@@ -254,7 +222,7 @@ class MessagingPairingMutation:
         """Stop the live session while retaining reusable pairing material."""
 
         with action_target(Channel, id, reason="messaging.graphql.disconnect_channel") as channel:
-            connect.disconnect_channel(channel)
+            _pairing_result(connect.disconnect_channel, channel)
         return ActionResult(ok=True, message="Disconnected channel.")
 
 
@@ -411,6 +379,10 @@ class RecordMessageReactionGroupType:
 class MessageType(AngeeNode):
     """GraphQL projection of a message."""
 
+    display_name: str = strawberry_django.field(
+        resolver=AngeeNode.display_name, only=["preview"], description=NODE_DISPLAY_NAME_DESCRIPTION
+    )
+
     @strawberry_django.field(only=["sent_at", "created_at"])
     def feed_order_key(self) -> str:
         """Opaque server key; descending ASCII comparison preserves feed order."""
@@ -426,6 +398,34 @@ class MessageType(AngeeNode):
     sent_at: auto
     received_at: auto
     sender: HandleType | None
+
+    @strawberry_django.field(
+        only=["sender_id"],
+        annotate={"_sender_name": lambda info: Message.objects.sender_name_expression()},
+    )
+    def sender_name(self) -> str:
+        """Return the actor-visible sender name used by inbox ordering."""
+
+        return cast(Any, self).sender_name()
+
+    @strawberry_django.field(
+        only=["thread_id"],
+        annotate={"_thread_title": lambda info: Message.objects.thread_title_expression()},
+    )
+    def thread_title(self) -> str:
+        """Return the actor-visible thread title used by inbox ordering."""
+
+        return cast(Any, self).thread_title()
+
+    @strawberry_django.field(
+        only=["channel_id"],
+        annotate={"_channel_vendor_name": lambda info: Message.objects.channel_vendor_name_expression()},
+    )
+    def channel_vendor_name(self) -> str:
+        """Return the actor-visible channel vendor used by inbox ordering."""
+
+        return cast(Any, self).channel_vendor_name()
+
     parent: "MessageType | None"
     subtype: MessageSubtypeType | None
     thread: "ThreadType | None"
@@ -588,6 +588,13 @@ class RecordMessageType(AngeeNode):
 @strawberry_django.type(Thread)
 class ThreadType(AngeeNode):
     """GraphQL projection of a thread."""
+
+    display_name: str = strawberry_django.field(
+        resolver=AngeeNode.display_name,
+        only=["title__text"],
+        select_related=["title"],
+        description=NODE_DISPLAY_NAME_DESCRIPTION,
+    )
 
     platform: auto
     modality: auto
@@ -1716,10 +1723,25 @@ def _message_inbox_queryset(info: strawberry.Info) -> Any:
     by-pk lookup.
     """
 
-    del info
     # The title annotation serves list rows in SQL; Message.title() prefers it,
     # so a title column on the grid costs no per-row probe.
-    return Message.objects.inbox().with_title_text()
+    queryset = Message.objects.inbox().with_title_text()
+    order_fields: set[str] = set()
+    for field in info.selected_fields:
+        if not isinstance(field, SelectedField) or field.name != info.field_name:
+            continue
+        order_by = field.arguments.get("order_by") or ()
+        # Strawberry resolves variables; GraphQL also accepts one input object
+        # as a list literal. Only explicit ordering needs its scoped alias.
+        orders = (order_by,) if isinstance(order_by, Mapping) else order_by
+        order_fields.update(key for order in orders for key, value in order.items() if value is not None)
+    if "sender_name" in order_fields:
+        queryset = queryset.with_sender_name()
+    if "thread_title" in order_fields:
+        queryset = queryset.with_thread_title()
+    if "channel_vendor_name" in order_fields:
+        queryset = queryset.with_channel_vendor_name()
+    return queryset
 
 
 def _part_inbox_queryset(info: strawberry.Info) -> Any:
@@ -1819,7 +1841,6 @@ _CHANNEL_RESOURCE = hasura_model_resource(
         Channel,
         public_id_fields=_CHANNEL_EXTENSION_PUBLIC_ID_FIELDS,
     ),
-    declared_fields=_CHANNEL_EXTENSION_DECLARED_FIELDS,
 )
 _MESSAGE_RESOURCE = hasura_model_resource(
     MessageType,
@@ -1839,7 +1860,23 @@ _MESSAGE_RESOURCE = hasura_model_resource(
         # The transcript's keyset "load older" cursors on (sent_at, created_at).
         "created_at",
     ],
-    sortable=["sent_at", "received_at", "created_at"],
+    sortable=[
+        "sent_at",
+        "received_at",
+        "created_at",
+        "id",
+        "title",
+        "sender_name",
+        "thread_title",
+        "channel_vendor_name",
+        "status",
+    ],
+    sortable_aliases={
+        "title": "_title_text",
+        "sender_name": "_sender_name",
+        "thread_title": "_thread_title",
+        "channel_vendor_name": "_channel_vendor_name",
+    },
     aggregatable=["id"],
     groupable=[
         "thread",

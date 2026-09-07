@@ -9,22 +9,21 @@ related row.
 
 from __future__ import annotations
 
+import enum
 from typing import Any, cast
 
 import strawberry
 import strawberry_django
-from angee.base.impl import ImplBase
 from django.apps import apps
 from django.contrib.auth import get_user_model
-from django.core.exceptions import FieldDoesNotExist
 from django.db import transaction
-from django.db.models import Prefetch
 from django.utils import timezone
-from rebac import PermissionDenied, system_context
+from rebac import MissingActorError, PermissionDenied, system_context
 from strawberry import auto
 from strawberry.scalars import JSON
 from strawberry_django.pagination import OffsetPaginated
 
+from angee.base.identity import public_id_of
 from angee.graphql.actions import ActionResult, action_target, resolve_action_target
 from angee.graphql.data import (
     AngeeHasuraWriteBackend,
@@ -38,6 +37,7 @@ from angee.graphql.impl import ImplChoice
 from angee.graphql.impl import impl_choices as resolve_impl_choices
 from angee.graphql.node import AngeeNode
 from angee.graphql.subscriptions import changes
+from angee.graphql.writes import instance_for_write
 from angee.iam.identity import user_from_public_id as _user_from_public_id
 from angee.iam.identity import user_principal as _user_principal
 from angee.iam.permissions import ADMIN_PERMISSION_CLASSES as _ADMIN_PERMISSION_CLASSES
@@ -46,10 +46,8 @@ from angee.iam.permissions import session_user as _session_user
 from angee.iam.schema import UserType
 from angee.integrate import connect as _connect
 from angee.integrate.credentials import handler_for
-from angee.integrate.impl import IntegrationImpl
 from angee.integrate.models import Bridge, IntegrationLifecycle
 from angee.integrate.oauth import flow, state
-from angee.integrate.oauth.client import OAuthClientProtocol
 from angee.integrate.oauth.errors import CLIENT_NOT_CONFIGURED, INVALID_STATE, OAuthFlowError
 from angee.integrate.queue import queue_bridge_sync
 from angee.integrate.registry import bridge_models
@@ -60,10 +58,6 @@ OAuthClient = apps.get_model("integrate", "OAuthClient")
 ExternalAccount = apps.get_model("integrate", "ExternalAccount")
 Credential = apps.get_model("integrate", "Credential")
 WebhookSubscription = apps.get_model("integrate", "WebhookSubscription")
-VcsBridge = apps.get_model("integrate", "VcsBridge")
-Repository = apps.get_model("integrate", "Repository")
-Source = apps.get_model("integrate", "Source")
-Template = apps.get_model("integrate", "Template")
 User = get_user_model()
 
 
@@ -76,6 +70,73 @@ class ConsoleImplChoicesQuery:
         """Return registry choices for an ``ImplClassField``."""
 
         return resolve_impl_choices(model, field)
+
+
+@strawberry.enum
+class IntegrationCreateMode(enum.Enum):
+    """How the console starts creation for an integration capability."""
+
+    FORM = "FORM"
+    CONNECT = "CONNECT"
+
+
+@strawberry.type
+class IntegrationCapability:
+    """One installed, actor-creatable concrete Integration capability."""
+
+    resource: str
+    label: str
+    icon: str | None
+    create_mode: IntegrationCreateMode
+
+
+@strawberry.type
+class ConsoleIntegrationCapabilitiesQuery:
+    """Runtime integration capabilities visible to the console actor."""
+
+    @strawberry.field(permission_classes=_ADMIN_PERMISSION_CLASSES)
+    def integration_capabilities(self, info: strawberry.Info) -> list[IntegrationCapability]:
+        """Return installed capability owners with an implemented create ingress."""
+
+        capabilities: list[IntegrationCapability] = []
+        exposed = _exposed_model_labels(info)
+        for model in Integration.concrete_child_models():
+            if model._meta.label not in exposed:
+                continue
+            raw_mode = getattr(model, "integration_create_mode", None)
+            if raw_mode not in {mode.value for mode in IntegrationCreateMode}:
+                continue
+            try:
+                model.objects.check_create()
+            except MissingActorError, PermissionDenied:
+                continue
+            capabilities.append(
+                IntegrationCapability(
+                    resource=model._meta.label,
+                    label=str(model.integration_kind_value()),
+                    icon=None,
+                    create_mode=IntegrationCreateMode(raw_mode),
+                )
+            )
+        return capabilities
+
+
+@strawberry.enum
+class ConcreteIntegrationTargetState(enum.Enum):
+    """Permission-safe resolution state for an Integration parent row."""
+
+    AVAILABLE = "AVAILABLE"
+    UNAVAILABLE = "UNAVAILABLE"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+@strawberry.type
+class ConcreteIntegrationTarget:
+    """Authorized concrete resource identity behind an Integration parent."""
+
+    state: ConcreteIntegrationTargetState
+    resource: str | None = None
+    id: str | None = None
 
 
 # --- Connection substrate: OAuth/OIDC clients, external accounts, credentials ----
@@ -436,16 +497,20 @@ def _console_credentials(info: strawberry.Info) -> Any:
 
 
 def _console_integrations(info: strawberry.Info) -> Any:
-    """Return admin-visible integrations with bridge children prefetched."""
+    """Return admin-visible integrations with authorized concrete children batched."""
 
-    del info
-    return Integration.objects.all().prefetch_related(
-        Prefetch(
-            "vcsbridge",
-            queryset=VcsBridge._base_manager.all(),
-            to_attr="_angee_prefetched_bridge",
-        )
+    actor = _session_user(info)
+    exposed = _exposed_model_labels(info)
+    return Integration.objects.all().with_concrete_children(
+        actor=actor,
+        exposed_model_labels=exposed,
     )
+
+
+def _exposed_model_labels(info: strawberry.Info) -> set[str]:
+    """Return model resources carried by this exact composed GraphQL schema."""
+
+    return {resource.model_label for resource in getattr(info.schema, "angee_resources", ())}
 
 
 _OAUTH_CLIENT_EXTENSION_INSERT_FIELDS = declared_hasura_resource_fields(
@@ -470,7 +535,6 @@ _OAUTH_CLIENT_RESOURCE = hasura_model_resource(
     sortable=["slug", "environment", "display_name", "is_enabled", "created_at", "updated_at"],
     aggregatable=["id"],
     groupable=["provider_type", "environment", "is_enabled"],
-    declared_fields=_OAUTH_CLIENT_EXTENSION_READ_FIELDS,
     insertable=[
         "display_name",
         "client_id",
@@ -606,27 +670,6 @@ def _credential_material(data: CredentialInput) -> dict[str, str]:
     return material
 
 
-def _revoke_remote_oauth_token(credential: Any) -> None:
-    """Best-effort remote revocation before removing a local OAuth credential."""
-
-    try:
-        oauth_client = credential.oauth_client
-        # Provider-less (static/ssh) credentials have nothing to revoke remotely.
-        if oauth_client is None or not getattr(oauth_client, "revoke_endpoint", ""):
-            return
-        token = str(credential.reveal().get("access_token") or "")
-        if token:
-            OAuthClientProtocol(oauth_client).revoke_token(token)
-    except Exception:
-        return
-
-
-def _integration_impl_class(impl_class: str) -> type[IntegrationImpl]:
-    """Return the configured implementation class for one integration key."""
-
-    return cast(type[IntegrationImpl], Integration.objects.impl_class_for_key(impl_class))
-
-
 def integration_create_attrs(
     data: Any,
     *,
@@ -660,6 +703,8 @@ def integration_create_attrs(
         "vendor": resolve_action_target(Vendor, data.vendor, reason=f"{reason}.vendor"),
         "owner": _user_from_public_id(data.owner),
     }
+    if hasattr(data, "display_name"):
+        attrs["display_name"] = data.display_name
     if credential is not None:
         attrs["credential"] = credential
     if account is not strawberry.UNSET:
@@ -684,6 +729,9 @@ def apply_integration_patch_fields(
     """
 
     provided: set[str] = set()
+    if hasattr(data, "display_name") and data.display_name is not strawberry.UNSET:
+        target.display_name = data.display_name or ""
+        provided.add("display_name")
     if data.vendor is not strawberry.UNSET:
         target.vendor = resolve_action_target(Vendor, data.vendor, reason=f"{reason}.vendor")
         provided.add("vendor")
@@ -709,26 +757,6 @@ def apply_integration_patch_fields(
     return provided
 
 
-def impl_default_update_fields(target: Any, field_name: str) -> set[str]:
-    """Return model fields the selected impl may have materialized on ``target``."""
-
-    field = type(target).impl_field(field_name)
-    key = getattr(target, field.attname, None)
-    if not key:
-        return set()
-    impl = field.resolve_class(key)
-    if not (isinstance(impl, type) and issubclass(impl, ImplBase)):
-        return set()
-    fields: set[str] = set()
-    for default_name in impl.effective_defaults():
-        try:
-            model_field = target._meta.get_field(default_name)
-        except FieldDoesNotExist:
-            continue
-        fields.add(model_field.name)
-    return fields
-
-
 def save_provided_fields(target: Any, provided: set[str]) -> None:
     """Persist provided fields once, skipping the save when a transition already did all work."""
 
@@ -736,40 +764,34 @@ def save_provided_fields(target: Any, provided: set[str]) -> None:
         target.save(update_fields={*provided, "updated_at"})
 
 
-def _oauth_client_for_integration(integration: Any) -> Any:
-    """Return the OAuth client this integration implementation connects through."""
+def _concrete_integration_target(info: strawberry.Info, user: Any, resource: str, id: PublicID) -> Any:
+    """Resolve one exposed concrete child through the actor's write scope."""
 
-    return integration.impl.connect_oauth_client("Integration")
+    exposed = _exposed_model_labels(info)
+    model = next(
+        (
+            child
+            for child in Integration.concrete_child_models()
+            if child._meta.label == resource and child._meta.label in exposed
+        ),
+        None,
+    )
+    if model is None:
+        raise PermissionDenied("Integration capability is unavailable.")
+    target = instance_for_write(model, id)
+    if target is None:
+        raise PermissionDenied("Integration capability is unavailable.")
+    if target.owner_id != user.pk:
+        raise PermissionDenied("Integration does not belong to the current user.")
+    return target
 
 
-def _current_user_integration(
+def _attach_completed_integration(
+    info: strawberry.Info,
+    integration_sqid: str,
     user: Any,
-    *,
-    integration_id: PublicID | None,
-    vendor_slug: str,
-    impl_class: str,
-) -> Any:
-    """Return the user's target integration, creating a disconnected row when needed."""
-
-    if integration_id is not None:
-        integration = resolve_action_target(
-            Integration,
-            integration_id,
-            reason="integrate.graphql.connect_integration",
-        )
-        if integration.owner_id != user.pk:
-            raise PermissionDenied("Integration does not belong to the current user.")
-        return integration
-
-    vendor_key = vendor_slug.strip()
-    if not (vendor_key and impl_class.strip()):
-        raise ValueError("connectIntegration requires integrationId or vendorSlug and implClass.")
-    impl_key = Integration.impl_key_for("impl_class", impl_class)
-    vendor = _vendor_by_slug(vendor_key)
-    return Integration.objects.disconnected_for(user, vendor=vendor, impl_class=impl_key)
-
-
-def _attach_completed_integration(integration_sqid: str, user: Any, credential: Any) -> None:
+    credential: Any,
+) -> None:
     """Attach a freshly connected credential to the integration named in OAuth state."""
 
     if not integration_sqid:
@@ -780,7 +802,19 @@ def _attach_completed_integration(integration_sqid: str, user: Any, credential: 
         raise OAuthFlowError(INVALID_STATE, 400)
     if credential.user_id != user.pk:
         raise PermissionDenied("Credential does not belong to the current user.")
-    integration.attach_credential(credential)
+    exposed = _exposed_model_labels(info)
+    integrity, _authorized = integration.concrete_children(
+        actor=user,
+        exposed_model_labels=exposed,
+    )
+    if len(integrity) != 1:
+        raise OAuthFlowError(INVALID_STATE, 400)
+    child = integrity[0]
+    try:
+        target = _concrete_integration_target(info, user, child._meta.label, PublicID(public_id_of(child)))
+    except (PermissionDenied, ValueError) as error:
+        raise OAuthFlowError(INVALID_STATE, 400) from error
+    target.attach_credential(credential)
 
 
 def connect_integration_target(
@@ -846,6 +880,31 @@ class ConnectionMutation:
     """Authenticated OAuth account-connect / disconnect mutations."""
 
     @strawberry.mutation
+    def connect_integration(
+        self,
+        info: strawberry.Info,
+        resource: str,
+        id: PublicID,
+        redirect_uri: str = "",
+        next: str = "/",
+    ) -> ConnectIntegrationResult:
+        """Attach OAuth to one explicit authorized concrete integration child."""
+
+        user = _session_user(info)
+        try:
+            integration = _concrete_integration_target(info, user, resource, id)
+            oauth_client = integration.capability_impl.connect_oauth_client(integration.integration_kind_value())
+            return connect_integration_target(
+                info,
+                integration,
+                oauth_client,
+                redirect_uri=redirect_uri,
+                next_path=next,
+            )
+        except OAuthFlowError as error:
+            return ConnectIntegrationResult(error=error.public_message, error_code=error.code)
+
+    @strawberry.mutation
     def connect_account_start(
         self,
         info: strawberry.Info,
@@ -898,42 +957,13 @@ class ConnectionMutation:
                 return ActionResult(ok=False, message="Set a discovery URL first.")
             try:
                 discovery = oauth_client.discover_endpoints()
-            except Exception as error:  # noqa: BLE001 — surface discovery failure to the operator
-                return ActionResult(ok=False, message=f"Discovery failed: {error}")
+            except OAuthFlowError as error:
+                return ActionResult(ok=False, message=error.public_message)
+            except Exception:  # noqa: BLE001 — provider diagnostics stay outside the action payload.
+                return ActionResult(ok=False, message="Provider discovery failed.")
             oauth_client.save()
         issuer = discovery.get("issuer") if isinstance(discovery, dict) else None
         return ActionResult(ok=True, message=f"Discovered endpoints for {issuer or 'provider'}.")
-
-    @strawberry.mutation
-    def connect_integration(
-        self,
-        info: strawberry.Info,
-        integration_id: PublicID | None = None,
-        vendor_slug: str = "",
-        impl_class: str = "",
-        redirect_uri: str = "",
-        next: str = "/",
-    ) -> ConnectIntegrationResult:
-        """Attach this user's live credential to an integration, or start OAuth."""
-
-        user = _session_user(info)
-        try:
-            integration = _current_user_integration(
-                user,
-                integration_id=integration_id,
-                vendor_slug=vendor_slug,
-                impl_class=impl_class,
-            )
-            oauth_client = _oauth_client_for_integration(integration)
-            return connect_integration_target(
-                info,
-                integration,
-                oauth_client,
-                redirect_uri=redirect_uri,
-                next_path=next,
-            )
-        except OAuthFlowError as error:
-            return ConnectIntegrationResult(error=error.public_message, error_code=error.code)
 
     @strawberry.mutation
     def connect_account_complete(
@@ -955,7 +985,7 @@ class ConnectionMutation:
                 state_token=state,
                 redirect_uri=redirect_uri,
             )
-            _attach_completed_integration(result.integration_id, result.user, result.credential)
+            _attach_completed_integration(info, result.integration_id, result.user, result.credential)
         except OAuthFlowError as error:
             return ConnectAccountResult(error=error.public_message, error_code=error.code)
         return ConnectAccountResult(
@@ -992,11 +1022,8 @@ class ConnectionMutation:
                 return UnlinkAccountResult(ok=False)
             external_account = credential.external_account
             with system_context(reason="integrate.graphql.disconnect_account"), transaction.atomic():
-                Credential.objects.check_disconnect(credential)
+                Credential.objects.prepare_disconnect(credential)
                 ExternalAccount.objects.revoke_owner(external_account, user)
-                # Revoke at the provider only if the delete commits; local guards run
-                # before scheduling the remote side effect.
-                transaction.on_commit(lambda: _revoke_remote_oauth_token(credential))
                 deleted, _details = Credential.objects.filter(pk=credential.pk).with_action("delete").delete()
             return UnlinkAccountResult(ok=deleted > 0)
         except OAuthFlowError as error:
@@ -1084,8 +1111,10 @@ class IntegrateCredentialMutation:
         ) as credential:
             try:
                 credential.refresh_now()
-            except (OAuthFlowError, ValueError) as error:
-                return ActionResult(ok=False, message=f"Refresh failed: {error}")
+            except OAuthFlowError as error:
+                return ActionResult(ok=False, message=error.public_message)
+            except ValueError:
+                return ActionResult(ok=False, message="The credential cannot be refreshed; reconnect it.")
         return ActionResult(ok=True, message="Token refreshed.")
 
     @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
@@ -1106,8 +1135,7 @@ class IntegrateCredentialMutation:
         """Delete the credential, then best-effort revoke remotely after commit."""
 
         def prepare_delete(credential: Any) -> None:
-            Credential.objects.check_disconnect(credential)
-            transaction.on_commit(lambda: _revoke_remote_oauth_token(credential))
+            Credential.objects.prepare_disconnect(credential)
 
         return delete_by_public_id(
             Credential,
@@ -1199,7 +1227,6 @@ class IntegrationType(IntegrationLabelMixin, AngeeNode):
     account: ExternalAccountType | None
     owner: UserType
     kind: auto
-    impl_class: auto
     lifecycle: auto
     runtime_status: auto
     last_used_at: auto
@@ -1210,40 +1237,26 @@ class IntegrationType(IntegrationLabelMixin, AngeeNode):
     created_at: auto
     updated_at: auto
 
-    @strawberry_django.field(only=["id"])
-    def bridge(self) -> VcsBridgeType | None:
-        """Return this integration's VCS child row when present."""
+    @strawberry.field
+    def concrete_target(self, info: strawberry.Info) -> ConcreteIntegrationTarget:
+        """Return this parent's one authorized concrete child without leaking denied rows."""
 
-        prefetched = getattr(self, "_angee_prefetched_bridge", None)
-        if prefetched is not None:
-            if isinstance(prefetched, (list, tuple)):
-                return cast("VcsBridgeType | None", prefetched[0] if prefetched else None)
-            return cast("VcsBridgeType | None", prefetched)
-        with system_context(reason="integrate.integration.bridge"):
-            bridge = VcsBridge._base_manager.filter(pk=cast(Any, self).pk).first()
-        return cast("VcsBridgeType | None", bridge)
-
-    @strawberry_django.field(only=["impl_class"], description="Implementation")
-    def impl_category(self) -> str:
-        """Return this integration implementation's board grouping category.
-
-        Reads the class-level metadata off the resolved impl class — no instance,
-        no child model fetch — so a board/list render does not N+1 over child models.
-        """
-
-        impl_class = _integration_impl_class(cast(Any, self).impl_class)
-        return str(getattr(impl_class, "category", "") or "none")
-
-    @strawberry_django.field(only=["impl_class"])
-    def impl_label(self) -> str:
-        """Return this integration implementation's human label."""
-
-        impl_class = _integration_impl_class(cast(Any, self).impl_class)
-        display_label = getattr(impl_class, "display_label", None)
-        if callable(display_label):
-            return str(display_label())
-        return str(getattr(impl_class, "label", "") or cast(Any, self).impl_class)
-
+        actor = _session_user(info)
+        exposed = _exposed_model_labels(info)
+        integrity, authorized = cast(Any, self).concrete_children(
+            actor=actor,
+            exposed_model_labels=exposed,
+        )
+        if len(integrity) == 1 and len(authorized) == 1:
+            child = authorized[0]
+            return ConcreteIntegrationTarget(
+                state=ConcreteIntegrationTargetState.AVAILABLE,
+                resource=child._meta.label,
+                id=str(public_id_of(child)),
+            )
+        if len(integrity) > 1 and len(authorized) == len(integrity):
+            return ConcreteIntegrationTarget(state=ConcreteIntegrationTargetState.AMBIGUOUS)
+        return ConcreteIntegrationTarget(state=ConcreteIntegrationTargetState.UNAVAILABLE)
 
 @strawberry_django.type(Integration)
 class ConnectedIntegrationType(IntegrationLabelMixin, AngeeNode):
@@ -1254,7 +1267,6 @@ class ConnectedIntegrationType(IntegrationLabelMixin, AngeeNode):
     account: ConnectedExternalAccountType | None
     owner: UserType
     kind: auto
-    impl_class: auto
     lifecycle: auto
     runtime_status: auto
     last_used_at: auto
@@ -1300,21 +1312,20 @@ _INTEGRATION_RESOURCE = hasura_model_resource(
     IntegrationType,
     model=Integration,
     name="integrations",
-    filterable=["id", "display_name", "vendor", "kind", "impl_class", "lifecycle", "runtime_status", "updated_at"],
+    filterable=["id", "display_name", "vendor", "kind", "lifecycle", "runtime_status", "updated_at"],
     sortable=[
         "display_name",
         "vendor",
         "kind",
-        "impl_class",
         "lifecycle",
         "runtime_status",
         "created_at",
         "updated_at",
     ],
     aggregatable=["id"],
-    groupable=["kind", "impl_class", "vendor", "vendor__display_name", "lifecycle", "runtime_status"],
-    insertable=["vendor", "owner", "credential", "account", "impl_class", "lifecycle"],
+    groupable=["kind", "vendor", "vendor__display_name", "lifecycle", "runtime_status"],
     updatable=["vendor", "credential", "account", "owner"],
+    insert=False,
     field_id_decode={
         "vendor": public_pk_decoder(Vendor),
         "owner": public_pk_decoder(User),
@@ -1383,40 +1394,29 @@ def _vendor_by_slug(slug: str) -> Any:
 
 @strawberry.type
 class IntegrationCredentialMutation:
-    """Self-service integration creation from connected credentials."""
+    """Credential-first attachment to an explicit concrete integration child."""
 
     @strawberry.mutation
-    def create_integration_from_credential(
+    def attach_integration_credential(
         self,
         info: strawberry.Info,
+        resource: str,
+        id: PublicID,
         credential: PublicID,
-        vendor_slug: str,
     ) -> ConnectedIntegrationType:
-        """Create or update this user's integration from a connected credential.
-
-        Self-service, not platform-admin: the authorization is *ownership of the
-        credential*. ``resolve_action_target`` reads the credential elevated, then the
-        ``user_id`` check below is the actual gate. This deliberately bypasses the
-        ``create = admin->member`` arm in ``integrate/permissions.zed`` (which
-        governs the admin-console Integration CRUD), so a credential owner can wire
-        up their own integration without an admin.
-        """
+        """Attach an owned credential without creating a neutral parent row."""
 
         user = _session_user(info)
-        oauth_credential = resolve_action_target(
+        target = _concrete_integration_target(info, user, resource, id)
+        owned_credential = resolve_action_target(
             Credential,
             credential,
-            reason="integrate.graphql.integration_from_credential.credential",
+            reason="integrate.graphql.attach_integration_credential.credential",
         )
-        if oauth_credential.user_id != user.pk:
+        if owned_credential.user_id != user.pk:
             raise PermissionDenied("Credential does not belong to the current user.")
-        vendor = _vendor_by_slug(vendor_slug)
-        integration = Integration.objects.connect_from_credential(
-            user,
-            vendor=vendor,
-            credential=oauth_credential,
-        )
-        return cast(ConnectedIntegrationType, integration)
+        target.attach_credential(owned_credential)
+        return cast(ConnectedIntegrationType, target)
 
 
 @strawberry.type
@@ -1482,8 +1482,8 @@ class IntegrationActionMutation:
                 return ActionResult(ok=False, message="No credential is attached.")
             try:
                 credential.auth_headers()
-            except Exception as error:  # noqa: BLE001 — surface any handler failure to the operator
-                return ActionResult(ok=False, message=f"Credential is not usable: {error}")
+            except Exception:  # noqa: BLE001 — handler diagnostics stay outside the action payload.
+                return ActionResult(ok=False, message="Credential is not usable.")
         return ActionResult(ok=True, message="Credential is usable.")
 
 
@@ -1516,332 +1516,6 @@ class WebhookActionMutation:
         return RotatedSecret(ok=True, secret=secret)
 
 
-# --- VCS inventory: integrations, repositories, sources, templates ----------
-
-
-@strawberry_django.type(VcsBridge)
-class VcsBridgeType(BridgeSyncStatusMixin, AngeeNode):
-    """Admin projection of a VCS bridge child model."""
-
-    vendor: VendorType
-    credential: CredentialType | None
-    account: ExternalAccountType | None
-    owner: UserType
-    backend_class: auto
-    lifecycle: auto
-    runtime_status: auto
-    config: JSON
-    last_sync_completed_at: auto
-    last_sync_status: auto
-    last_sync_summary: JSON
-    sync_error: auto
-    sync_progress: JSON
-    created_at: auto
-    updated_at: auto
-
-    @strawberry_django.field(only=["backend_class", "lifecycle"])
-    def display_name(self) -> str:
-        """Return a human label for the record header and relation pickers."""
-
-        bridge = cast(Any, self)
-        return f"{bridge.backend_class} ({bridge.lifecycle})"
-
-
-@strawberry_django.type(Repository)
-class RepositoryType(AngeeNode):
-    """Admin projection of one inventoried repository."""
-
-    vcs_bridge: VcsBridgeType
-    org: auto
-    name: auto
-    remote: auto
-    ssh_remote: auto
-    remote_id: auto
-    default_branch: auto
-    visibility: auto
-    web_url: auto
-    archived: auto
-    created_at: auto
-    updated_at: auto
-
-
-@strawberry_django.type(Source)
-class SourceType(AngeeNode):
-    """Admin projection of one source (a ref+path pointer into a repository)."""
-
-    repository: RepositoryType
-    kind: auto
-    ref: auto
-    path: auto
-    last_synced_at: auto
-    created_at: auto
-    updated_at: auto
-
-
-@strawberry_django.type(Template)
-class TemplateType(AngeeNode):
-    """Admin projection of one discovered template."""
-
-    source: SourceType
-    name: auto
-    kind: auto
-    path: auto
-    inputs: JSON
-    created_at: auto
-    updated_at: auto
-
-
-@strawberry.type
-class RepoCandidate:
-    """A repository the host returns for the add typeahead (not yet inventoried)."""
-
-    name: str
-    org: str
-    remote: str
-    ssh_remote: str
-    default_branch: str
-    visibility: str
-    web_url: str
-    archived: bool
-
-
-@strawberry.input
-class VcsBridgeInput:
-    """Fields accepted when creating a VCS bridge child row."""
-
-    vendor: PublicID
-    owner: PublicID
-    credential: PublicID | None = None
-    account: PublicID | None = strawberry.UNSET
-    backend_class: str | None = strawberry.UNSET
-    lifecycle: str | None = strawberry.UNSET
-    config: JSON | None = strawberry.UNSET
-    webhook_secret: str = ""
-
-
-@strawberry.input
-class VcsBridgePatch:
-    """Fields accepted when updating a VCS bridge child model."""
-
-    id: PublicID
-    vendor: PublicID | None = strawberry.UNSET
-    credential: PublicID | None = strawberry.UNSET
-    account: PublicID | None = strawberry.UNSET
-    owner: PublicID | None = strawberry.UNSET
-    backend_class: str | None = strawberry.UNSET
-    lifecycle: str | None = strawberry.UNSET
-    config: JSON | None = strawberry.UNSET
-    webhook_secret: str | None = strawberry.UNSET
-
-
-def _repo_candidate(descriptor: Any) -> RepoCandidate:
-    """Project a host ``RepoDescriptor`` into a typeahead candidate."""
-
-    return RepoCandidate(
-        name=str(descriptor.name),
-        org=str(descriptor.org),
-        remote=str(descriptor.remote),
-        ssh_remote=str(descriptor.ssh_remote),
-        default_branch=str(descriptor.default_branch),
-        visibility=str(descriptor.visibility),
-        web_url=str(descriptor.web_url),
-        archived=bool(descriptor.archived),
-    )
-
-
-_VCS_BRIDGE_RESOURCE = hasura_model_resource(
-    VcsBridgeType,
-    model=VcsBridge,
-    name="vcs_bridges",
-    filterable=[
-        "id",
-        "vendor",
-        "backend_class",
-        "lifecycle",
-        "runtime_status",
-        "last_sync_status",
-        "sync_stage",
-        "updated_at",
-    ],
-    sortable=[
-        "vendor",
-        "backend_class",
-        "lifecycle",
-        "runtime_status",
-        "last_sync_completed_at",
-        "created_at",
-        "updated_at",
-    ],
-    aggregatable=["id", "last_sync_items"],
-    groupable=[
-        "vendor",
-        "vendor__display_name",
-        "backend_class",
-        "lifecycle",
-        "runtime_status",
-        "last_sync_status",
-        "sync_stage",
-    ],
-    insert=False,
-    update=False,
-    delete=True,
-    field_id_decode={"vendor": public_pk_decoder(Vendor)},
-)
-_REPOSITORY_RESOURCE = hasura_model_resource(
-    RepositoryType,
-    model=Repository,
-    name="repositories",
-    filterable=["id", "vcs_bridge", "org", "name", "visibility", "archived", "updated_at"],
-    sortable=["vcs_bridge", "org", "name", "visibility", "archived", "created_at", "updated_at"],
-    aggregatable=["id"],
-    groupable=["vcs_bridge", "vcs_bridge__backend_class", "org", "visibility", "archived"],
-    insert=False,
-    update=False,
-    delete=True,
-    field_id_decode={"vcs_bridge": public_pk_decoder(VcsBridge)},
-)
-_SOURCE_RESOURCE = hasura_model_resource(
-    SourceType,
-    model=Source,
-    name="sources",
-    filterable=["id", "repository", "kind", "ref", "updated_at"],
-    sortable=["repository", "kind", "ref", "path", "last_synced_at", "created_at", "updated_at"],
-    aggregatable=["id"],
-    groupable=["repository", "repository__name", "kind", "last_synced_at"],
-    insertable=["repository", "kind", "ref", "path"],
-    updatable=["kind", "ref", "path"],
-    field_id_decode={"repository": public_pk_decoder(Repository)},
-    write_backend=AngeeHasuraWriteBackend(Source, public_id_fields=("repository",)),
-)
-_TEMPLATE_RESOURCE = hasura_model_resource(
-    TemplateType,
-    model=Template,
-    name="templates",
-    filterable=["id", "source", "name", "kind", "path", "updated_at"],
-    sortable=["source", "name", "kind", "path", "created_at", "updated_at"],
-    aggregatable=["id"],
-    groupable=["source", "source__path", "kind", "updated_at"],
-    insert=False,
-    update=False,
-    delete=False,
-    field_id_decode={"source": public_pk_decoder(Source)},
-)
-
-
-@strawberry.type
-class VCSConsoleQuery:
-    """Admin VCS inventory queries."""
-
-    @strawberry.field(permission_classes=_ADMIN_PERMISSION_CLASSES)
-    def search_repositories(self, vcs_bridge_id: PublicID, query: str) -> list[RepoCandidate]:
-        """Return host repositories matching ``query`` for the add typeahead."""
-
-        with action_target(
-            VcsBridge,
-            vcs_bridge_id,
-            reason="integrate.graphql.search_repositories",
-        ) as vcs:
-            return [_repo_candidate(descriptor) for descriptor in vcs.search_repositories(query)]
-
-
-@strawberry.type
-class VcsBridgeCreateMutation:
-    """Admin create for a VCS bridge child, validating backend-owned fields."""
-
-    @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
-    def create_vcs_bridge(self, data: VcsBridgeInput) -> VcsBridgeType:
-        """Create a VCS child row directly."""
-
-        attrs = {
-            **integration_create_attrs(data, reason="integrate.graphql.vcs_bridge.create"),
-            "backend_class": VcsBridge.impl_key_for(
-                "backend_class",
-                None if data.backend_class is strawberry.UNSET else data.backend_class,
-                default="local",
-            ),
-            "webhook_secret": data.webhook_secret,
-        }
-        if data.config is not strawberry.UNSET:
-            attrs["config"] = data.config
-        with system_context(reason="integrate.graphql.vcs_bridge.create"), transaction.atomic():
-            bridge = VcsBridge.objects.create(**attrs)
-        return cast(VcsBridgeType, bridge)
-
-
-@strawberry.type
-class VcsBridgeUpdateMutation:
-    """Admin update for a VCS bridge child, validating backend-owned fields."""
-
-    @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
-    def update_vcs_bridge(self, data: VcsBridgePatch) -> VcsBridgeType:
-        """Update a VCS child row, rematerializing backend defaults on backend change."""
-
-        backend_changed = False
-        with (
-            action_target(
-                VcsBridge,
-                data.id,
-                reason="integrate.graphql.vcs_bridge.update",
-            ) as bridge,
-            transaction.atomic(),
-        ):
-            provided = apply_integration_patch_fields(
-                bridge,
-                data,
-                reason="integrate.graphql.vcs_bridge.update",
-            )
-            if data.backend_class is not strawberry.UNSET:
-                backend_changed = bridge.set_impl_key("backend_class", data.backend_class, default="local")
-                provided.add("backend_class")
-            if data.config is not strawberry.UNSET:
-                bridge.config = data.config
-                provided.add("config")
-            if data.webhook_secret is not strawberry.UNSET:
-                bridge.webhook_secret = data.webhook_secret or ""
-                provided.add("webhook_secret")
-            if backend_changed:
-                bridge.materialize_impl_defaults("backend_class", provided=frozenset(provided))
-                provided.update(impl_default_update_fields(bridge, "backend_class"))
-            save_provided_fields(bridge, provided)
-        return cast(VcsBridgeType, bridge)
-
-
-@strawberry.type
-class VCSActionMutation:
-    """Operational actions on a VCS bridge and its inventory."""
-
-    @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
-    def add_repository(self, vcs_bridge_id: PublicID, name: str) -> RepositoryType:
-        """Inventory one repository by its host ``name`` (a picked typeahead result)."""
-
-        with action_target(VcsBridge, vcs_bridge_id, reason="integrate.graphql.add_repository") as vcs:
-            return cast(RepositoryType, vcs.import_repository(name))
-
-    @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
-    def discover_repositories(self, vcs_bridge_id: PublicID, org: str = "") -> ActionResult:
-        """Inventory every repository the account exposes (bulk import; prunes vanished)."""
-
-        with action_target(VcsBridge, vcs_bridge_id, reason="integrate.graphql.discover_repositories") as vcs:
-            count = vcs.discover_repositories(org=org)
-        return ActionResult(ok=True, message=f"Inventoried {count} repository(ies).")
-
-    @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
-    def sync_vcs_bridge(self, id: PublicID) -> ActionResult:
-        """Queue a refresh of every repository's sources for one VCS bridge."""
-
-        with action_target(VcsBridge, id, reason="integrate.graphql.sync_vcs_bridge") as vcs:
-            queue_bridge_sync(vcs, now=timezone.now())
-        return ActionResult(ok=True, message="Queued bridge sync.")
-
-    @strawberry.mutation(permission_classes=_ADMIN_PERMISSION_CLASSES)
-    def refresh_source(self, id: PublicID) -> ActionResult:
-        """Re-enumerate one source's output rows now."""
-
-        with action_target(Source, id, reason="integrate.graphql.refresh_source") as source:
-            count = source.refresh()
-        return ActionResult(ok=True, message=f"Synced {count} item(s).")
-
-
 # Extracted with an explicit annotation: a bare homogeneous list of two
 # AngeeNode-decorated types infers as ``list[type[AngeeNode]]`` and trips mypy's
 # invariance check; ``list[type]`` widens it. (iam's inline lists are heterogeneous,
@@ -1869,15 +1543,6 @@ _CONSOLE_TYPES: list[object] = [
     *_OAUTH_CLIENT_RESOURCE.types,
     *_EXTERNAL_ACCOUNT_RESOURCE.types,
     *_CREDENTIAL_RESOURCE.types,
-    VcsBridgeType,
-    *_VCS_BRIDGE_RESOURCE.types,
-    RepositoryType,
-    *_REPOSITORY_RESOURCE.types,
-    SourceType,
-    *_SOURCE_RESOURCE.types,
-    TemplateType,
-    *_TEMPLATE_RESOURCE.types,
-    RepoCandidate,
 ]
 
 schemas = {
@@ -1898,22 +1563,18 @@ schemas = {
         ],
     },
     "console": {
-        # The impl-picker lookup (Integration.impl_class / VcsBridge.backend_class /
-        # OAuthClient.provider_type live here); a generic framework query contributed
+        # Concrete impl-picker lookups (VcsBridge.backend_class /
+        # OAuthClient.provider_type) live here; a generic framework query contributed
         # where its models do.
         "query": [
             ConsoleImplChoicesQuery,
+            ConsoleIntegrationCapabilitiesQuery,
             _OAUTH_CLIENT_RESOURCE.query,
             _EXTERNAL_ACCOUNT_RESOURCE.query,
             _CREDENTIAL_RESOURCE.query,
             _VENDOR_RESOURCE.query,
             _INTEGRATION_RESOURCE.query,
             _WEBHOOK_SUBSCRIPTION_RESOURCE.query,
-            _VCS_BRIDGE_RESOURCE.query,
-            _REPOSITORY_RESOURCE.query,
-            _SOURCE_RESOURCE.query,
-            _TEMPLATE_RESOURCE.query,
-            VCSConsoleQuery,
         ],
         "mutation": [
             _OAUTH_CLIENT_RESOURCE.mutation,
@@ -1922,22 +1583,15 @@ schemas = {
             _VENDOR_RESOURCE.mutation,
             _INTEGRATION_RESOURCE.mutation,
             _WEBHOOK_SUBSCRIPTION_RESOURCE.mutation,
-            _VCS_BRIDGE_RESOURCE.mutation,
-            _REPOSITORY_RESOURCE.mutation,
-            _SOURCE_RESOURCE.mutation,
             IntegrateExternalAccountMutation,
             IntegrateCredentialMutation,
             ConnectionMutation,
-            VcsBridgeCreateMutation,
-            VcsBridgeUpdateMutation,
             IntegrationCredentialMutation,
             IntegrationActionMutation,
             WebhookActionMutation,
-            VCSActionMutation,
         ],
         "subscription": [
             changes(Integration, field="integrationChanged"),
-            changes(VcsBridge, field="vcsBridgeChanged"),
         ],
         "types": _CONSOLE_TYPES,
     },

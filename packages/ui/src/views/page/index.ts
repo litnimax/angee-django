@@ -186,14 +186,6 @@ function facetDescriptor(props: FacetProps): FacetDescriptor {
   return cachedDescriptor(facetDescriptorCache, props, () => ({
     field: props.field,
     ...(props.label !== undefined ? { label: props.label } : {}),
-    ...(props.filterField !== undefined
-      ? { filterField: props.filterField }
-      : {}),
-    ...(props.filterMode !== undefined ? { filterMode: props.filterMode } : {}),
-    ...(props.aggregateKey !== undefined
-      ? { aggregateKey: props.aggregateKey }
-      : {}),
-    ...(props.labelField !== undefined ? { labelField: props.labelField } : {}),
     ...(props.pageSize !== undefined ? { pageSize: props.pageSize } : {}),
     ...(props.group !== undefined ? { group: props.group } : {}),
   }));
@@ -209,6 +201,12 @@ function fieldDescriptor(props: FieldProps): FieldDescriptor {
     ...(props.editOnly !== undefined ? { editOnly: props.editOnly } : {}),
     ...(props.showWhen !== undefined ? { showWhen: props.showWhen } : {}),
     ...(props.prefill !== undefined ? { prefill: props.prefill } : {}),
+    ...(props.prefillPreserveDirty !== undefined
+      ? { prefillPreserveDirty: props.prefillPreserveDirty }
+      : {}),
+    ...(props.prefillReplace !== undefined
+      ? { prefillReplace: props.prefillReplace }
+      : {}),
     ...(props.slugFrom !== undefined ? { slugFrom: props.slugFrom } : {}),
     ...(props.title !== undefined ? { title: props.title } : {}),
     ...(props.body !== undefined ? { body: props.body } : {}),

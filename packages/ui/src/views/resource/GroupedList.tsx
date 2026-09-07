@@ -18,15 +18,11 @@ import { type Virtualizer } from "@tanstack/react-virtual";
 import {
   type AggregateBucket,
 } from "@angee/refine";
-import type {
-  ModelMetadata,
-} from "@angee/metadata";
 import { Glyph } from "../../chrome/Glyph";
 import { useUiT, type UiTranslate } from "../../i18n";
 import { cn } from "../../lib/cn";
 import type { DndPayload } from "../../lib/dnd";
 import { CountBadge } from "../../ui/badge";
-import { Pager } from "../../ui/pager";
 import {
   Table,
   TableBody,
@@ -37,7 +33,7 @@ import {
 } from "../../ui/table";
 import { textRoleVariants } from "../../ui/text";
 import type { ResourceViewContextValue } from "./resource-view-context";
-import type { ResourceListSnapshot } from "./resource-view-surface";
+import type { ListViewNavigationScope, ResourceListSnapshot } from "./resource-view-surface";
 import {
   ALIGN_CLASS,
   ListEmpty,
@@ -52,8 +48,6 @@ import {
   alignOf,
   estimateGroupedItemSize,
   formatMeasure,
-  groupMeasuresFromColumns,
-  hasuraMeasuresFromGroupMeasures,
   measureValue,
   useVirtualWindow,
   type GroupedListItem,
@@ -61,22 +55,19 @@ import {
   type GroupMeasure,
   type VisibleFieldOption,
 } from "./resource-view-list-body";
-import type { ColumnDescriptor } from "../page";
 import type { ListEmptyContent } from "./resource-view-types";
 
-function formatPagerNumber(value: number): string {
-  return value.toLocaleString();
-}
+import { GroupedScopePager } from "./GroupedScopePager";
+import { snapshotFromNav } from "./grouped-navigation";
 
 export interface GroupedListBodyProps<TRow extends Row> {
-  columns: readonly ColumnDescriptor<TRow>[];
   table: TableModel<TRow>;
   tableColumns: readonly ColumnDef<TRow>[];
   visibleColumnCount: number;
   visibleFields?: readonly VisibleFieldOption[];
   onVisibleFieldToggle?: (id: string, visible: boolean) => void;
   resourceView: ResourceViewContextValue;
-  modelMetadata?: ModelMetadata | null;
+  measures: readonly GroupMeasure[];
   listItems: readonly GroupedListItem<TRow>[];
   tableScrollRef: React.RefObject<HTMLDivElement | null>;
   rowVirtualizer: Virtualizer<HTMLDivElement, Element>;
@@ -84,9 +75,10 @@ export interface GroupedListBodyProps<TRow extends Row> {
   expandedKeys: ReadonlySet<string>;
   toggleGroup: (key: string) => void;
   setScopePage: (key: string, page: number) => void;
+  setScopePageSize: (key: string, pageSize: number) => void;
   selectedIds: ReadonlySet<string>;
   interactive: boolean;
-  rowHref?: (row: TRow) => string;
+  rowHref?: (row: TRow, scope?: ListViewNavigationScope) => string;
   renderRowActions?: (row: TRow) => React.ReactNode;
   onRowClick?: (row: TRow) => void;
   draggableRow?: (row: TRow) => DndPayload | null;
@@ -97,19 +89,19 @@ export interface GroupedListBodyProps<TRow extends Row> {
 }
 
 export function GroupedListBody<TRow extends Row>({
-  columns,
   table,
   visibleColumnCount,
   visibleFields = [],
   onVisibleFieldToggle,
   resourceView,
-  modelMetadata = null,
+  measures,
   listItems,
   tableScrollRef,
   rowVirtualizer,
   footerAggregate,
   toggleGroup,
   setScopePage,
+  setScopePageSize,
   interactive,
   rowHref,
   renderRowActions,
@@ -127,17 +119,9 @@ export function GroupedListBody<TRow extends Row>({
     1,
     visibleColumnCount + 1 + (hasRowActions ? 1 : 0),
   );
-  const measures = React.useMemo(
-    () => groupMeasuresFromColumns(columns),
-    [columns],
-  );
-  const queryMeasures = React.useMemo(
-    () => hasuraMeasuresFromGroupMeasures(measures, modelMetadata),
-    [measures, modelMetadata],
-  );
   const measuresByColumn = React.useMemo(
-    () => new Map(queryMeasures.map((measure) => [measure.columnId, measure])),
-    [queryMeasures],
+    () => new Map(measures.map((measure) => [measure.columnId, measure])),
+    [measures],
   );
   const visibleColumns = table.getVisibleLeafColumns();
   const { paddingTop, paddingBottom, visibleIndexes } = useVirtualWindow(
@@ -145,20 +129,9 @@ export function GroupedListBody<TRow extends Row>({
     listItems.length,
     (index) => estimateGroupedItemSize(listItems[index]),
   );
-  const recordNavByRowId = React.useMemo(() => {
-    const map = new Map<string, GroupedRecordNav>();
-    for (const item of listItems) {
-      if (item.kind === "record") map.set(item.row.id, item.nav);
-    }
-    return map;
-  }, [listItems]);
   const handleRecordOpen = React.useCallback(
-    (row: TRow) => {
-      const nav = recordNavByRowId.get(String(row.id));
-      if (!nav) return;
-      onListStateChange?.(snapshotFromNav<TRow>(nav));
-    },
-    [onListStateChange, recordNavByRowId],
+    (nav: GroupedRecordNav) => onListStateChange?.(snapshotFromNav<TRow>(nav)),
+    [onListStateChange],
   );
 
   return (
@@ -227,6 +200,7 @@ export function GroupedListBody<TRow extends Row>({
                       onRecordOpen={handleRecordOpen}
                       onToggleGroup={toggleGroup}
                       onPageChange={setScopePage}
+                      onPageSizeChange={setScopePageSize}
                       loadingLabel={t("list.loading")}
                       t={t}
                     />
@@ -241,7 +215,7 @@ export function GroupedListBody<TRow extends Row>({
           {measures.length > 0 && footerAggregate ? (
             <MeasureFooter
               table={table}
-              measures={queryMeasures}
+              measures={measures}
               aggregate={footerAggregate}
               selectable
               labelInSelectionColumn
@@ -261,8 +235,6 @@ function groupedItemKey<TRow extends Row>(item: GroupedListItem<TRow>): string {
       return `header:${item.bucketKey}`;
     case "record":
       return item.itemKey;
-    case "pager":
-      return `pager:${item.unit}:${item.pageKey}`;
     case "skeleton":
     case "status":
       return item.itemKey;
@@ -277,13 +249,14 @@ interface GroupedItemRowProps<TRow extends Row> {
   measuresByColumn: ReadonlyMap<string, GroupMeasure>;
   resourceView: ResourceViewContextValue;
   interactive: boolean;
-  rowHref?: (row: TRow) => string;
+  rowHref?: (row: TRow, scope?: ListViewNavigationScope) => string;
   renderRowActions?: (row: TRow) => React.ReactNode;
   onRowClick?: (row: TRow) => void;
   draggableRow?: (row: TRow) => DndPayload | null;
-  onRecordOpen: (row: TRow) => void;
+  onRecordOpen: (nav: GroupedRecordNav) => void;
   onToggleGroup: (key: string) => void;
   onPageChange: (key: string, page: number) => void;
+  onPageSizeChange: (key: string, pageSize: number) => void;
   loadingLabel: React.ReactNode;
   t: UiTranslate;
 }
@@ -303,6 +276,7 @@ function GroupedItemRow<TRow extends Row>({
   onRecordOpen,
   onToggleGroup,
   onPageChange,
+  onPageSizeChange,
   loadingLabel,
   t,
 }: GroupedItemRowProps<TRow>): React.ReactElement {
@@ -316,6 +290,9 @@ function GroupedItemRow<TRow extends Row>({
           onToggle={onToggleGroup}
           trailingColumn={renderRowActions !== undefined}
           unavailableLabel={t("list.itemsUnavailable")}
+          onPageChange={onPageChange}
+          onPageSizeChange={onPageSizeChange}
+          t={t}
         />
       );
     case "record":
@@ -325,20 +302,11 @@ function GroupedItemRow<TRow extends Row>({
           selected={Boolean(resourceView.state.rowSelection[item.row.id])}
           onToggleSelected={resourceView.toggleSelectedId}
           interactive={interactive}
-          rowHref={rowHref}
+          rowHref={rowHref ? (row) => rowHref(row, item.nav) : undefined}
           onRowClick={onRowClick}
           draggableRow={draggableRow}
-          onRecordOpen={onRecordOpen}
+          onRecordOpen={() => onRecordOpen(item.nav)}
           renderRowActions={renderRowActions}
-        />
-      );
-    case "pager":
-      return (
-        <GroupedPagerRow
-          item={item}
-          colSpan={colSpan}
-          onPageChange={onPageChange}
-          t={t}
         />
       );
     case "skeleton":
@@ -362,6 +330,9 @@ interface GroupedHeaderRowProps<TRow extends Row> {
   onToggle: (key: string) => void;
   trailingColumn: boolean;
   unavailableLabel: string;
+  onPageChange: (key: string, page: number) => void;
+  onPageSizeChange: (key: string, pageSize: number) => void;
+  t: UiTranslate;
 }
 
 function GroupedHeaderRow<TRow extends Row>({
@@ -371,8 +342,30 @@ function GroupedHeaderRow<TRow extends Row>({
   onToggle,
   trailingColumn,
   unavailableLabel,
+  onPageChange,
+  onPageSizeChange,
+  t,
 }: GroupedHeaderRowProps<TRow>): React.ReactElement {
   const { bucket, bucketKey, depth, label, count, expandable, expanded } = item;
+  // Keep aggregate cells numeric; chrome belongs in the last ordinary column
+  // (or the existing action column), not in a measure's accessible value.
+  const ordinaryColumns = visibleColumns.filter((column) => !measuresByColumn.has(column.id));
+  const labelColumn = ordinaryColumns[0]?.id;
+  const pagerColumn = ordinaryColumns.at(-1)?.id;
+  const labelContent = (
+    <span className="inline-flex min-w-0 max-w-full items-center gap-2">
+      <span className="min-w-0 truncate">{label}</span>
+      <CountBadge value={count} />
+      {!expandable ? (
+        <span className={cn(textRoleVariants({ role: "meta" }), "font-normal")}>
+          {unavailableLabel}
+        </span>
+      ) : null}
+    </span>
+  );
+  const pager = item.pager ? (
+    <GroupedScopePager pager={item.pager} label={label} onPageChange={onPageChange} onPageSizeChange={onPageSizeChange} t={t} />
+  ) : null;
   const toggle = (): void => {
     if (expandable) onToggle(bucketKey);
   };
@@ -393,30 +386,34 @@ function GroupedHeaderRow<TRow extends Row>({
       }}
     >
       <TableCell className="h-9 w-8 bg-sheet-2 p-0">
-        <button
-          type="button"
-          className={cn(
-            "flex min-h-9 w-full items-center justify-center px-2 text-left text-13 outline-none",
-            "focus-visible:focus-ring",
-            expandable
-              ? "text-fg hover:bg-inset"
-              : "cursor-not-allowed text-fg-muted",
-          )}
-          aria-label={label}
-          aria-expanded={expandable ? expanded : false}
-          aria-disabled={!expandable}
-          onClick={(event) => {
-            event.stopPropagation();
-            toggle();
-          }}
-        >
-          <Glyph
-            name={expanded && expandable ? "chevron-down" : "chevron-right"}
-            className="size-3.5 shrink-0 text-fg-muted"
-          />
-        </button>
+        <div className="flex min-h-9 items-center gap-2">
+          <button
+            type="button"
+            className={cn(
+              "flex min-h-9 w-8 shrink-0 items-center justify-center px-2 text-left text-13 outline-none",
+              "focus-visible:focus-ring",
+              expandable
+                ? "text-fg hover:bg-inset"
+                : "cursor-not-allowed text-fg-muted",
+            )}
+            aria-label={label}
+            aria-expanded={expandable ? expanded : false}
+            aria-disabled={!expandable}
+            onClick={(event) => {
+              event.stopPropagation();
+              toggle();
+            }}
+          >
+            <Glyph
+              name={expanded && expandable ? "chevron-down" : "chevron-right"}
+              className="size-3.5 shrink-0 text-fg-muted"
+            />
+          </button>
+          {!labelColumn ? labelContent : null}
+          {!trailingColumn && !pagerColumn ? pager : null}
+        </div>
       </TableCell>
-      {visibleColumns.map((column, index) => {
+      {visibleColumns.map((column) => {
         const measure = measuresByColumn.get(column.id);
         const value = measure ? measureValue(bucket, measure) : undefined;
         const formatted = measure && value != null ? formatMeasure(value, measure) : "";
@@ -426,74 +423,29 @@ function GroupedHeaderRow<TRow extends Row>({
             className={cn(
               "h-9 bg-sheet-2 text-13",
               ALIGN_CLASS[alignOf(column.columnDef)],
-              index === 0 ? "font-semibold" : "",
+              column.id === labelColumn ? "font-semibold" : "",
             )}
-            style={index === 0 ? depthIndentStyle(depth) : undefined}
+            style={column.id === labelColumn ? depthIndentStyle(depth) : undefined}
             aria-label={
               measure
                 ? `${label} ${measure.label}${formatted ? `: ${formatted}` : ""}`
                 : undefined
             }
           >
-            {measure ? (
-              formatted
-            ) : index === 0 ? (
-              <span className="inline-flex min-w-0 max-w-full items-center gap-2">
-                <span className="min-w-0 truncate">{label}</span>
-                <CountBadge value={count} />
-                {!expandable ? (
-                  <span className={cn(textRoleVariants({ role: "meta" }), "font-normal")}>
-                    {unavailableLabel}
-                  </span>
-                ) : null}
-              </span>
-            ) : null}
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="min-w-0 flex-1">
+                {measure ? formatted : column.id === labelColumn ? labelContent : null}
+              </div>
+              {!trailingColumn && column.id === pagerColumn ? pager : null}
+            </div>
           </TableCell>
         );
       })}
-      {trailingColumn ? <TableCell className="h-9 bg-sheet-2" /> : null}
-    </TableRow>
-  );
-}
-
-interface GroupedPagerRowProps<TRow extends Row> {
-  item: Extract<GroupedListItem<TRow>, { kind: "pager" }>;
-  colSpan: number;
-  onPageChange: (key: string, page: number) => void;
-  t: UiTranslate;
-}
-
-function GroupedPagerRow<TRow extends Row>({
-  item,
-  colSpan,
-  onPageChange,
-  t,
-}: GroupedPagerRowProps<TRow>): React.ReactElement {
-  const { pageKey, label, page, pageSize, total, unit } = item;
-  const navLabel = t(
-    unit === "groups" ? "list.pagerSubject.groups" : "list.pagerSubject.records",
-    { label },
-  );
-  return (
-    <TableRow>
-      <TableCell colSpan={colSpan} className="bg-sheet py-2">
-        <nav
-          aria-label={navLabel}
-          className={cn(textRoleVariants({ role: "meta" }), "flex items-center justify-end gap-2")}
-        >
-          <Pager
-            page={page}
-            pageSize={pageSize}
-            total={total}
-            onPageChange={(next) => onPageChange(pageKey, next)}
-            unit={unit === "groups" ? "groups" : undefined}
-            labelElement="span"
-            previousLabel={t("pager.previousSubject", { subject: navLabel })}
-            nextLabel={t("pager.nextSubject", { subject: navLabel })}
-            formatNumber={formatPagerNumber}
-          />
-        </nav>
-      </TableCell>
+      {trailingColumn ? (
+        <TableCell className="h-9 bg-sheet-2">
+          {pager}
+        </TableCell>
+      ) : null}
     </TableRow>
   );
 }
@@ -519,29 +471,6 @@ function GroupedStatusRow<TRow extends Row>({
       </TableCell>
     </TableRow>
   );
-}
-
-function snapshotFromNav<TRow extends Row>(
-  nav: GroupedRecordNav,
-): ResourceListSnapshot<TRow> {
-  const pageCount =
-    nav.total === undefined ? undefined : Math.max(1, Math.ceil(nav.total / nav.pageSize));
-  return {
-    rows: nav.rows as readonly TRow[],
-    total: nav.total,
-    page: nav.page,
-    pageSize: nav.pageSize,
-    pageCount,
-    hasNext: pageCount !== undefined && nav.page < pageCount,
-    hasPrev: nav.page > 1,
-    fetching: nav.fetching,
-    navigationScope: {
-      filter: nav.filter,
-      order: nav.order,
-      page: nav.page,
-      pageSize: nav.pageSize,
-    },
-  };
 }
 
 function depthIndentStyle(depth: number): React.CSSProperties | undefined {

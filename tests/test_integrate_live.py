@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from angee.jobs.locks import task_lock_is_held
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.db import connection
@@ -20,12 +19,29 @@ from angee.integrate.live import PairingState
 from angee.integrate.locks import bridge_advisory_lock
 from angee.integrate.models import IntegrationRuntimeStatus
 from angee.integrate.session import PASSWORD_SKIPPED, LiveSession, PasswordSkipped
+from angee.jobs.locks import task_lock_is_held
 from angee.messaging.backends import LiveChannelBackend, ParsedMessage, ParsedPart, ParsedThread
 from tests.conftest import _clear_model_tables, _create_missing_tables, make_integration
 from tests.test_messaging import MESSAGING_TEST_MODELS, Message
 from tests.test_messaging_graphql import Channel
 
 LIVE_TEST_MODELS = (*MESSAGING_TEST_MODELS, Channel)
+
+
+@pytest.mark.django_db
+def test_run_bridge_session_skips_actual_periodic_vcs_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale live-session delivery for a periodic VCS bridge exits cleanly."""
+
+    from angee.integrate import tasks as tasks_module
+    from tests.conftest import VcsBridge
+
+    monkeypatch.setattr(tasks_module, "_bridge", lambda *_: VcsBridge())
+
+    assert tasks_module.run_bridge_session("integrate_vcs.vcsbridge", 1) == {
+        "ok": True,
+        "skipped": True,
+        "reason": "not-live-capable",
+    }
 
 
 class FakeLiveSession(LiveSession):
@@ -609,7 +625,7 @@ def test_missing_credential_at_password_delivery_is_a_latched_session_outcome(
         assert fresh_channel.runtime_status == IntegrationRuntimeStatus.ERROR
         assert fresh_channel.sync_stage == fresh_channel.SyncStage.FAILED
         assert fresh_channel.sync_progress["details"]["pairing"]["state"] == PairingState.STOPPED
-        assert "live bridge has no credential" in fresh_channel.sync_error.lower()
+        assert fresh_channel.sync_error == "Integration operation failed."
     assert "live bridge has no credential" in caplog.text.lower()
     assert tasks_module.ensure_bridge_sessions() == {"ok": True, "dispatched": 0}
 
@@ -667,7 +683,7 @@ def test_missing_password_at_consume_time_reports_and_rearms(
             "state": PairingState.AWAITING_PASSWORD,
             "message": "The submitted password was unavailable. Enter the bridge password again.",
         }
-        assert "no submitted password" in fresh_channel.sync_error.lower()
+        assert fresh_channel.sync_error == "Integration operation failed."
     assert "no submitted password" in caplog.text.lower()
     assert tasks_module.ensure_bridge_sessions() == {"ok": True, "dispatched": 0}
 
@@ -809,6 +825,16 @@ def test_ensure_bridge_sessions_reconciles_live_desire_and_routes_to_session_que
 
     from angee.integrate import tasks as tasks_module
     from angee.integrate.constants import RUN_SESSION_TASK, SESSION_START_EXPIRES
+    from angee.integrate.models import Bridge
+    from angee.integrate.registry import bridge_models
+    from tests.conftest import VcsBridge
+
+    discovered = bridge_models(Bridge)
+    assert VcsBridge in discovered
+    assert Channel in discovered
+    assert VcsBridge.live_implementation_field() is None
+    assert Channel.live_implementation_field() is Channel._meta.get_field("backend_class")
+    monkeypatch.setattr(tasks_module, "bridge_models", bridge_models)
 
     sent: list[dict[str, Any]] = []
     monkeypatch.setattr(
@@ -869,14 +895,15 @@ def test_ensure_bridge_sessions_latches_runtime_error_until_resume(
     assert tasks_module.ensure_bridge_sessions() == {"ok": True, "dispatched": 1}
 
 
-def test_live_backend_holds_account_lock_key() -> None:
+def test_live_backend_holds_account_lock_key(settings: Any) -> None:
     """The account-scoped lock namespace follows the backend key."""
 
-    backend = FakeLiveChannelBackend.__new__(FakeLiveChannelBackend)
-    assert backend.account_lock_key("account-1").name == "angee:fake_live-account:account-1"
-    with backend.account_lock("account-1") as acquired:
+    settings.ANGEE_TASK_LOCK_BACKEND = "angee.jobs.locks.LocalLockBackend"
+    bridge = Channel()
+    assert bridge.live_account_lock_key("fake_live", "account-1").name == "angee:fake_live-account:account-1"
+    with bridge.live_account_lock("fake_live", "account-1") as acquired:
         assert acquired
-        assert task_lock_is_held(backend.account_lock_key("account-1"))
+        assert task_lock_is_held(bridge.live_account_lock_key("fake_live", "account-1"))
 
 
 @pytest.mark.django_db(transaction=True)

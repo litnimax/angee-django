@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,7 @@ from urllib import parse
 import pytest
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-from django.db import IntegrityError, connection, transaction
+from django.db import IntegrityError, connection, connections, transaction
 from django.test.utils import override_settings
 from django.utils import timezone
 from rebac import system_context, to_object_ref, to_subject_ref
@@ -21,7 +23,42 @@ from angee.integrate.credentials import CredentialKind, OAuthCredentialHandler, 
 from angee.integrate.models import AccountStatus
 from angee.integrate.oauth.client import OAuthClientProtocol
 from angee.integrate.oauth.errors import TOKEN_EXCHANGE_FAILED, OAuthFlowError
-from tests.conftest import Credential, ExternalAccount, Integration, OAuthClient, Vendor, _create_missing_tables
+from tests.conftest import (
+    Credential,
+    ExternalAccount,
+    OAuthClient,
+    VcsBridge,
+    Vendor,
+    _create_missing_tables,
+)
+
+
+def _ensure_fresh_in_process(
+    credential_pk: int,
+    start: Any,
+    results: Any,
+) -> None:
+    """Race one real database refresh transaction from a separate process."""
+
+    import django
+
+    django.setup()
+
+    def refresh_once(self: Any, *, refresh_token: str) -> dict[str, Any]:
+        results.put(("refresh", refresh_token))
+        time.sleep(0.3)
+        return {"access_token": "process-fresh", "refresh_token": "process-rotated", "expires_in": 7200}
+
+    OAuthClientProtocol.refresh_token = refresh_once
+    try:
+        with system_context(reason="test cross-process credential refresh"):
+            credential = Credential.objects.sudo(reason="test cross-process credential load").get(pk=credential_pk)
+            if not start.wait(timeout=10):
+                raise TimeoutError("credential refresh race did not start")
+            credential.ensure_fresh()
+            results.put(("result", credential.secret_value()))
+    finally:
+        connections.close_all()
 
 
 def test_oauth_client_blank_client_id_means_needs_client() -> None:
@@ -99,16 +136,16 @@ def test_install_fixture_seeds_anthropic_loopback_callback_path() -> None:
         assert entries[slug]["loopback_redirect_path"] == "/callback"
 
 
-def test_oauth_flow_error_public_message_prefers_safe_provider_body() -> None:
-    """The OAuth error object owns the user-facing safe fallback text."""
+def test_oauth_flow_error_public_message_ignores_provider_body() -> None:
+    """Provider-controlled descriptions never become user-facing text."""
 
     provider_error = OAuthFlowError(
         TOKEN_EXCHANGE_FAILED,
-        body={"error": {"message": " Rate limited. "}},
+        body={"error": {"message": "code=canary client_secret=top-secret"}},
     )
 
-    assert provider_error.public_message == "Rate limited."
-    assert OAuthFlowError("invalid_state").public_message == "invalid_state"
+    assert provider_error.public_message == "The provider could not complete authorization."
+    assert OAuthFlowError("unknown_provider_code").public_message == "The authorization request failed."
 
 
 def test_oauth_protocol_discovers_missing_authorize_endpoint() -> None:
@@ -632,6 +669,59 @@ def test_ensure_fresh_renews_an_expiring_oauth_credential(monkeypatch: pytest.Mo
 
 
 @pytest.mark.django_db(transaction=True)
+def test_ensure_fresh_serializes_two_processes_on_postgresql() -> None:
+    """Two consumers issue one refresh and both adopt its persisted token."""
+
+    if connection.vendor != "postgresql":
+        pytest.skip("PostgreSQL row-lock behavior")
+    created_models = _create_missing_tables()
+    processes: list[multiprocessing.Process] = []
+    results: Any | None = None
+    try:
+        user = get_user_model().objects.create_user(username="refresh-process", email="process@example.com")
+        call_command("rebac", "sync", verbosity=0)
+        credential = _expiring_oauth_credential(
+            user,
+            slug="refresh-process",
+            material={"access_token": "old", "refresh_token": "process-old", "expires_in": 3600},
+        )
+        connections.close_all()
+        context = multiprocessing.get_context("fork")
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(target=_ensure_fresh_in_process, args=(credential.pk, start, results)) for _ in range(2)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+
+        events = [results.get(timeout=5) for _ in range(3)]
+        assert events.count(("refresh", "process-old")) == 1
+        assert events.count(("result", "process-fresh")) == 2
+        reloaded = Credential.objects.sudo(reason="test cross-process credential verify").get(pk=credential.pk)
+        assert reloaded.reveal()["refresh_token"] == "process-rotated"
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            if process.pid is not None and process.exitcode is None:
+                process.join(timeout=1)
+        if results is not None:
+            results.close()
+            results.join_thread()
+        _drop_models(created_models)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite locking floor")
 def test_ensure_fresh_does_not_call_select_for_update_on_sqlite(monkeypatch: pytest.MonkeyPatch) -> None:
     """SQLite is the documented floor; refresh locking degrades to a plain read there."""
 
@@ -671,83 +761,39 @@ def test_ensure_fresh_does_not_call_select_for_update_on_sqlite(monkeypatch: pyt
 
 
 @pytest.mark.django_db(transaction=True)
-def test_connect_from_credential_does_not_call_select_for_update_on_sqlite(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """SQLite is the documented floor; connection locking degrades to a plain read there."""
+def test_attach_credential_preserves_paused_lifecycle_while_resetting_health() -> None:
+    """Credential replacement does not silently resume an operator-paused row."""
 
     created_models = _create_missing_tables()
     try:
-        user = get_user_model().objects.create_user(username="activate-sqlite", email="activate@example.com")
+        user = get_user_model().objects.create_user(username="attach-paused", email="paused@example.com")
         call_command("rebac", "sync", verbosity=0)
-        with system_context(reason="test activate setup"):
-            vendor = Vendor.objects.create(slug="activate", display_name="Activate")
-            oauth_client = OAuthClient.objects.create(
-                slug="activate",
-                display_name="Activate prod",
-                client_id="activate-client",
-                token_endpoint="https://idp.example/token",
-            )
-            credential = Credential.objects.upsert_for_user(
-                user,
-                oauth_client,
-                CredentialKind.OAUTH,
-                {"access_token": "activate-token"},
-            )
-
-        def forbidden_select_for_update(self: Any, *args: Any, **kwargs: Any) -> Any:
-            raise AssertionError("SQLite activation must not call select_for_update()")
-
-        monkeypatch.setattr(type(Integration.objects.all()), "select_for_update", forbidden_select_for_update)
-
-        integration = Integration.objects.connect_from_credential(user, vendor=vendor, credential=credential)
-
-        assert integration.credential_id == credential.pk
-        assert integration.lifecycle == "connected"
-    finally:
-        _drop_models(created_models)
-
-
-@pytest.mark.django_db(transaction=True)
-def test_connect_from_credential_reconnect_swaps_credential_on_connected_integration() -> None:
-    """Re-auth can replace credentials on an already-connected row without a self-edge."""
-
-    created_models = _create_missing_tables()
-    try:
-        user = get_user_model().objects.create_user(username="activate-again", email="again@example.com")
-        call_command("rebac", "sync", verbosity=0)
-        with system_context(reason="test activate again setup"):
-            vendor = Vendor.objects.create(slug="activate-again", display_name="Activate Again")
+        with system_context(reason="test paused attach setup"):
+            vendor = Vendor.objects.create(slug="attach-paused", display_name="Attach Paused")
             first = Credential.objects.create_local_credential(
-                user,
-                kind=CredentialKind.STATIC_TOKEN,
-                name="first-token",
-                material={"api_key": "first"},
+                user, kind=CredentialKind.STATIC_TOKEN, name="paused-first", material={"api_key": "first"}
             )
             second = Credential.objects.create_local_credential(
-                user,
-                kind=CredentialKind.STATIC_TOKEN,
-                name="second-token",
-                material={"api_key": "second"},
+                user, kind=CredentialKind.STATIC_TOKEN, name="paused-second", material={"api_key": "second"}
             )
-
-        integration = Integration.objects.connect_from_credential(user, vendor=vendor, credential=first)
-        with system_context(reason="test activate again seed error"):
+        with system_context(reason="test paused attach integration setup"):
+            integration = VcsBridge.objects.create(
+                owner=user,
+                vendor=vendor,
+                credential=first,
+                backend_class="local",
+                lifecycle="connected",
+            )
+        with system_context(reason="test paused attach state"):
+            integration.pause()
             integration.report_status("error", "expired token")
+            integration.attach_credential(second)
 
-        reconnected = Integration.objects.connect_from_credential(user, vendor=vendor, credential=second)
-
-        assert reconnected.pk == integration.pk
-        assert reconnected.credential_id == second.pk
-        assert str(reconnected.lifecycle) == "connected"
-        assert str(reconnected.runtime_status) == "ok"
-        assert reconnected.last_error == ""
-        with system_context(reason="test activate again verify"):
-            persisted = Integration.objects.get(pk=integration.pk)
-            assert persisted.credential_id == second.pk
-            assert str(persisted.lifecycle) == "connected"
-            assert str(persisted.runtime_status) == "ok"
-            assert persisted.last_error == ""
+        integration.refresh_from_db()
+        assert str(integration.lifecycle) == "paused"
+        assert str(integration.runtime_status) == "ok"
+        assert integration.credential_id == second.pk
+        assert integration.last_error == ""
     finally:
         _drop_models(created_models)
 
@@ -789,7 +835,10 @@ def test_ensure_fresh_is_a_noop_for_a_valid_token(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.django_db(transaction=True)
-def test_ensure_fresh_records_failure_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ensure_fresh_records_failure_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A provider rejecting the refresh is recorded (``last_refresh_status``), not raised."""
 
     created_models = _create_missing_tables()
@@ -803,7 +852,7 @@ def test_ensure_fresh_records_failure_without_raising(monkeypatch: pytest.Monkey
         )
 
         def boom(self: Any, *, refresh_token: str) -> dict[str, Any]:
-            raise OAuthFlowError(TOKEN_EXCHANGE_FAILED, 400)
+            raise ValueError("provider body https://idp.example/token?code=canary-secret")
 
         monkeypatch.setattr(OAuthClientProtocol, "refresh_token", boom)
 
@@ -812,6 +861,8 @@ def test_ensure_fresh_records_failure_without_raising(monkeypatch: pytest.Monkey
 
         assert credential.last_refresh_status == "failed"
         assert credential.secret_value() == "stale-access"  # the old token is retained
+        assert "ValueError" in caplog.text
+        assert "canary-secret" not in caplog.text
         reloaded = Credential.objects.sudo(reason="test reload").get(pk=credential.pk)
         assert reloaded.last_refresh_status == "failed"
         assert reloaded.reveal()["access_token"] == "stale-access"

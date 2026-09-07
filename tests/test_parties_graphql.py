@@ -30,6 +30,7 @@ Circle = messaging_models.Circle
 Organization = messaging_models.Organization
 Person = messaging_models.Person
 PartyHandle = messaging_models.PartyHandle
+Handle = messaging_models.Handle
 
 
 # Import after the concrete test models are registered; the source schema resolves
@@ -52,10 +53,7 @@ def test_public_resource_metadata_declares_people_surface() -> None:
     """The composed public schema reports Person's Hasura resource contract."""
 
     schema = _schema("public")
-    metadata = {
-        item.model_label: item
-        for item in schema.angee_resources
-    }["parties.Person"]
+    metadata = {item.model_label: item for item in schema.angee_resources}["parties.Person"]
 
     assert metadata.roots.list_name == "people"
     assert metadata.roots.detail_name == "people_by_pk"
@@ -64,28 +62,28 @@ def test_public_resource_metadata_declares_people_surface() -> None:
     assert metadata.roots.create_name == "insert_people_one"
     assert metadata.roots.update_name == "update_people_by_pk"
     assert metadata.roots.delete_name is None
-    assert metadata.filter_fields == (
-        "id",
+    assert {name for name, field in metadata.query.fields.items() if field.filter} == {
         "display_name",
-        "given_name",
-        "family_name",
         "nickname",
-        "folder",
-        "birthday",
-        "anniversary",
         "created_at",
-        "updated_at",
-    )
-    assert metadata.order_fields == (
-        "display_name",
+        "id",
+        "family_name",
+        "birthday",
+        "folder",
         "given_name",
+        "updated_at",
+        "anniversary",
+    }
+    assert {name for name, field in metadata.query.fields.items() if field.sort} == {
+        "display_name",
+        "created_at",
         "family_name",
         "folder",
-        "created_at",
+        "given_name",
         "updated_at",
-    )
+    }
     assert metadata.aggregate_fields == ("id",)
-    assert metadata.group_by_fields == ("folder", "folder__name", "created_at")
+    assert set(metadata.query.axes) == {"folder", "created_at"}
     assert metadata.capabilities == (
         "list",
         "detail",
@@ -94,17 +92,16 @@ def test_public_resource_metadata_declares_people_surface() -> None:
         "create",
         "update",
     )
-    assert metadata.relation_axes[0].field == "folder"
-    assert metadata.relation_axes[0].model_label == "parties.Folder"
-    assert metadata.relation_axes[0].public_id_field == "sqid"
-    assert metadata.relation_axes[0].label_axis == "folder__name"
+    assert metadata.query.axes["folder"].field == "folder"
+    assert metadata.query.fields["folder"].relation.model == "parties.Folder"
+    assert metadata.query.fields["folder"].relation.identity_path == "folder.id"
+    assert metadata.query.axes["folder"].server.label_key == "folder__name"
+    assert metadata.query.identity.field == "id"
 
     serialized = schema._schema.extensions["angee"]["resources"]
-    person = {
-        item["modelLabel"]: item
-        for item in serialized
-    }["parties.Person"]
+    person = {item["modelLabel"]: item for item in serialized}["parties.Person"]
     assert person["schemaName"] == "public"
+    assert person["query"]["identity"]["field"] == "id"
     assert person["roots"]["list"] == "people"
     assert person["roots"]["detail"] == "people_by_pk"
     assert person["roots"]["aggregate"] == "people_aggregate"
@@ -113,37 +110,34 @@ def test_public_resource_metadata_declares_people_surface() -> None:
     assert person["roots"]["create"] == "insert_people_one"
     assert person["roots"]["update"] == "update_people_by_pk"
     assert person["roots"]["delete"] is None
-    assert person["groupByFields"] == ["folder", "folder__name", "created_at"]
-    group_dimensions = {dimension["field"]: dimension for dimension in person["groupDimensions"]}
+    assert list(person["query"]["axes"]) == ["folder", "created_at"]
+    group_dimensions = person["query"]["axes"]
     assert {
         field: (
-            dimension["input"],
-            dimension["key"],
+            dimension["server"]["input"],
+            dimension["server"]["key"],
             dimension["kind"],
-            dimension["scalar"],
         )
         for field, dimension in group_dimensions.items()
     } == {
-        "folder": ("FOLDER", "folder_id", "relation", "ID"),
-        "folder__name": ("FOLDER__NAME", "folder__name", "column", None),
-        "created_at": ("CREATED_AT", "created_at", "column", "DateTime"),
+        "folder": ("FOLDER", "folder_id", "relation"),
+        "created_at": ("CREATED_AT", "created_at", "date"),
     }
     created_at_extractions = {
-        extraction["name"]: extraction
-        for extraction in group_dimensions["created_at"]["extractions"]
+        extraction["name"]: extraction for extraction in group_dimensions["created_at"]["extractions"]
     }
     assert created_at_extractions["month"] == {
         "name": "month",
         "input": "MONTH",
         "key": "created_at_month",
         "rangeKey": "created_at_month_range",
-        "filter": {
+        "drill": {
             "kind": "range",
             "field": "created_at",
             "valueKey": "created_at_month",
             "rangeKey": "created_at_month_range",
-            "lookup": None,
-            "nullLookup": "isNull",
+            "jsonPath": None,
+            "nullMode": "isNull",
             "valueTransform": None,
             "valueMap": [],
         },
@@ -175,20 +169,17 @@ def test_public_resource_metadata_declares_people_surface() -> None:
         "birthday",
         "anniversary",
     ]
-    assert person["relationAxes"] == [
-        {
-            "field": "folder",
-            "modelLabel": "parties.Folder",
-            "publicIdField": "sqid",
-            "labelAxis": "folder__name",
-        }
-    ]
+    assert person["query"]["fields"]["folder"]["relation"] == {
+        "model": "parties.Folder",
+        "identityPath": "folder.id",
+        "labelPath": "folder.name",
+    }
     folder_field = {field["name"]: field for field in person["fields"]}["folder"]
     assert folder_field["kind"] == "relation"
     assert folder_field["widget"] == "many2one"
     assert folder_field["readable"] is True
     assert folder_field["relationModelLabel"] == "parties.Folder"
-    assert folder_field["relationLabelAxis"] == "folder__name"
+    assert person["query"]["fields"]["folder"]["relation"]["labelPath"] == "folder.name"
     display_name_field = {field["name"]: field for field in person["fields"]}["display_name"]
     assert display_name_field["creatable"] is True
     assert display_name_field["updatable"] is True
@@ -206,7 +197,12 @@ def test_public_resource_metadata_converts_related_parties_surfaces() -> None:
     assert address.roots.create_name == "insert_addresses_one"
     assert address.roots.update_name == "update_addresses_by_pk"
     assert address.roots.delete_name == "delete_addresses_by_pk"
-    assert address.filter_fields == ("id", "party", "label", "created_at")
+    assert {name for name, field in address.query.fields.items() if field.filter} == {
+        "id",
+        "party",
+        "label",
+        "created_at",
+    }
     assert address.create_fields[0] == "party"
 
     relationship = resources["parties.Relationship"]
@@ -271,6 +267,60 @@ def test_person_hasura_insert_and_update(parties_tables: None) -> None:
     assert person.family_name == "Lovelace"
 
 
+def test_handle_aggregate_includes_unresolved_rows(parties_tables: None) -> None:
+    """Handle aggregate filters operate over the same visible row domain as lists."""
+
+    admin = _platform_admin("party-handle-aggregate-admin")
+    with system_context(reason="test.parties.handle_aggregate.seed"):
+        party = messaging_models.Party.objects.create(display_name="Resolved party", created_by_id=admin.pk)
+        Handle.objects.create(
+            party=party,
+            platform="email",
+            value="resolved@example.com",
+            normalized_value="resolved@example.com",
+            created_by_id=admin.pk,
+        )
+        Handle.objects.create(
+            platform="email",
+            value="unresolved@example.com",
+            normalized_value="unresolved@example.com",
+            created_by_id=admin.pk,
+        )
+
+    result = _data(
+        execute_schema(
+            _schema("public"),
+            """
+            query HandleAggregateDomain {
+              rows: handles(order_by: [{value: asc}]) { id value }
+              all: handles_aggregate { aggregate { count } }
+              unresolved: handles_aggregate(where: {party: {_is_null: true}}) {
+                aggregate { count }
+              }
+              groups: handles_groups(group_by: [{field: PARTY}], limit: 10) {
+                key { party_id }
+                aggregate { count }
+              }
+              groups_count: handles_groups_count(group_by: [{field: PARTY}])
+            }
+            """,
+            user=admin,
+        )
+    )
+
+    assert [row["value"] for row in result["rows"]] == [
+        "resolved@example.com",
+        "unresolved@example.com",
+    ]
+    assert result["all"]["aggregate"]["count"] == 2
+    assert result["unresolved"]["aggregate"]["count"] == 1
+    assert {group["key"]["party_id"]: group["aggregate"]["count"] for group in result["groups"]} == {
+        None: 1,
+        party.sqid: 1,
+    }
+    assert result["groups_count"] == 2
+
+
 def test_circle_console_insert_establishes_private_creator_access(
     parties_tables: None,
 ) -> None:
@@ -332,10 +382,7 @@ def parties_tables(transactional_db: Any) -> Iterator[None]:
 
 
 def _schema(name: str) -> Any:
-    parts = {
-        key: tuple(parties_schema.schemas[name].get(key, ()))
-        for key in SCHEMA_PART_KEYS
-    }
+    parts = {key: tuple(parties_schema.schemas[name].get(key, ())) for key in SCHEMA_PART_KEYS}
     return GraphQLSchemas([SchemaAddon({name: parts})]).build(name)
 
 
