@@ -31,9 +31,12 @@ from angee.iam.audit import AuthoredRefMixin
 from angee.iam.identity import user_public_id
 from angee.iam.permissions import ADMIN_PERMISSION_CLASSES, session_user
 from angee.integrate.schema import BridgeSyncStatusMixin, IntegrationLabelMixin
+from angee.money.schema import CurrencyType
 from angee.parties.mixins import LinkSource
 
 Party = apps.get_model("parties", "Party")
+Bank = apps.get_model("parties", "Bank")
+BankAccount = apps.get_model("parties", "BankAccount")
 Person = apps.get_model("parties", "Person")
 Organization = apps.get_model("parties", "Organization")
 Handle = apps.get_model("parties", "Handle")
@@ -52,6 +55,8 @@ Relationship = apps.get_model("parties", "Relationship")
 class PartyType(AuthoredRefMixin, AngeeNode):
     """GraphQL projection of a party (the unified contact)."""
 
+    tax_country: auto
+    vat: auto
     display_name: auto
     notes: auto
     handle_count: auto
@@ -72,6 +77,8 @@ class PartyType(AuthoredRefMixin, AngeeNode):
 class PersonType(AngeeNode):
     """GraphQL projection of a person."""
 
+    tax_country: auto
+    vat: auto
     display_name: auto
     notes: auto
     name_prefix: auto
@@ -103,6 +110,8 @@ class PersonType(AngeeNode):
 class OrganizationType(AngeeNode):
     """GraphQL projection of an organisation."""
 
+    tax_country: auto
+    vat: auto
     display_name: auto
     notes: auto
     legal_name: auto
@@ -497,6 +506,43 @@ class PartiesDirectoryMutation:
         return cast(DirectoryType, directory)
 
 
+@strawberry_django.type(Bank)
+class BankType(AngeeNode):
+    """Shared bank directory."""
+    name: auto
+    bic: auto
+    country: auto
+    is_archived: auto
+
+
+@strawberry_django.type(BankAccount)
+class BankAccountType(AngeeNode):
+    """A party-owned payment destination."""
+    party: PartyType
+    bank: BankType
+    currency: CurrencyType | None
+    holder_name: auto
+    number_kind: auto
+    account_number: auto
+    is_archived: auto
+
+
+_BANK_RESOURCE = hasura_model_resource(
+    BankType, model=Bank, name="banks", aggregatable=["id"], filterable=["id", "name", "bic", "country", "is_archived"],
+    sortable=["name", "bic"], writable=["name", "bic", "country", "is_archived"],
+    write_backend=AngeeHasuraWriteBackend(Bank),
+)
+_BANK_ACCOUNT_RESOURCE = hasura_model_resource(
+    BankAccountType, model=BankAccount, name="bank_accounts", aggregatable=["id"],
+    filterable=["id", "party", "bank", "currency", "account_number", "is_archived"],
+    sortable=["account_number", "holder_name"], groupable=["party", "bank", "currency"],
+    writable=["party", "bank", "currency", "holder_name", "number_kind", "account_number", "is_archived"],
+    field_id_decode={"party": public_pk_decoder(Party), "bank": public_pk_decoder(Bank),
+                     "currency": public_pk_decoder(apps.get_model("money", "Currency"))},
+    write_backend=AngeeHasuraWriteBackend(BankAccount, public_id_fields=("party", "bank", "currency")),
+)
+
+
 _PARTY_RESOURCE = hasura_model_resource(
     PartyType,
     model=Party,
@@ -506,7 +552,7 @@ _PARTY_RESOURCE = hasura_model_resource(
     aggregatable=["id", "handle_count"],
     groupable=["created_at"],
     insert=False,
-    updatable=["display_name", "notes"],
+    updatable=["display_name", "notes", "tax_country", "vat"],
 )
 _PERSON_RESOURCE = hasura_model_resource(
     PersonType,
@@ -527,7 +573,7 @@ _PERSON_RESOURCE = hasura_model_resource(
     sortable=["display_name", "given_name", "family_name", "folder", "created_at", "updated_at"],
     aggregatable=["id"],
     groupable=["folder", "folder__name", "created_at"],
-    insertable=[
+    insertable=["tax_country", "vat",
         "display_name",
         "notes",
         "name_prefix",
@@ -539,7 +585,7 @@ _PERSON_RESOURCE = hasura_model_resource(
         "birthday",
         "anniversary",
     ],
-    updatable=[
+    updatable=["tax_country", "vat",
         "display_name",
         "notes",
         "name_prefix",
@@ -563,8 +609,8 @@ _ORGANIZATION_RESOURCE = hasura_model_resource(
     sortable=["display_name", "legal_name", "domain", "created_at", "updated_at"],
     aggregatable=["id"],
     groupable=["domain", "created_at"],
-    insertable=["display_name", "notes", "legal_name", "domain"],
-    updatable=["display_name", "notes", "legal_name", "domain"],
+    insertable=["tax_country", "vat","display_name", "notes", "legal_name", "domain"],
+    updatable=["tax_country", "vat","display_name", "notes", "legal_name", "domain"],
     delete=False,
 )
 _HANDLE_RESOURCE = hasura_model_resource(
@@ -760,6 +806,7 @@ _DIRECTORY_RESOURCE = hasura_model_resource(
 
 
 _RESOURCE_TYPES = [
+    *_BANK_RESOURCE.types, *_BANK_ACCOUNT_RESOURCE.types,
     *_PARTY_RESOURCE.types,
     *_PERSON_RESOURCE.types,
     *_ORGANIZATION_RESOURCE.types,
@@ -779,6 +826,7 @@ _RESOURCE_TYPES = [
 _PARTIES_SCHEMA_BUCKET = {
     "query": [
         PartiesReviewQuery,
+        _BANK_RESOURCE.query, _BANK_ACCOUNT_RESOURCE.query,
         _PARTY_RESOURCE.query,
         _PERSON_RESOURCE.query,
         _ORGANIZATION_RESOURCE.query,
@@ -796,6 +844,7 @@ _PARTIES_SCHEMA_BUCKET = {
     "mutation": [
         PartiesDirectoryMutation,
         PartiesIdentityMutation,
+        _BANK_RESOURCE.mutation, _BANK_ACCOUNT_RESOURCE.mutation,
         _PARTY_RESOURCE.mutation,
         _PERSON_RESOURCE.mutation,
         _ORGANIZATION_RESOURCE.mutation,
@@ -811,6 +860,7 @@ _PARTIES_SCHEMA_BUCKET = {
         _DIRECTORY_RESOURCE.mutation,
     ],
     "types": [
+        BankType, BankAccountType,
         PartyType,
         PersonType,
         OrganizationType,

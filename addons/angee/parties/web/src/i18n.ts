@@ -2,6 +2,18 @@ import { createNamespaceT } from "@angee/ui";
 
 export const enPartiesMessages: Record<string, string> = {
   "common.yes": "Yes",
+  "tax.details": "Tax details",
+  "tax.country": "Tax country (ISO code)",
+  "tax.vat": "VAT number",
+  "bank.details": "Bank details",
+  "bank.bic": "BIC / SWIFT",
+  "bank.country": "Country code",
+  "bankAccount.number": "IBAN / Account number",
+  "bankAccount.details": "Account details",
+  "bankAccount.owner": "Account owner",
+  "bankAccount.holder": "Beneficiary name",
+  "address.details": "Postal address",
+  "address.primaryBilling": "Primary billing address",
   "overview.metric.contacts": "People",
   "overview.metric.organizations": "Organizations",
   "overview.metric.unresolvedHandles": "Unresolved handles",

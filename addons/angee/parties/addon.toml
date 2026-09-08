@@ -5,9 +5,10 @@ name = "angee.parties"
 description = "Contacts — people and organizations, their circles, relationships, addresses, and directory sync"
 keywords = ["parties", "contacts", "crm"]
 category = "Data"
-depends_on = ["angee.iam", "angee.integrate", "angee.storage"]
+depends_on = ["angee.iam", "angee.integrate", "angee.storage", "angee.money"]
 dependencies = [
   "phonenumbers>=9.0",
+  "python-stdnum>=2.2,<3",
 ]
 
 [[migrations]]
@@ -29,3 +30,8 @@ module = "runtime_migrations.handle_normalized_value"
 master = [
   { path = "resources/master/010_parties.relationshipkind.yaml", adopt = "slug" },
 ]
+
+[[migrations]]
+app_label = "parties"
+name = "tax_and_bank_details"
+module = "runtime_migrations.tax_and_bank_details"

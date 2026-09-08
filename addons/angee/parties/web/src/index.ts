@@ -21,6 +21,9 @@ const partiesMenu: readonly BaseMenuItem[] = [
         route: "parties.organizations",
         icon: "organization",
       },
+      { id: "parties.banks", label: "Banks", route: "parties.banks", icon: "organization" },
+      { id: "parties.bank-accounts", label: "Bank Accounts", route: "parties.bank-accounts", icon: "organization" },
+      { id: "parties.addresses", label: "Addresses", route: "parties.addresses", icon: "address-book" },
       { id: "parties.circles", label: "Circles", route: "parties.circles", icon: "circle" },
       {
         id: "parties.relationships",
@@ -43,6 +46,9 @@ const partiesMenu: readonly BaseMenuItem[] = [
 const parties = defineBaseAddon({
   id: "parties",
   routes: [
+    ...resourcePageRoutes("parties.banks", "/parties/banks", lazyRouteComponent(() => import("./BankAccountsPage"), "BanksPage"), "parties.Bank"),
+    ...resourcePageRoutes("parties.bank-accounts", "/parties/bank-accounts", lazyRouteComponent(() => import("./BankAccountsPage"), "BankAccountsPage"), "parties.BankAccount"),
+    ...resourcePageRoutes("parties.addresses", "/parties/addresses", lazyRouteComponent(() => import("./BankAccountsPage"), "AddressesPage"), "parties.Address"),
     {
       name: "parties.overview",
       path: "/parties",
