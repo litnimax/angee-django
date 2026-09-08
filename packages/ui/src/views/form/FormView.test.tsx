@@ -2690,6 +2690,20 @@ describe("FormView", () => {
   // Editable document lines (F6): the resource metadata carries a `linesResource`
   // and a `save` root, so FormView renders the lines composer and routes a dirty
   // save through `<resource>_save(pk, patch, lines)`.
+  test("new document renders Add line and submits lines with its first create", async () => {
+    sdkMocks.record = null;
+    sdkMocks.mutate.mockResolvedValue({ id: "doc-new", title: "Quotation", lines: [{ id: "line-new", label: "Lamp", position: 0 }] });
+    renderSaleDoc(null);
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Quotation" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add line" }));
+    fireEvent.change(screen.getByLabelText("Text", { exact: true }), { target: { value: "Lamp" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(sdkMocks.mutate).toHaveBeenCalledWith({
+      data: { title: "Quotation", lines: { data: [{ label: "Lamp", position: 0 }] } },
+    }));
+    expect(sdkMocks.save).not.toHaveBeenCalled();
+  });
+
   test("seeds document lines without a reseed loop", async () => {
     sdkMocks.record = saleDocRecord();
     renderSaleDoc();
@@ -2843,11 +2857,11 @@ function saleDocRecord(): Row {
   };
 }
 
-function renderSaleDoc(): void {
+function renderSaleDoc(id: string | null = "doc-1"): void {
   renderWithProviders(
     <FormView
       resource="demo.SaleDoc"
-      id="doc-1"
+      id={id}
       fields={[{ name: "title", label: "Title", title: true }]}
     />,
     SALES_METADATA,
@@ -2892,12 +2906,13 @@ const SALES_METADATA: TestSchemaMetadata = {
         recordRepresentation: "title",
         roots: {
           list: "sale_docs",
+          create: "insert_sale_docs_one",
           detail: "sale_docs_by_pk",
           update: "update_sale_docs_by_pk",
           save: "sale_docs_save",
         },
-        typeNames: { node: "SaleDocType", updateInput: "sale_docs_set_input" },
-        capabilities: ["list", "detail", "update", "save"],
+        typeNames: { node: "SaleDocType", createInput: "sale_docs_insert_input", updateInput: "sale_docs_set_input" },
+        capabilities: ["list", "detail", "create", "update", "save"],
         fields: [saleLineField("title", "String", { requiredOnCreate: true })],
 
 

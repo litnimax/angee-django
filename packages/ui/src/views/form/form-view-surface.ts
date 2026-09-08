@@ -357,7 +357,7 @@ export function useFormViewSurface({
         modelMetadata?.fields[field.name],
       );
     }
-    const lines = isCreate ? null : modelMetadata?.resource?.linesResource;
+    const lines = modelMetadata?.resource?.linesResource;
     if (lines?.field) {
       for (const path of lineReadSelectionPaths(lines, schemaMetadata)) {
         paths.add(`${lines.field}.${path}`);
@@ -373,7 +373,7 @@ export function useFormViewSurface({
       if (path) paths.add(path);
     }
     return [...paths];
-  }, [formFields, isCreate, modelMetadata, relationByField, returning, schemaMetadata]);
+  }, [formFields, modelMetadata, relationByField, returning, schemaMetadata]);
   const refineFields = React.useMemo(
     () => refineFieldsFromPaths(selection),
     [selection],

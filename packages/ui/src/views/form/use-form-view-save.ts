@@ -205,10 +205,11 @@ export function useFormViewSave({
   });
   const invalidate = useInvalidate();
   const linesActive =
-    !isCreate &&
     linesConfig !== null &&
     linesField !== null &&
-    (saveOperation.target !== null || Boolean(submit));
+    (isCreate
+      ? Boolean(dataResource?.roots.create || submit || createSubmit)
+      : saveOperation.target !== null || Boolean(submit));
   const seedLineRows = React.useMemo(
     () =>
       linesActive && linesConfig && linesField
@@ -276,7 +277,7 @@ export function useFormViewSave({
     }
     resetDefaultValues(baseline, { keepIsValid: true });
   }, [form, linesActive, linesField, reset, resetDefaultValues, setValue]);
-  const lineDraftDirty = Boolean(linesActive && linesField && dirtyFields[linesField]);
+  const lineDraftDirty = Boolean(!isCreate && linesActive && linesField && dirtyFields[linesField]);
   // Replay a held remote array when the user undoes the last local line edit.
   React.useEffect(() => { syncRecordValues(values); }, [lineDraftDirty, syncRecordValues, values]);
   const serverFieldErrors = React.useMemo(() => serverErrorsFromForm(form.formState.errors), [form.formState.errors]);
@@ -313,7 +314,7 @@ export function useFormViewSave({
   const runSubmit = React.useCallback(
     async (data: FormValues, lines: LineDiff | null = null): Promise<Row | null> => {
       if (submitOwner) return customSubmit.mutateAsync({ data, lines });
-      if (lines && lines.hasChanges && id != null && saveOperation.target !== null) {
+      if (!isCreate && lines && lines.hasChanges && id != null && saveOperation.target !== null) {
         const saved = await resourceSave.save({
           pk: id,
           patch: data,
@@ -323,7 +324,11 @@ export function useFormViewSave({
         return saved;
       }
       const response = isCreate
-        ? await create.mutateAsync({ values: data })
+        ? await create.mutateAsync({
+            values: lines?.hasChanges && linesField
+              ? { ...data, [linesField]: { data: lines.payload } }
+              : data,
+          })
         : await update.mutateAsync({ id: id as BaseKey, values: data });
       return response?.data ?? null;
     },
@@ -334,6 +339,7 @@ export function useFormViewSave({
       id,
       invalidateResource,
       isCreate,
+      linesField,
       resource,
       resourceSave,
       saveOperation.target,
@@ -403,7 +409,7 @@ export function useFormViewSave({
               linesConfig,
             )
           : null;
-      if (linesDiff?.hasChanges && linesConfig && linesField) {
+      if (!isCreate && linesDiff?.hasChanges && linesConfig && linesField) {
         const baseline = baselineLineRows(form.formState.defaultValues ?? {}, linesField, seedLineRows);
         const latest = queryClient.getQueryData<GetOneResponse<RowRecord>>(detailKey)?.data ?? record;
         // Full-list writes implicitly delete omitted IDs. Refuse a stale draft
