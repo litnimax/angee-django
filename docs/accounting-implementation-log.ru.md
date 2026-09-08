@@ -714,3 +714,9 @@ Payment Term обязателен при создании/сохранении �
 - Browser на живом стеке: смена продукта → label/price/UOM → Save/reload; новая строка quantity1/discount0/price149 → Save/reload; readonly confirmed order; Invoices tab → реальный invoice; CRM обязательный Payment Term и disabled empty submit. .angee/browser/sales-new-contract.log, sales-links-final.log, sales-product-change.png, sales-confirmed.png, sales-invoices.png, crm-payment-term.png. Скриншоты просмотрены.
 - Semantic no-op Save проверен отдельно: .angee/browser/sales-dirty-fixed-final.log/png. Vite prebundle держал старый framework после изменения source; очищен generated optimizer cache, web перезапущен через process-compose. В скриптах приёмки исправлены ожидания конкретного product code LAMP-01, заглавной Payment Term и Playwright API; ошибок продукта из этих несовпадений не выводилось.
 - Два созданных для браузера временных draft orders удалены после проверки; пользовательские confirmed orders и финансовые документы не проводились и не изменялись этой приёмкой. Stack остаётся modest-toad на frontend0.0.0.0:5174 / backend0.0.0.0:8601.
+
+## 057 — 2026-09-08 — Ветка main-astra и PR
+
+По прямому указанию пользователя в litnimax/arpee-angee создана и опубликована main-astra от актуального origin/main, SHA fa5c444125595e82260d45e2e53d4c7994ed3ce5. modest-toad на 082ba908c4106de4c536be4502e64f9475fe56de уже совпадала с origin; force-push не применялся, текущая рабочая ветка не переключалась.
+
+Создан открытый PR **#2**, modest-toad → main-astra: https://github.com/litnimax/arpee-angee/pull/2 . Включены все31коммит accounting/sales итераций. Английское описание фиксирует итоговый объём, прошлые проверки, миграции, ограничения и отдельную зависимость от angee-django astra/invoice-form-contract на cd2bdf37. Framework branch в этот PR не входит. Base/head/isDraft=false проверены через GitHub API. Код не менялся, дополнительные тесты при публикации не запускались.
