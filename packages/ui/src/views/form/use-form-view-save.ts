@@ -78,6 +78,8 @@ export interface UseFormViewSaveProps {
   onSaved?: (row: Row) => void;
   submit?: FormSubmit;
   createSubmit?: FormSubmit;
+  /** Lock editing from persisted state; lifecycle actions remain independent. */
+  readOnlyWhen?: (record: Row) => boolean;
   defaultSlugSource?: string;
   t: UiTranslate;
 }
@@ -119,6 +121,7 @@ export function useFormViewSave({
   onSaved,
   submit,
   createSubmit,
+  readOnlyWhen,
   defaultSlugSource,
   t,
 }: UseFormViewSaveProps): FormViewSaveSurface {
@@ -288,10 +291,11 @@ export function useFormViewSave({
   const formReadOnly = React.useMemo(
     () =>
       recordUnavailable ||
+      (!isCreate && record !== null && Boolean(readOnlyWhen?.(record))) ||
       (!submitOwner &&
         !Boolean(isCreate ? dataResource?.roots.create : dataResource?.roots.update)) ||
       (formFields.length > 0 && formFields.every((field) => field.readOnly)),
-    [dataResource, formFields, isCreate, recordUnavailable, submitOwner],
+    [dataResource, formFields, isCreate, record, readOnlyWhen, recordUnavailable, submitOwner],
   );
   const formIsDirty = form.formState.isDirty;
   const pending = create.mutation.isPending || update.mutation.isPending || customSubmit.isPending || resourceSave.fetching || form.formState.isSubmitting;
@@ -417,7 +421,10 @@ export function useFormViewSave({
         const saved = await runSubmit(data, linesDiff);
         if (saved) commitSavedRecord(saved, {
           submitted: value,
-          submittedFields: [...Object.keys(data), ...(linesDiff?.hasChanges && linesField ? [linesField] : [])],
+          // A semantically unchanged line can still have a dirty RHF value
+          // (picked relation label shape, numeric string vs number). Accept its
+          // submitted baseline too; later edits remain dirty against that snapshot.
+          submittedFields: [...Object.keys(data), ...(linesDiff && linesField ? [linesField] : [])],
           createdLines: Boolean(linesDiff?.created.length),
           notify: true,
         });
@@ -528,8 +535,8 @@ export function useFormViewSave({
   );
   const fieldReadOnly = React.useCallback(
     (field: FieldDescriptor): boolean =>
-      recordUnavailable || Boolean(field.readOnly),
-    [recordUnavailable],
+      formReadOnly || Boolean(field.readOnly),
+    [formReadOnly],
   );
   const discardChanges = React.useCallback(() => {
     reset(isCreate ? emptyValues : values, { keepDirtyValues: false, keepDirty: false });

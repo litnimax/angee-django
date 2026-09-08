@@ -237,7 +237,12 @@ describe("ActionFormDialog", () => {
 
     // The relation list is seeded from the invoking selection (labels from options).
     expect(await screen.findByText("INV-1")).toBeTruthy();
-    expect(screen.getByText("INV-2")).toBeTruthy();
+    const invoices = screen.getByRole("combobox", { name: "Invoices" });
+    expect(invoices.getAttribute("title")).toBe("INV-1, INV-2");
+    fireEvent.click(invoices);
+    expect((await screen.findByRole("option", { name: "INV-1" })).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("option", { name: "INV-2" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.keyDown(invoices, { key: "Escape" });
     // The single relation composes the relation picker.
     expect(screen.getByRole("button", { name: "Journal" })).toBeTruthy();
     // The scalars render editable inputs.
@@ -330,10 +335,13 @@ describe("ActionFormDialog", () => {
     const submit = vi.fn().mockResolvedValue({ ok: true, message: "Done." });
     renderDialog(registerPaymentAction(submit));
 
-    // Remove one prefilled invoice chip before submitting.
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Remove INV-1" }),
-    );
+    // Toggle one prefilled invoice off in the compact multi-picker.
+    const invoices = await screen.findByRole("combobox", { name: "Invoices" });
+    fireEvent.click(invoices);
+    const firstInvoice = await screen.findByRole("option", { name: "INV-1" });
+    fireEvent.pointerDown(firstInvoice, { pointerType: "mouse", button: 0 });
+    fireEvent.click(firstInvoice);
+    fireEvent.keyDown(invoices, { key: "Escape" });
     await pickJournal("Cash Journal");
     fireEvent.change(screen.getByRole("textbox", { name: "Date" }), {
       target: { value: "2026-07-05" },

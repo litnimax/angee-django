@@ -22,10 +22,8 @@ from angee.data.field_classification import (
     RESOURCE_FIELD_SCALARS as _RESOURCE_FIELD_SCALARS,
 )
 from angee.data.field_classification import (
-    RESOURCE_FIELD_WIDGETS as _RESOURCE_FIELD_WIDGETS,
-)
-from angee.data.field_classification import (
     is_archive_field,
+    is_resource_field_widget,
     money_currency_field,
     resource_field_kind,
     resource_field_widget,
@@ -532,7 +530,7 @@ def _validate_resource_field(model_label: str, field: data_contract.DataResource
         raise ImproperlyConfigured(
             f"resource metadata for {model_label} field '{field.name}' declares unsupported scalar '{field.scalar}'."
         )
-    if field.widget is not None and field.widget not in _RESOURCE_FIELD_WIDGETS:
+    if field.widget is not None and not is_resource_field_widget(field.widget):
         raise ImproperlyConfigured(
             f"resource metadata for {model_label} field '{field.name}' declares unsupported widget '{field.widget}'."
         )
@@ -541,7 +539,10 @@ def _validate_resource_field(model_label: str, field: data_contract.DataResource
             f"resource metadata for {model_label} field '{field.name}' cannot declare "
             f"scalar '{field.scalar}' for {field.kind} fields."
         )
-    if field.kind == "relation" and field.widget not in {None, "many2one"}:
+    # A namespaced addon widget changes presentation, never the relation's
+    # target, wire selection, filters or public-ID semantics.
+    custom_widget = field.widget is not None and "." in field.widget
+    if field.kind == "relation" and field.widget not in {None, "many2one"} and not custom_widget:
         raise ImproperlyConfigured(
             f"resource metadata for {model_label} field '{field.name}' cannot declare "
             f"widget '{field.widget}' for relation fields."

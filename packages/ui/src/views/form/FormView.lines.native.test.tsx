@@ -96,6 +96,29 @@ async function fixture(options: { submit?: FormSubmit; lines?: readonly Row[] } 
 
 function edit(name: string, value: string) { fireEvent.change(screen.getByLabelText(name), { target: { value } }); }
 
+test("successful semantic no-op line saves accept the native draft baseline", async () => {
+  const f = await fixture({ submit: async () => ({ id: "doc-1", title: "Original", lines: initialLines }) });
+  act(() => f.surface().form.setValue<string>("lines.0.quantity", "10", { shouldDirty: true }));
+  expect(f.surface().formIsDirty).toBe(true);
+  await act(async () => f.surface().submitForm());
+  expect(f.submit).toHaveBeenCalledWith({}, expect.objectContaining({ lines: expect.objectContaining({ hasChanges: false }) }));
+  await waitFor(() => expect(f.surface().formIsDirty).toBe(false));
+  expect(f.surface().form.getValues("lines")).toEqual(initialLines);
+});
+
+test("semantic no-op line saves preserve a later edit while the request is pending", async () => {
+  let resolve!: (row: Row) => void;
+  const f = await fixture({ submit: () => new Promise<Row>((done) => { resolve = done; }) });
+  act(() => f.surface().form.setValue<string>("lines.0.quantity", "10", { shouldDirty: true }));
+  let saving!: Promise<void>;
+  act(() => { saving = f.surface().submitForm(); });
+  await waitFor(() => expect(f.submit).toHaveBeenCalledTimes(1));
+  edit("a.quantity", "11");
+  await act(async () => { resolve({ id: "doc-1", title: "Original", lines: initialLines }); await saving; });
+  expect((f.surface().form.getValues("lines") as Row[])[0]?.quantity).toBe("11");
+  expect(f.surface().formIsDirty).toBe(true);
+});
+
 test("reordered remote lines keep dirty cells attached to their public row IDs", async () => {
   const f = await fixture();
   edit("a.label", "Local alpha");

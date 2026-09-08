@@ -36,28 +36,30 @@ export function gqlAliasFor(runtimeGqlDir: string) {
 const srcTestIncludes = ["src/**/*.test.ts", "src/**/*.test.tsx"];
 
 const packageDefaults = defineConfig({
+  resolve: { dedupe: ["react", "react-dom", "@tanstack/react-router"] },
   test: {
     // Pure modules run under node; hook/component suites opt into a DOM
     // environment per-file with a `// @vitest-environment happy-dom` pragma.
     environment: "node",
     include: srcTestIncludes,
     server: {
-      // The chrome barrel pulls in the logo stylesheet; inline it so Vite
-      // resolves the CSS import instead of Node's ESM loader rejecting it
-      // (same rationale as the web defaults below).
-      deps: { inline: ["@angee/logo-react"] },
+      // Linked source packages can have a separate node_modules tree. Transform
+      // DOM dependency imports through Vite so React peers obey dedupe as they do
+      // in the app, and CSS imports use Vite rather than Node's ESM loader.
+      deps: { inline: ["@angee/logo-react", /@base-ui\//, /@floating-ui\//, "lucide-react"] },
     },
   },
 });
 
 const webDefaults = defineConfig({
+  resolve: { dedupe: ["react", "react-dom", "@tanstack/react-router"] },
   test: {
     environment: "node",
     include: srcTestIncludes,
     server: {
-      // The chrome barrel pulls in the logo stylesheet; inline it so Vite
-      // resolves the CSS import instead of Node's ESM loader rejecting it.
-      deps: { inline: ["@angee/logo-react"] },
+      // Keep linked dependency React peers inside Vite's dedupe boundary;
+      // externalizing them would resolve a second React through Node.
+      deps: { inline: ["@angee/logo-react", /@base-ui\//, /@floating-ui\//, "lucide-react"] },
     },
   },
 });

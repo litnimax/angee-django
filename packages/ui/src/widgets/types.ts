@@ -110,11 +110,15 @@ export interface WidgetControlProps {
 export interface WidgetRenderProps<TValue = unknown, TRow = unknown> {
   value?: TValue | null;
   row?: TRow;
+  /** Owning document for a widget rendered inside editable child lines. */
+  parentRow?: unknown;
   field?: WidgetField;
   /** Validation messages scoped to this widget's descriptor field. */
   messages?: readonly string[];
   readOnly?: boolean;
   onChange?: (value: TValue) => void;
+  /** Atomically patch sibling fields of this editable line; stale rows are ignored. */
+  onRowChange?: (patch: Record<string, unknown>) => void;
 }
 
 export interface WidgetDefinition<TValue = unknown, TRow = unknown> {

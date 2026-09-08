@@ -176,6 +176,8 @@ export function FormViewOverview({
     afterFieldChange,
     fieldReadOnly,
   } = surface;
+  const draft = useWatch({ control: form.control });
+  const parentRow = { ...surface.displayRecord, ...draft };
   const renderField = (field: FieldDescriptor): React.ReactNode => {
     const relation = surface.relationByField.get(field.name);
     const selectedOption = relation
@@ -259,6 +261,7 @@ export function FormViewOverview({
             control={form.control}
             name={linesField}
             lines={linesResource}
+            parentRow={parentRow}
             readOnly={formReadOnly}
             rowErrors={lineRowErrors}
           />

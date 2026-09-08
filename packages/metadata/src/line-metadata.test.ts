@@ -211,3 +211,19 @@ describe("resourceReadSelectionPaths", () => {
     ).toBeNull();
   });
 });
+
+
+test("object lists need authored subfields while scalar lists remain selectable", () => {
+  const account = testDataResource("accounts.Account", {
+    fields: [
+      field("schedule", "list", { relationModelLabel: "accounts.Item", scalar: null }),
+      field("tags", "list", { scalar: "ID" }),
+    ],
+  });
+  account.query.fields.schedule = testQueryField("schedule", { kind: "list", scalar: null, row: null });
+  account.query.fields.tags = testQueryField("tags", { kind: "list", scalar: "ID" });
+  const schema = schemaFieldMetadataFromDataResources([account]);
+  expect(resourceReadSelectionPaths(schema.labels["accounts.Account"]!, schema)).toEqual(["id", "tags"]);
+  expect(lineReadSelectionPaths({ ...LINES, fields: account.fields, positionField: null }, schema))
+    .toEqual(["id", "tags"]);
+});
