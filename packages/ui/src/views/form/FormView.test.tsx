@@ -802,7 +802,7 @@ describe("FormView", () => {
     expect(sdkMocks.mutate).not.toHaveBeenCalled();
   });
 
-  test("does not offer save without a stock update root or custom submit", async () => {
+  test("renders fields read-only and does not offer save without an update root or custom submit", async () => {
     sdkMocks.record = { id: "provider-1", name: "Anthropic" };
     const resource = {
       ...defaultResource("InferenceProviderType", "agents.InferenceProvider"),
@@ -833,11 +833,8 @@ describe("FormView", () => {
       metadata,
     );
 
-    await waitFor(() =>
-      expect(
-        (screen.getByLabelText("Name") as HTMLInputElement).value,
-      ).toBe("Anthropic"),
-    );
+    expect(await screen.findByRole("heading", { name: "Anthropic" })).toBeTruthy();
+    expect(screen.queryByLabelText("Name")).toBeNull();
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
 

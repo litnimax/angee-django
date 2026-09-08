@@ -100,6 +100,8 @@ export interface UseFormViewSurfaceProps {
   onSaved?: (row: Row) => void;
   submit?: FormSubmit;
   createSubmit?: FormSubmit;
+  /** Read-only policy evaluated on the saved record, never on the local draft. */
+  readOnlyWhen?: (record: Row) => boolean;
   recordTabs?: readonly RecordTabDescriptor[];
   deleteAction?: RecordDeleteAction;
   deleteVisibleWhen?: (record: Row) => boolean;
@@ -147,6 +149,7 @@ export function useFormViewSurface({
   onSaved,
   submit,
   createSubmit,
+  readOnlyWhen,
   recordTabs,
   deleteAction,
   deleteVisibleWhen,
@@ -389,6 +392,7 @@ export function useFormViewSurface({
     onSaved,
     submit,
     createSubmit,
+    readOnlyWhen,
     defaultSlugSource,
     t,
   });

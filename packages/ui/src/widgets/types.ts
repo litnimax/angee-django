@@ -117,6 +117,8 @@ export interface WidgetRenderProps<TValue = unknown, TRow = unknown> {
   messages?: readonly string[];
   readOnly?: boolean;
   onChange?: (value: TValue) => void;
+  /** Atomically patch sibling fields of this editable line; stale rows are ignored. */
+  onRowChange?: (patch: Record<string, unknown>) => void;
 }
 
 export interface WidgetDefinition<TValue = unknown, TRow = unknown> {

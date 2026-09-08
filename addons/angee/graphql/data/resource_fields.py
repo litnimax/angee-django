@@ -539,7 +539,10 @@ def _validate_resource_field(model_label: str, field: data_contract.DataResource
             f"resource metadata for {model_label} field '{field.name}' cannot declare "
             f"scalar '{field.scalar}' for {field.kind} fields."
         )
-    if field.kind == "relation" and field.widget not in {None, "many2one"}:
+    # A namespaced addon widget changes presentation, never the relation's
+    # target, wire selection, filters or public-ID semantics.
+    custom_widget = field.widget is not None and "." in field.widget
+    if field.kind == "relation" and field.widget not in {None, "many2one"} and not custom_widget:
         raise ImproperlyConfigured(
             f"resource metadata for {model_label} field '{field.name}' cannot declare "
             f"widget '{field.widget}' for relation fields."

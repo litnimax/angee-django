@@ -28,6 +28,7 @@ export interface FieldDescriptorControlProps {
   messages?: readonly string[];
   readOnly?: boolean;
   onChange?: (value: unknown) => void;
+  onRowChange?: (patch: Record<string, unknown>) => void;
   controlProps?: WidgetControlProps;
 }
 
@@ -44,6 +45,7 @@ export function FieldDescriptorControl({
   messages,
   readOnly,
   onChange,
+  onRowChange,
   controlProps,
 }: FieldDescriptorControlProps): React.ReactElement {
   const widget = useResolvedWidget(fieldWidgetId(field)) ?? fallbackWidget();
@@ -66,6 +68,7 @@ export function FieldDescriptorControl({
       messages={messages}
       readOnly={readOnly}
       onChange={onChange}
+      onRowChange={onRowChange}
     />
   );
 }

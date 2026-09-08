@@ -118,7 +118,7 @@ export function EditableLines({
   );
   // The array field lives on the parent form; a per-array keyName keeps rhf's row
   // key off the line's own `id` (which stays the public id used by the save diff).
-  const { fields, append, insert, move, remove } = useFieldArray({
+  const { fields, append, insert, move, remove, update } = useFieldArray({
     control: control as unknown as Control<FieldValues>,
     name,
     keyName: "rhfKey",
@@ -127,11 +127,27 @@ export function EditableLines({
     control: control as unknown as Control<FieldValues>,
     name,
   }) as Row[] | undefined) ?? [];
+  // Async widgets retain a callback after reorder/remove/refresh. Resolve its
+  // RHF identity at completion, never write through the captured row index.
+  const latest = React.useRef({ fields, rows, readOnly, update });
+  latest.current = { fields, rows, readOnly, update };
+  const mounted = React.useRef(true);
+  React.useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  const patchRow = React.useCallback((key: string, patch: Record<string, unknown>) => {
+    const current = latest.current;
+    if (!mounted.current || current.readOnly) return;
+    const index = current.fields.findIndex((field) => field.rhfKey === key);
+    if (index < 0 || !current.rows[index]) return;
+    current.update(index, { ...current.rows[index], ...patch });
+  }, []);
   const sensors = useDndKitSensors(4);
 
   const onDragEnd = (event: DragEndEvent): void => {
     const { active, over } = event;
-    if (!over || active.id === over.id) return;
+    if (readOnly || !over || active.id === over.id) return;
     const from = fields.findIndex((row) => row.rhfKey === active.id);
     const to = fields.findIndex((row) => row.rhfKey === over.id);
     if (from >= 0 && to >= 0) move(from, to);
@@ -188,6 +204,7 @@ export function EditableLines({
                     columns={columns}
                     row={rows[index]}
                     parentRow={parentRow}
+                    onRowChange={(patch) => patchRow(row.rhfKey, patch)}
                     gridStyle={gridStyle}
                     readOnly={readOnly}
                     rowError={rowErrors?.[index]}
@@ -231,6 +248,7 @@ function LineRow({
   columns,
   row,
   parentRow,
+  onRowChange,
   gridStyle,
   readOnly,
   rowError,
@@ -245,6 +263,7 @@ function LineRow({
   columns: readonly LineColumn[];
   row?: Row;
   parentRow?: Row | null;
+  onRowChange: (patch: Record<string, unknown>) => void;
   gridStyle: React.CSSProperties;
   readOnly?: boolean;
   rowError?: ValidationErrors;
@@ -310,6 +329,7 @@ function LineRow({
                   value={controller.value}
                   readOnly={readOnly}
                   onChange={controller.onChange}
+                  onRowChange={onRowChange}
                 />
               )
             }
@@ -358,6 +378,7 @@ function lineColumns(
     .filter((field) => field.name !== config.positionField)
     .map((field) => {
       const widget = defaultWidgetForModelField(field);
+      const customWidget = Boolean(field.widget && !["many2one", "many2many"].includes(field.widget));
       const options = enumOptions(field);
       const descriptor: FieldDescriptor = {
         name: field.name,
@@ -368,8 +389,8 @@ function lineColumns(
       return {
         field,
         descriptor,
-        relation: relationFieldInfoForField(field, schemaMetadata),
-        relationMulti: relationListFieldInfoForField(field, schemaMetadata),
+        relation: customWidget ? null : relationFieldInfoForField(field, schemaMetadata),
+        relationMulti: customWidget ? null : relationListFieldInfoForField(field, schemaMetadata),
         header: titleCase(field.name),
       };
     });

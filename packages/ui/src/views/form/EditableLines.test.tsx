@@ -1,8 +1,9 @@
 // @vitest-environment happy-dom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { useForm } from "react-hook-form";
-import type { DataResourceLinesMetadata } from "@angee/metadata";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useForm, type UseFormReturn } from "react-hook-form";
+import { ModelMetadataProvider, schemaFieldMetadataFromDataResources, type DataResourceLinesMetadata } from "@angee/metadata";
+import { testDataResource } from "@angee/metadata/testing";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { AppRuntimeProvider } from "../../runtime";
@@ -101,7 +102,65 @@ function Host({
 
 afterEach(cleanup);
 
+function rowPatchFixture() {
+  let form!: UseFormReturn<Record<string, unknown>>;
+  const callbacks = new Map<string, NonNullable<WidgetRenderProps["onRowChange"]>>();
+  const metadata = schemaFieldMetadataFromDataResources([testDataResource("demo.Product")]);
+  const lines: DataResourceLinesMetadata = { ...LINES, fields: [
+    { ...LINES.fields[0]!, name: "product", kind: "relation", scalar: null, relationModelLabel: "demo.Product", widget: "demo.product" },
+    ...LINES.fields,
+  ] };
+  const productWidget = {
+    read: ({ row }: WidgetRenderProps) => <span>Locked {String((row as { label: string }).label)}</span>,
+    edit: ({ row, onRowChange }: WidgetRenderProps) => {
+      const label = String((row as { label: string }).label);
+      return <button type="button" onClick={() => callbacks.set(label, onRowChange!)}>Preview {label}</button>;
+    },
+  };
+  function PatchHost({ readOnly = false }: { readOnly?: boolean }) {
+    form = useForm<Record<string, unknown>>({ defaultValues: { lines: [
+      { id: "one", label: "Widget", quantity: 2, position: 0 },
+      { id: "two", label: "Gadget", quantity: 5, position: 1 },
+    ] } });
+    return <ModelMetadataProvider metadata={metadata}>
+      <AppRuntimeProvider runtime={{ widgets: { ...defaultWidgets, "demo.product": productWidget } }}>
+        <EditableLines control={form.control} name="lines" lines={lines} readOnly={readOnly} />
+      </AppRuntimeProvider>
+    </ModelMetadataProvider>;
+  }
+  const view = render(<PatchHost />);
+  return { form: () => form, callbacks, lock: () => view.rerender(<PatchHost readOnly />), unmount: view.unmount };
+}
+
 describe("EditableLines", () => {
+  test("a custom relation widget patches its stable row after earlier deletion and preserves later sibling edits", () => {
+    const f = rowPatchFixture();
+    fireEvent.click(screen.getByRole("button", { name: "Preview Gadget" }));
+    fireEvent.click(screen.getAllByLabelText("Remove line")[0]!);
+    act(() => f.form().setValue<string>("lines.0.quantity", 8, { shouldDirty: true }));
+    act(() => f.callbacks.get("Gadget")!({ product: { id: "new-product", name: "New" }, label: "New label" }));
+    expect(f.form().getValues("lines")).toEqual([
+      { id: "two", label: "New label", quantity: 8, position: 1, product: { id: "new-product", name: "New" } },
+    ]);
+    expect(f.form().getFieldState("lines").isDirty).toBe(true);
+  });
+
+  test("pending row patches cannot recreate a deleted line or alter a read-only form", () => {
+    const f = rowPatchFixture();
+    fireEvent.click(screen.getByRole("button", { name: "Preview Widget" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview Gadget" }));
+    fireEvent.click(screen.getAllByLabelText("Remove line")[0]!);
+    act(() => f.callbacks.get("Widget")!({ label: "Resurrected" }));
+    expect(f.form().getValues("lines")).toMatchObject([{ id: "two", label: "Gadget" }]);
+    f.lock();
+    expect(screen.getByText("Locked Gadget")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Add line" })).toBeNull();
+    act(() => f.callbacks.get("Gadget")!({ label: "Forbidden" }));
+    expect(f.form().getValues("lines")).toMatchObject([{ id: "two", label: "Gadget" }]);
+    f.unmount();
+    act(() => f.callbacks.get("Gadget")!({ label: "After unmount" }));
+    expect(f.form().getValues("lines")).toMatchObject([{ id: "two", label: "Gadget" }]);
+  });
   test("passes the live child and owning document to a registered widget", () => {
     render(<Host inspectContext />);
     expect(screen.getByText("Widget / Acme")).toBeTruthy();

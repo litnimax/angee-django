@@ -1634,6 +1634,23 @@ def test_resource_field_accepts_addon_qualified_widget(widget):
     assert require_unique_resource_fields("demo.Item", fields) == fields
 
 
+def test_resource_relation_field_accepts_addon_widget_without_changing_relation_facts():
+    from angee.graphql.data.resource_fields import require_unique_resource_fields
+
+    fields = (
+        DataResourceFieldMetadata(
+            name="product", kind="relation", widget="demo.lines.product",
+            relation_model_label="demo.Product", relation_object=True,
+            creatable=True, updatable=True,
+        ),
+    )
+    assert require_unique_resource_fields("demo.Line", fields) == fields
+    with pytest.raises(ImproperlyConfigured, match="for relation fields"):
+        require_unique_resource_fields(
+            "demo.Line", (DataResourceFieldMetadata(name="product", kind="relation", widget="integer"),),
+        )
+
+
 @pytest.mark.parametrize("widget", ["slider", "demo.widget", "demo..widget", "demo.app.bad-widget", "Demo.app.widget"])
 def test_resource_field_rejects_malformed_addon_widget(widget):
     from angee.graphql.data.resource_fields import require_unique_resource_fields
