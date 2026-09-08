@@ -153,7 +153,7 @@ function normalizeRoutePath(path: string): string {
 }
 
 /** Join the active routed collection base path with a record id. */
-function recordPath(basePath: string, id: string): string {
+export function recordPath(basePath: string, id: string): string {
   if (basePath === "/") return `/${encodeURIComponent(id)}`;
   return `${basePath}/${encodeURIComponent(id)}`;
 }

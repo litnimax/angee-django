@@ -75,11 +75,13 @@ export {
   type UseAngeeRevisionsResult,
 } from "./dialect/hooks";
 export {
+  useAuthoredFetch,
   useAuthoredMutation,
   useAuthoredLiveInterest,
   useAuthoredQuery,
   useAuthoredQueryBatch,
   useInvalidateAuthoredModels,
+  type AuthoredFetch,
   errorFromAuthoredEnvelope,
   authoredOperationData,
   authoredQueryKey,

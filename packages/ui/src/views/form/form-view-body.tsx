@@ -36,6 +36,10 @@ import {
 } from "./form-view-model";
 import type { FormViewSurface } from "./form-view-surface";
 
+type EditableLinesSetValue = React.ComponentProps<
+  typeof EditableLines
+>["setValue"];
+
 const TITLE_TEXT_CLASS =
   "block w-full min-w-0 truncate text-28 font-semibold leading-9 text-fg";
 const TITLE_INPUT_CLASS =
@@ -169,6 +173,7 @@ export function FormViewOverview({
     linesActive,
     linesResource,
     linesField,
+    linesDeclaration,
     formReadOnly,
     lineRowErrors,
     bodyField,
@@ -253,14 +258,25 @@ export function FormViewOverview({
             weight="semibold"
             className="border-b border-border-subtle pb-1"
           >
-            {t("lines.section")}
+            {linesDeclaration?.label ?? t("lines.section")}
           </SectionEyebrow>
           <EditableLines
             control={form.control}
             name={linesField}
             lines={linesResource}
             readOnly={formReadOnly}
+            columns={linesDeclaration?.columns}
+            footer={
+              linesDeclaration?.footer
+                ? (rows) =>
+                    linesDeclaration.footer?.(rows, {
+                      record: surface.displayRecord,
+                      isCreate: surface.isCreate,
+                    })
+                : undefined
+            }
             rowErrors={lineRowErrors}
+            setValue={form.setValue as EditableLinesSetValue}
           />
         </section>
       ) : null}

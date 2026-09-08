@@ -158,6 +158,30 @@ export function sameObservedLines(
 }
 
 /**
+ * The line inputs worth creating: a composer row the user added but never
+ * filled serializes to only its position (blank cells are withheld, see
+ * `lineToInput`), and shipping it would create an empty child. Kept rows are
+ * any carrying an id or at least one content column.
+ */
+export function meaningfulLineInputs(
+  payload: readonly LineInput[],
+  config: LineDiffConfig,
+): LineInput[] {
+  return payload.filter((input) =>
+    Object.entries(input).some(
+      ([key, value]) =>
+        key !== "id" && key !== config.positionField && cellHasContent(value),
+    ),
+  );
+}
+
+/** Whether a serialized cell value carries content (an empty M2M `[]` does not). */
+function cellHasContent(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  return value !== null && value !== undefined && value !== "";
+}
+
+/**
  * Normalize a record's loaded lines into field-array rows: keep the public id, the
  * editable child columns, and a `position` (from the stored value, else row order).
  * Used to seed the composer and as the diff baseline, so an unedited save is a no-op.

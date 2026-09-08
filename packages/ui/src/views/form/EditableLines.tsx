@@ -45,7 +45,12 @@ import {
   relationListFieldInfoForField,
   type RelationFieldInfo,
 } from "../resource/model-metadata-defaults";
-import type { FieldDescriptor } from "../page";
+import type {
+  ColumnDescriptor,
+  FieldDescriptor,
+  LineCellResolve,
+} from "../page";
+import { useLatestRef } from "../../lib/use-latest-ref";
 import { RelationFieldWidget } from "../relation/RelationFieldWidget";
 import { RelationMultiFieldWidget } from "../relation/RelationMultiFieldWidget";
 import { relationSelectedOption } from "../relation/relation-options";
@@ -65,6 +70,13 @@ export interface EditableLinesProps {
   lines: DataResourceLinesMetadata;
   readOnly?: boolean;
   /**
+   * Declared column overrides (a form's `Lines` children): their order is the
+   * render order and each may override the metadata-derived header, widget,
+   * width, and read-only state, or attach a `resolveDefaults` hook. Empty/omitted
+   * renders every metadata column in metadata order.
+   */
+  columns?: readonly ColumnDescriptor[];
+  /**
    * Footer content (e.g. document totals) the composing form supplies. Receives the
    * live line rows so totals recompute as cells change; the composer owns the money
    * math, not this primitive.
@@ -72,6 +84,15 @@ export interface EditableLinesProps {
   footer?: (rows: readonly Row[]) => React.ReactNode;
   /** Server validation messages per line row, indexed by row position. */
   rowErrors?: readonly (ValidationErrors | undefined)[];
+  /**
+   * The composing form's `setValue`, required for column `resolveDefaults` hooks to
+   * seed sibling cells. Without it, `resolveDefaults` declarations are inert.
+   */
+  setValue?: (
+    name: string,
+    value: unknown,
+    options?: { shouldDirty?: boolean; shouldTouch?: boolean },
+  ) => void;
 }
 
 interface LineColumn {
@@ -80,6 +101,9 @@ interface LineColumn {
   relation: RelationFieldInfo | null;
   relationMulti: RelationFieldInfo | null;
   header: string;
+  width?: string;
+  readOnly?: boolean;
+  resolveDefaults?: LineCellResolve;
 }
 
 const CELL_CLASS = "min-w-0";
@@ -103,15 +127,17 @@ export function EditableLines({
   name,
   lines,
   readOnly,
+  columns: columnOverrides,
   footer,
   rowErrors,
+  setValue,
 }: EditableLinesProps): React.ReactElement {
   const t = useUiT();
   const config = React.useMemo(() => lineDiffConfig(lines), [lines]);
   const schemaMetadata = useSchemaFieldMetadata();
   const columns = React.useMemo(
-    () => lineColumns(lines, config, schemaMetadata),
-    [lines, config, schemaMetadata],
+    () => lineColumns(lines, config, schemaMetadata, columnOverrides),
+    [lines, config, schemaMetadata, columnOverrides],
   );
   // The array field lives on the parent form; a per-array keyName keeps rhf's row
   // key off the line's own `id` (which stays the public id used by the save diff).
@@ -134,7 +160,57 @@ export function EditableLines({
     if (from >= 0 && to >= 0) move(from, to);
   };
 
-  const gridStyle = { gridTemplateColumns: gridTemplate(columns.length) };
+  // The computed-default law for line cells (mirrors the form's field.resolveDefaults):
+  // a user's direct edit marks that cell of that row (keyed by the row's stable
+  // rhf key, so reorders don't cross rows); a column resolver's result seeds
+  // only unmarked sibling cells; only the latest in-flight resolve per cell
+  // applies. Rows and marks reset with the field array's own lifecycle.
+  const userEditedCellsRef = React.useRef(new Map<string, Set<string>>());
+  const resolveTokensRef = React.useRef(new Map<string, number>());
+  const fieldsRef = useLatestRef(fields);
+  const rowsRef = useLatestRef(rows);
+  const setValueRef = useLatestRef(setValue);
+  const onCellChange = React.useCallback(
+    (rowKey: string, column: LineColumn, value: unknown): void => {
+      const edited =
+        userEditedCellsRef.current.get(rowKey) ?? new Set<string>();
+      edited.add(column.field.name);
+      userEditedCellsRef.current.set(rowKey, edited);
+      const resolve = column.resolveDefaults;
+      if (!resolve || !setValueRef.current) return;
+      const tokenKey = `${rowKey}:${column.field.name}`;
+      const token = (resolveTokensRef.current.get(tokenKey) ?? 0) + 1;
+      resolveTokensRef.current.set(tokenKey, token);
+      const index = fieldsRef.current.findIndex((row) => row.rhfKey === rowKey);
+      if (index < 0) return;
+      const currentRows = rowsRef.current;
+      const row = { ...(currentRows[index] ?? {}), [column.field.name]: value };
+      void Promise.resolve(resolve(value, { row, index, rows: currentRows }))
+        .then((patch) => {
+          if (!patch) return;
+          if (resolveTokensRef.current.get(tokenKey) !== token) return;
+          const liveIndex = fieldsRef.current.findIndex(
+            (candidate) => candidate.rhfKey === rowKey,
+          );
+          if (liveIndex < 0) return;
+          const editedNow = userEditedCellsRef.current.get(rowKey);
+          for (const [cellName, cellValue] of Object.entries(patch)) {
+            if (cellName === column.field.name) continue;
+            if (editedNow?.has(cellName)) continue;
+            setValueRef.current?.(`${name}.${liveIndex}.${cellName}`, cellValue, {
+              shouldDirty: true,
+              shouldTouch: true,
+            });
+          }
+        })
+        .catch((error: unknown) => {
+          console.warn(`Line column "${column.field.name}" resolve failed:`, error);
+        });
+    },
+    [fieldsRef, name, rowsRef, setValueRef],
+  );
+
+  const gridStyle = { gridTemplateColumns: gridTemplate(columns) };
 
   return (
     <div className="grid gap-2">
@@ -179,6 +255,7 @@ export function EditableLines({
                   readOnly={readOnly}
                   rowError={rowErrors?.[index]}
                   t={t}
+                  onCellChange={onCellChange}
                   onDuplicate={() =>
                     insert(index + 1, duplicateLineRow(rows[index] ?? {}, config) as never)
                   }
@@ -219,6 +296,7 @@ function LineRow({
   readOnly,
   rowError,
   t,
+  onCellChange,
   onDuplicate,
   onRemove,
 }: {
@@ -231,6 +309,7 @@ function LineRow({
   readOnly?: boolean;
   rowError?: ValidationErrors;
   t: UiTranslate;
+  onCellChange: (rowKey: string, column: LineColumn, value: unknown) => void;
   onDuplicate: () => void;
   onRemove: () => void;
 }): React.ReactElement {
@@ -258,49 +337,56 @@ function LineRow({
         <Glyph name="grip-vertical" size={16} />
       </button>
 
-      {columns.map((column) => (
-        <div key={column.field.name} className={CELL_CLASS}>
-          <Controller
-            control={control as unknown as Control<FieldValues>}
-            name={`${name}.${index}.${column.field.name}`}
-            render={({ field: controller }) =>
-              column.relationMulti ? (
-                <RelationMultiFieldWidget
-                  value={relationIdList(controller.value)}
-                  onChange={controller.onChange}
-                  readOnly={readOnly}
-                  relation={column.relationMulti}
-                  aria-label={column.header}
-                />
-              ) : column.relation ? (
-                <RelationFieldWidget
-                  value={relationValueId(controller.value) || null}
-                  onChange={controller.onChange}
-                  readOnly={readOnly}
-                  relation={column.relation}
-                  selectedOption={relationSelectedOption(
-                    controller.value,
-                    column.relation.labelField,
-                  )}
-                  aria-label={column.header}
-                />
-              ) : (
-                <FieldDescriptorControl
-                  field={column.descriptor}
-                  value={controller.value}
-                  readOnly={readOnly}
-                  onChange={controller.onChange}
-                />
-              )
-            }
-          />
-          {rowMessages(rowError, column.field.name).map((message, messageIndex) => (
-            <p key={messageIndex} className="mt-1 text-xs text-danger-text">
-              {message}
-            </p>
-          ))}
-        </div>
-      ))}
+      {columns.map((column) => {
+        const cellReadOnly = readOnly || column.readOnly;
+        return (
+          <div key={column.field.name} className={CELL_CLASS}>
+            <Controller
+              control={control as unknown as Control<FieldValues>}
+              name={`${name}.${index}.${column.field.name}`}
+              render={({ field: controller }) => {
+                const changeCell = (next: unknown): void => {
+                  controller.onChange(next);
+                  onCellChange(id, column, next);
+                };
+                return column.relationMulti ? (
+                  <RelationMultiFieldWidget
+                    value={relationIdList(controller.value)}
+                    onChange={changeCell}
+                    readOnly={cellReadOnly}
+                    relation={column.relationMulti}
+                    aria-label={column.header}
+                  />
+                ) : column.relation ? (
+                  <RelationFieldWidget
+                    value={relationValueId(controller.value) || null}
+                    onChange={changeCell}
+                    readOnly={cellReadOnly}
+                    relation={column.relation}
+                    selectedOption={relationSelectedOption(
+                      controller.value,
+                      column.relation.labelField,
+                    )}
+                    aria-label={column.header}
+                  />
+                ) : (
+                  <FieldDescriptorControl
+                    field={column.descriptor}
+                    value={controller.value}
+                    readOnly={cellReadOnly}
+                    onChange={changeCell}
+                  />
+                );
+              }}
+            />
+            {rowMessages(rowError, column.field.name).map((message, messageIndex) => (
+              <p key={messageIndex} className="mt-1 text-xs text-danger-text">
+                {message}
+              </p>
+            ))}
+          </div>
+        );
+      })}
 
       {readOnly ? (
         <span />
@@ -328,31 +414,59 @@ function LineRow({
   );
 }
 
-/** Resolve each editable child column: its widget descriptor and relation target. */
+/**
+ * Resolve each editable child column: its widget descriptor and relation target.
+ * Declared overrides pick the columns and their order; each override merges its
+ * header, widget, options, width, read-only state, and `resolveDefaults` hook over the
+ * metadata-derived column. An override naming a field that is not an editable
+ * child column fails fast — the declaration is out of sync with the contract.
+ */
 function lineColumns(
   lines: DataResourceLinesMetadata,
   config: LineDiffConfig,
   schemaMetadata: ReturnType<typeof useSchemaFieldMetadata>,
+  overrides?: readonly ColumnDescriptor[],
 ): LineColumn[] {
-  return (lines.fields ?? [])
-    .filter((field) => field.name !== config.positionField)
-    .map((field) => {
-      const widget = defaultWidgetForModelField(field);
-      const options = enumOptions(field);
-      const descriptor: FieldDescriptor = {
-        name: field.name,
-        ...(widget ? { widget } : {}),
-        ...(options.length > 0 ? { options } : {}),
-        ...(field.currencyField ? { currencyField: field.currencyField } : {}),
-      };
-      return {
-        field,
-        descriptor,
-        relation: relationFieldInfoForField(field, schemaMetadata),
-        relationMulti: relationListFieldInfoForField(field, schemaMetadata),
-        header: titleCase(field.name),
-      };
+  const fields = lines.fields ?? [];
+  const build = (
+    field: ModelFieldMetadata,
+    override: ColumnDescriptor | undefined,
+  ): LineColumn => {
+    const widget = override?.widget ?? defaultWidgetForModelField(field);
+    const options = override?.options ?? enumOptions(field);
+    const descriptor: FieldDescriptor = {
+      name: field.name,
+      ...(widget ? { widget } : {}),
+      ...(options.length > 0 ? { options } : {}),
+      ...(field.currencyField ? { currencyField: field.currencyField } : {}),
+    };
+    const header = override?.header ?? titleCase(field.name);
+    return {
+      field,
+      descriptor,
+      relation: relationFieldInfoForField(field, schemaMetadata),
+      relationMulti: relationListFieldInfoForField(field, schemaMetadata),
+      header: typeof header === "string" ? header : String(header),
+      ...(override?.width !== undefined ? { width: override.width } : {}),
+      ...(override?.readOnly !== undefined ? { readOnly: override.readOnly } : {}),
+      ...(override?.resolveDefaults !== undefined ? { resolveDefaults: override.resolveDefaults } : {}),
+    };
+  };
+  if (overrides && overrides.length > 0) {
+    return overrides.map((override) => {
+      const field = fields.find((candidate) => candidate.name === override.field);
+      if (!field || field.name === config.positionField) {
+        throw new Error(
+          `Lines column "${override.field}" is not an editable child column of `
+            + `"${lines.modelLabel}".`,
+        );
+      }
+      return build(field, override);
     });
+  }
+  return fields
+    .filter((field) => field.name !== config.positionField)
+    .map((field) => build(field, undefined));
 }
 
 function rowMessages(
@@ -362,8 +476,11 @@ function rowMessages(
   return rowError?.fieldErrors[fieldName] ?? [];
 }
 
-function gridTemplate(columnCount: number): string {
-  return `auto repeat(${columnCount}, minmax(0, 1fr)) auto`;
+function gridTemplate(columns: readonly LineColumn[]): string {
+  const tracks = columns
+    .map((column) => column.width ?? "minmax(0, 1fr)")
+    .join(" ");
+  return `auto ${tracks} auto`;
 }
 
 function sortableTransformStyle(

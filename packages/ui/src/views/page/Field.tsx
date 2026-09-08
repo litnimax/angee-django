@@ -13,6 +13,28 @@ export type PageFieldKind =
   | "selection"
   | (string & {});
 
+/** The live form facts a `Field.resolveDefaults` hook reads besides the changed value. */
+export interface FieldResolveContext {
+  /** The form's current values at the moment of the change. */
+  values: Record<string, unknown>;
+  /** The loaded record on an edit form; `null` while creating. */
+  record: Row | null;
+  isCreate: boolean;
+}
+
+/**
+ * An async sibling-defaults hook: given the changed value, return a
+ * `{fieldName: value}` map of defaults to seed. See `FieldDescriptor.resolveDefaults`.
+ */
+export type FieldResolve = (
+  value: unknown,
+  context: FieldResolveContext,
+) =>
+  | Record<string, unknown>
+  | null
+  | undefined
+  | Promise<Record<string, unknown> | null | undefined>;
+
 export interface FieldDescriptor extends FieldPresentation {
   name: string;
   widget?: string;
@@ -35,6 +57,8 @@ export interface FieldDescriptor extends FieldPresentation {
   prefillPreserveDirty?: boolean;
   /** Fields a preset must replace even when they are dirty (for example private implementation config). */
   prefillReplace?: readonly string[];
+  /** Async sibling defaults on change, skipping user-edited fields (see `FieldResolve`). */
+  resolveDefaults?: FieldResolve;
   /** Source field a `widget="slug"` field derives from on create (see `FieldProps.slugFrom`). */
   slugFrom?: string;
   title?: boolean;

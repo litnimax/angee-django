@@ -5,7 +5,7 @@ import { type FormViewProps } from "../../form/FormView";
 import type { ListProps } from "../List";
 import type { FormProps } from "../../form/Form";
 import { type ResourceViewDefaultGroups, type ResourceViewGroup, type ResourceViewKind } from "../resource-view-model";
-import { parsePageActions, parsePageColumns, parsePageFacets, parsePageFields, parsePageGroups, mergePageFacets, pageChildren, pageElementProps, requirePageColumns } from "../../page";
+import { parsePageActions, parsePageColumns, parsePageFacets, parsePageFields, parsePageGroups, parsePageLines, mergePageFacets, pageChildren, pageElementProps, requirePageColumns } from "../../page";
 import { formDeclarationCache, listDeclarationCache, unrecognizedResourceListChildMessage } from "./child-dsl";
 import type { ResourceFormDeclaration, ResourceListDeclaration, ResourceListDeclarations, ResourceListProps } from "./public";
 export function parseResourceListDeclarations<TRow extends Row = Row>(
@@ -66,6 +66,7 @@ function resourceFormDeclaration(props: FormProps): ResourceFormDeclaration {
     fields: parsePageFields(props.children),
     groups: parsePageGroups(props.children),
     actions: parsePageActions(props.children),
+    lines: parsePageLines(props.children),
   };
   formDeclarationCache.set(props, declaration);
   return declaration;
