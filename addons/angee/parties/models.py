@@ -28,6 +28,7 @@ from typing import Any, ClassVar, cast
 from django.apps import apps
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 from django.db import models, transaction
 from phonenumbers import (
     NumberParseException,
@@ -39,10 +40,13 @@ from phonenumbers import (
 )
 from rebac import PermissionDenied, system_context
 from rebac.mixins import RebacModelBase
+from stdnum import bic, iban
+from stdnum.exceptions import ValidationError as IdentifierError
+from stdnum.util import get_cc_module
 
 from angee.base.fields import SqidField, StateField
 from angee.base.impl import ImplClassField
-from angee.base.mixins import AuditMixin, HierarchyMixin, SqidMixin
+from angee.base.mixins import ArchiveMixin, AuditMixin, HierarchyMixin, SqidMixin
 from angee.base.models import AngeeManager, AngeeModel
 from angee.integrate.models import Bridge
 from angee.parties.backends import DirectoryBackend
@@ -69,6 +73,8 @@ class Party(SqidMixin, AuditMixin, AngeeModel):
 
     sqid = SqidField(real_field_name="id", prefix="pty_", min_length=8)
     display_name = models.TextField()
+    tax_country = models.CharField(max_length=2, blank=True, default="", validators=[RegexValidator(r"^[A-Z]{2}$", "Use a two-letter country code.")])
+    vat = models.CharField(max_length=32, blank=True, default="")
     notes = models.TextField(blank=True, default="")
     avatar = models.ForeignKey(
         "storage.File",
@@ -114,6 +120,8 @@ class Party(SqidMixin, AuditMixin, AngeeModel):
         "display_name",
         "notes",
         "first_met_note",
+        "tax_country",
+        "vat",
     )
     _person_merge_scalar_fields: ClassVar[tuple[str, ...]] = (
         "name_prefix",
@@ -150,6 +158,44 @@ class Party(SqidMixin, AuditMixin, AngeeModel):
         """Return the party's display name for Django displays."""
 
         return self.display_name
+
+    def clean(self) -> None:
+        """Validate tax identifiers locally through the country's stdnum implementation."""
+        super().clean()
+        self.tax_country = self.tax_country.strip().upper()
+        self.vat = self.vat.strip().upper()
+        if self.vat:
+            validator = get_cc_module(self.tax_country.lower(), "vat") if self.tax_country else None
+            if validator is None:
+                raise ValidationError({"tax_country": "Select a country supported for VAT validation."})
+            try:
+                number = validator.validate(self.vat)
+            except IdentifierError as error:
+                raise ValidationError({"vat": "Invalid VAT number for the selected country."}) from error
+            prefix = "EL" if self.tax_country == "GR" else self.tax_country
+            self.vat = number if number.startswith(prefix) else prefix + number
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        """Normalize paired tax fields when either is written, including direct model writes."""
+        fields = kwargs.get("update_fields")
+        if fields is None or {"vat", "tax_country"}.intersection(fields):
+            self.clean()
+            if fields is not None:
+                kwargs["update_fields"] = set(fields) | {"vat", "tax_country"}
+        super().save(*args, **kwargs)
+
+    def billing_details(self) -> dict[str, str]:
+        """Return printable legal identity using this party's existing postal addresses."""
+        organization = apps.get_model("parties", "Organization").objects.filter(pk=self.pk).first()
+        address = self.addresses.order_by("-is_primary", "pk").first()
+        return {
+            "name": (organization.legal_name if organization else "") or self.display_name,
+            "vat": self.vat,
+            "address": "\n".join(filter(None, (
+                address.street, address.extended, address.po_box,
+                " ".join(filter(None, (address.postal_code, address.city))), address.region, address.country,
+            ))) if address else "",
+        }
 
     PLACEHOLDER_NAME = "Unknown"
     """The display name imports write when a source carries no name at all."""
@@ -1166,3 +1212,95 @@ class Directory(Bridge):
             folder.sync_token = book.sync_token
             folder.save(update_fields=["ctag", "sync_token", "updated_at"])
         return resolved
+
+
+class Bank(SqidMixin, AuditMixin, ArchiveMixin, AngeeModel):
+    """A bank's reusable name and locally validated BIC/SWIFT identifier."""
+
+    runtime = True
+    sqid_prefix = "bnk_"
+    name = models.CharField(max_length=200)
+    bic = models.CharField(max_length=11, blank=True, default="")
+    country = models.CharField(max_length=2, blank=True, default="")
+
+    class Meta:
+        abstract = True
+        ordering = ("name", "sqid")
+        rebac_resource_type = "parties/bank"
+        rebac_id_attr = "sqid"
+
+    def __str__(self) -> str:
+        return self.name
+
+    def clean(self) -> None:
+        """Normalize and validate the optional international bank identifier."""
+        super().clean()
+        self.country = self.country.strip().upper()
+        if self.bic:
+            try:
+                self.bic = bic.validate(self.bic)
+            except IdentifierError as error:
+                raise ValidationError({"bic": "Invalid BIC/SWIFT code."}) from error
+            if self.country and self.bic[4:6] != self.country:
+                raise ValidationError({"country": "The country must match the BIC/SWIFT code."})
+            self.country = self.bic[4:6]
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.clean()
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = set(kwargs["update_fields"]) | {"bic", "country"}
+        super().save(*args, **kwargs)
+
+
+class BankAccount(SqidMixin, AuditMixin, ArchiveMixin, AngeeModel):
+    """A party's payment destination; access follows its owning party."""
+
+    runtime = True
+    sqid_prefix = "bac_"
+
+    class NumberKind(models.TextChoices):
+        IBAN = "iban", "IBAN"
+        LOCAL = "local", "Local account number"
+
+    party = models.ForeignKey("parties.Party", on_delete=models.PROTECT, related_name="bank_accounts")
+    bank = models.ForeignKey("parties.Bank", on_delete=models.PROTECT, related_name="accounts")
+    currency = models.ForeignKey("money.Currency", on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+    holder_name = models.CharField(max_length=200, blank=True, default="")
+    number_kind = StateField(choices_enum=NumberKind, default=NumberKind.IBAN)
+    account_number = models.CharField(max_length=64)
+
+    class Meta:
+        abstract = True
+        ordering = ("account_number", "sqid")
+        rebac_resource_type = "parties/bank_account"
+        rebac_id_attr = "sqid"
+        constraints = (models.UniqueConstraint(fields=("party", "account_number"), name="uq_party_bank_account_number"),)
+
+    def __str__(self) -> str:
+        return self.account_number
+
+    def clean(self) -> None:
+        """IBAN uses stdnum; non-IBAN accounts retain their bank-specific format."""
+        super().clean()
+        self.account_number = self.account_number.strip()
+        if self.number_kind == self.NumberKind.IBAN:
+            try:
+                self.account_number = iban.validate(self.account_number)
+            except IdentifierError as error:
+                raise ValidationError({"account_number": "Invalid IBAN."}) from error
+            if self.bank_id and self.bank.country and self.bank.country != self.account_number[:2]:
+                raise ValidationError({"bank": "The bank country must match the IBAN."})
+        elif not self.account_number or any(ord(c) < 32 for c in self.account_number):
+            raise ValidationError({"account_number": "Enter a valid local account number."})
+
+    def save(self, *args: Any, **kwargs: Any) -> None:
+        self.clean()
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = set(kwargs["update_fields"]) | {"account_number"}
+        super().save(*args, **kwargs)
+
+    def payment_details(self) -> dict[str, str]:
+        """Return the payment destination for document snapshots."""
+        return {"holder": self.holder_name or self.party.billing_details()["name"],
+                "bank": self.bank.name, "bic": self.bank.bic, "number": self.account_number,
+                "kind": self.number_kind, "currency": self.currency.code if self.currency_id else ""}

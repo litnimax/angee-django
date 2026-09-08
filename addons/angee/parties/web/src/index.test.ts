@@ -12,6 +12,12 @@ describe("parties addon manifest", () => {
 
   test("registers the overview, people, organization, circle, relationship, handle, review, merge, and directory pages", () => {
     expect((parties.routes ?? []).map((route) => route.name)).toEqual([
+      "parties.banks",
+      "parties.banks.record",
+      "parties.bank-accounts",
+      "parties.bank-accounts.record",
+      "parties.addresses",
+      "parties.addresses.record",
       "parties.overview",
       "parties.people",
       "parties.people.record",

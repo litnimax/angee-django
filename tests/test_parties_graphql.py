@@ -145,6 +145,8 @@ def test_public_resource_metadata_declares_people_surface() -> None:
     assert person["defaultMeasures"] == [{"op": "count", "field": None, "input": None}]
     assert person["aggregateMeasures"] == []
     assert person["createFields"] == [
+        "tax_country",
+        "vat",
         "display_name",
         "notes",
         "name_prefix",
@@ -158,6 +160,8 @@ def test_public_resource_metadata_declares_people_surface() -> None:
     ]
     assert person["requiredCreateFields"] == ["display_name"]
     assert person["updateFields"] == [
+        "tax_country",
+        "vat",
         "display_name",
         "notes",
         "name_prefix",

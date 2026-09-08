@@ -254,6 +254,8 @@ def test_notes_app_order_is_stable(tmp_path: Path) -> None:
         "angee.operator",
         "angee.agents.apps.AgentsConfig",
         "angee.agents_integrate_anthropic",
+        # Party-owned bank accounts reference the shared currency directory.
+        "angee.money.apps.MoneyConfig",
         "angee.storage.apps.StorageConfig",
         "angee.parties.apps.PartiesConfig",
         # OIDC login now composes parties (it claims the signed-in user's own
